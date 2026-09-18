@@ -1,15 +1,11 @@
 #![forbid(unsafe_code)]
 
-mod cli;
-mod error;
-
 use std::io::{self, Write};
 use std::process::ExitCode;
 
+use bifrost_ssh::cli::{Action, Cli};
+use bifrost_ssh::error::Result;
 use clap::Parser;
-
-use cli::{Action, Cli};
-use error::Result;
 
 fn main() -> ExitCode {
     let action = Cli::parse().action();

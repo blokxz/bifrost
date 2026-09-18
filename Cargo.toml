@@ -19,3 +19,16 @@ clap = { version = "4", default-features = false, features = [
     "usage",
     "error-context",
 ] }
+# Derives (de)serialization for the Bifrost store schema.
+serde = { version = "1", features = ["derive"] }
+# Reads and writes the TOML store. Only parsing, serializing and serde support.
+toml = { version = "1", default-features = false, features = [
+    "std",
+    "parse",
+    "display",
+    "serde",
+] }
+
+[dev-dependencies]
+# Temporary directories (removed on drop) so tests never touch the real config dir.
+tempfile = "3"

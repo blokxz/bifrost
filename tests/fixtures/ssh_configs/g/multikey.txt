@@ -1,0 +1,10 @@
+user tester
+hostname multi.example.com
+port 22
+addressfamily any
+batchmode no
+stricthostkeychecking ask
+serveraliveinterval 30
+identityfile ~/keys/first
+identityfile ~/keys/second
+forwardagent no

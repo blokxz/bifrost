@@ -1,0 +1,9 @@
+user admin
+hostname bastion.example.com
+port 2222
+addressfamily any
+batchmode no
+stricthostkeychecking ask
+serveraliveinterval 30
+identityfile ~/keys/bastion_ed25519
+forwardagent no

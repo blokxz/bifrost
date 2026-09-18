@@ -1,0 +1,19 @@
+user tester
+hostname 10.0.0.5
+port 22
+addressfamily any
+batchmode no
+stricthostkeychecking ask
+serveraliveinterval 30
+dynamicforward 1080
+localforward 5433 [localhost]:5432
+localforward [0.0.0.0]:8080 [localhost]:80
+identityfile ~/.ssh/id_rsa
+identityfile ~/.ssh/id_ecdsa
+identityfile ~/.ssh/id_ecdsa_sk
+identityfile ~/.ssh/id_ed25519
+identityfile ~/.ssh/id_ed25519_sk
+identityfile ~/.ssh/id_xmss
+identityfile ~/.ssh/id_dsa
+forwardagent no
+proxyjump bastion

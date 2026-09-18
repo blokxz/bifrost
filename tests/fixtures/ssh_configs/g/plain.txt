@@ -1,0 +1,15 @@
+user tester
+hostname plain.example.com
+port 22
+addressfamily any
+batchmode no
+stricthostkeychecking ask
+serveraliveinterval 30
+identityfile ~/.ssh/id_rsa
+identityfile ~/.ssh/id_ecdsa
+identityfile ~/.ssh/id_ecdsa_sk
+identityfile ~/.ssh/id_ed25519
+identityfile ~/.ssh/id_ed25519_sk
+identityfile ~/.ssh/id_xmss
+identityfile ~/.ssh/id_dsa
+forwardagent no
