@@ -1,0 +1,21 @@
+[package]
+name = "bifrost-ssh"
+version = "0.1.0"
+edition = "2024"
+description = "Beginner-friendly SSH TUI: connections, keys, jump hosts and port forwards"
+publish = false
+
+[[bin]]
+name = "bifrost"
+path = "src/main.rs"
+
+[dependencies]
+# Argument parsing, --help/--version and usage errors. Default features are off
+# to skip color, suggestions and env support, which Bifrost does not need.
+clap = { version = "4", default-features = false, features = [
+    "derive",
+    "std",
+    "help",
+    "usage",
+    "error-context",
+] }
