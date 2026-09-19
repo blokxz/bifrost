@@ -4,59 +4,78 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 
 use bifrost_ssh::cli::{Action, Cli};
+use bifrost_ssh::commands;
 use bifrost_ssh::error::Result;
+use bifrost_ssh::sanitize::sanitize_lines;
+use bifrost_ssh::store::Store;
+use bifrost_ssh::sysenv::process_env;
+use bifrost_ssh::tui;
 use clap::Parser;
 
 fn main() -> ExitCode {
     let action = Cli::parse().action();
-    match run(action, &mut io::stdout().lock()) {
+    match run(action, &mut io::stdout().lock(), &mut io::stderr().lock()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
+            // Error text can quote file contents and host names, so it is
+            // sanitized like everything else that reaches the terminal.
             // Ignore a failure to report the failure: nothing else can be done.
-            let _ = writeln!(io::stderr(), "bifrost: error: {err}");
+            let _ = writeln!(
+                io::stderr(),
+                "bifrost: error: {}",
+                sanitize_lines(&err.to_string())
+            );
             ExitCode::FAILURE
         }
     }
 }
 
-/// Block 1 stub: only reports what each action would do.
-fn run(action: Action, out: &mut impl Write) -> Result<()> {
+/// `out` receives data meant for pipes; `err` receives messages for the user.
+fn run(action: Action, out: &mut impl Write, err: &mut impl Write) -> Result<()> {
     match action {
-        Action::OpenTui => writeln!(out, "Would open the TUI.")?,
-        // `{:?}` escapes control characters in the user-supplied host name.
-        Action::Connect { host } => writeln!(out, "Would connect to host {host:?}.")?,
-        Action::List => writeln!(out, "Would list the saved hosts.")?,
+        Action::OpenTui => {
+            // A store that cannot be found or read must not stop the TUI from
+            // opening: the home screen explains the problem.
+            let loaded = Store::from_process_env().and_then(|store| store.load());
+            tui::run(loaded, &process_env)
+        }
+        // Block 5 stub. `{:?}` escapes control characters in the user-supplied
+        // host name.
+        Action::Connect { host } => {
+            writeln!(out, "Would connect to host {host:?}.")?;
+            Ok(())
+        }
+        Action::List => {
+            let store = Store::from_process_env()?;
+            commands::list(&store, out, err)
+        }
     }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn output_of(action: Action) -> String {
-        let mut buf = Vec::new();
-        run(action, &mut buf).expect("stub should not fail");
-        String::from_utf8(buf).expect("stub output should be UTF-8")
+    fn connect_output(host: &str) -> String {
+        let mut out = Vec::new();
+        let action = Action::Connect {
+            host: host.to_string(),
+        };
+        run(action, &mut out, &mut Vec::new()).expect("stub should not fail");
+        String::from_utf8(out).expect("stub output should be UTF-8")
     }
 
     #[test]
-    fn stubs_describe_what_they_would_do() {
-        assert_eq!(output_of(Action::OpenTui), "Would open the TUI.\n");
-        assert_eq!(output_of(Action::List), "Would list the saved hosts.\n");
+    fn connect_is_still_a_stub() {
         assert_eq!(
-            output_of(Action::Connect {
-                host: "prod-db".to_string()
-            }),
+            connect_output("prod-db"),
             "Would connect to host \"prod-db\".\n"
         );
     }
 
     #[test]
     fn connect_stub_escapes_control_characters() {
-        let out = output_of(Action::Connect {
-            host: "evil\x1b[31m\nhost".to_string(),
-        });
+        let out = connect_output("evil\x1b[31m\nhost");
         assert!(!out.contains('\x1b'));
         assert_eq!(out.matches('\n').count(), 1, "only the final newline");
     }
@@ -72,7 +91,10 @@ mod tests {
                 Ok(())
             }
         }
-        let err = run(Action::List, &mut Broken).expect_err("write should fail");
+        let action = Action::Connect {
+            host: "prod-db".to_string(),
+        };
+        let err = run(action, &mut Broken, &mut Vec::new()).expect_err("write should fail");
         assert!(err.to_string().contains("closed"));
     }
 }

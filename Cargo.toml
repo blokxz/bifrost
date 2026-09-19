@@ -19,6 +19,14 @@ clap = { version = "4", default-features = false, features = [
     "usage",
     "error-context",
 ] }
+# Terminal rendering and the TestBackend used to test screens. Default features
+# are off: no proc-macro crate, no calendar widget (pulls `time`), no layout
+# cache and no underline colors. The crossterm backend is the only one enabled
+# and crossterm itself is used through `ratatui::crossterm`, so the dependency
+# tree holds exactly one copy of it.
+ratatui = { version = "0.30.2", default-features = false, features = [
+    "crossterm",
+] }
 # Derives (de)serialization for the Bifrost store schema.
 serde = { version = "1", features = ["derive"] }
 # Reads and writes the TOML store. Only parsing, serializing and serde support.
@@ -32,3 +40,10 @@ toml = { version = "1", default-features = false, features = [
 [dev-dependencies]
 # Temporary directories (removed on drop) so tests never touch the real config dir.
 tempfile = "3"
+
+[target.'cfg(unix)'.dev-dependencies]
+# Opens a pseudo-terminal so tests/pty.rs can run the real binary in a real
+# terminal. Safe wrappers only, so the test code needs no `unsafe`. It is already
+# in the tree through crossterm (this only enables its `fs`, `pty` and `termios`
+# features), and Windows never builds it: those tests are Unix-only.
+rustix = { version = "1", features = ["fs", "pty", "termios"] }
