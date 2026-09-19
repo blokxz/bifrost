@@ -1,0 +1,44 @@
+ New host  ·  ✓ 1 Connection  ›  [2 Authentication]  ›  3 Organize  ›  4 Review
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+┌─ Connection ──────────────────────────────────────────────────────────────┐ ┌─ ? What is an SSH key ─────────────────┐
+│ Name      homelab-incus                                                   │ │                                        │
+│ Target    dev@10.0.3.14:22     ✓ port 22 open                             │ │ A key is a pair of files: a private    │
+└───────────────────────────────────────────────────────────────────────────┘ │ one that stays on this computer and    │
+                                                                              │ a public one you copy to the server.   │
+┌─ How do you want to log in? ──────────────────────────────────────────────┐ │                                        │
+│   (•) SSH key        recommended                                          │ │ The server checks you have the         │
+│   ( ) Password       asked every time · never stored                      │ │ private half without it ever leaving   │
+├───────────────────────────────────────────────────────────────────────────┤ │ your machine. It is safer than a       │
+│ Pick a key                                                                │ │ password and you type nothing.         │
+│ › id_ed25519_homelab     ed25519    ● in agent                            │ │                                        │
+│   id_ed25519_work        ed25519    ● in agent                            │ │ If you are unsure, keep the            │
+│   id_rsa_old             rsa 2048   ▲ legacy · bad permissions            │ │ recommended option. Bifrost never      │
+│   + Generate a new ed25519 key for this host                              │ │ stores passwords or passphrases.       │
+├───────────────────────────────────────────────────────────────────────────┤ │                                        │
+│ Public key on server?  not yet — press i to install it (ssh-copy-id)      │ │                                        │
+└───────────────────────────────────────────────────────────────────────────┘ │                                        │
+                                                                              │                                        │
+                                                                              │                                        │
+                                                                              │                                        │
+                                                                              │                                        │
+                                                                              │                                        │
+                                                                              │                                        │
+                                                                              │                                        │
+                                                                              │                                        │
+                                                                              │                                        │
+                                                                              │                                        │
+                                                                              │                                        │
+                                                                              │                                        │
+                                                                              │                                        │
+                                                                              │ h hide tips                            │
+                                                                              └────────────────────────────────────────┘
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ↑↓ choose   space select   ctrl+→ next step   ctrl+← back                                                   esc cancel
+
+==================== notes (not part of the render) ====================
+Screen: New host wizard, step 2 of 4. Steps: done = `green` with ✓, current = `accent` keycap, pending = `muted`.
+- Focused panel (How do you want to log in?): `accent` border.
+- (•) selected radio in `accent`; "recommended" in `green`.
+- ● in agent in `green`; ▲ legacy in `amber`. "+ Generate…" in `accent`.
+- "not yet" in `amber`.
+- Tips panel: dashed look is not possible in a terminal, so use border `border` and title in `violet`. Hidden when ui.show_tips = false (the left column then takes the full width).

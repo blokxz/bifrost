@@ -1,0 +1,43 @@
+ bifrost  v0.1.0      Hosts   Keys   Known hosts  [Settings]                                          ● unsaved changes
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+┌─ Start view ─────────────────────────────────────────────────────────┐ ┌─ config.toml preview ───────────────────────┐
+│ What opens when you run bifrost                                      │ │ ~/.config/bifrost/config.toml               │
+│                                                                      │ │                                             │
+│ › (•) Full view        hosts, details, keys and settings in panels   │ │ [ui]                                        │
+│   ( ) Quick launcher   search box only: type, press ⏎, connect       │ │ start_view = "full"  # "full" | "launcher"  │
+├──────────────────────────────────────────────────────────────────────┤ │ show_tips = true                            │
+│ Switch any time with tab · one-off override: bifrost --launcher      │ │ show_command = true                         │
+│                                                                      │ │                                             │
+└──────────────────────────────────────────────────────────────────────┘ │                                             │
+                                                                         │                                             │
+┌─ Beginner help ──────────────────────────────────────────────────────┐ │                                             │
+│   [x] Show tips panels              "What is an SSH key?" and friends│ │                                             │
+│   [x] Show equivalent ssh command   learn the flags as you go        │ │                                             │
+│                                                                      │ │                                             │
+└──────────────────────────────────────────────────────────────────────┘ │                                             │
+                                                                         │                                             │
+┌─ Security ───────────────────────────────────────────────────────────┐ │                                             │
+│   [■] Ask before trusting a new host      always on                  │ │                                             │
+│   [■] Block when a host key changes       always on                  │ │                                             │
+│                                                                      │ │                                             │
+│ These cannot be disabled from the UI on purpose.                     │ │                                             │
+│                                                                      │ │                                             │
+│                                                                      │ │                                             │
+│                                                                      │ │                                             │
+│                                                                      │ │                                             │
+│                                                                      │ │                                             │
+│                                                                      │ │                                             │
+│                                                                      │ │                                             │
+│                                                                      │ │                                             │
+│                                                                      │ │                                             │
+│                                                                      │ │ Windows: %APPDATA%\bifrost\config.toml      │
+└──────────────────────────────────────────────────────────────────────┘ └─────────────────────────────────────────────┘
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ↑↓ move   space toggle   ctrl+s save   esc discard                                                     ? help   q quit
+
+==================== notes (not part of the render) ====================
+Screen: Settings tab.
+- "● unsaved changes" in `amber` (only shown when dirty).
+- (•) / [x] in `accent`; [■] locked items in `muted` with "always on".
+- TOML preview: [ui] in `violet`, keys `bright`, strings `green`, booleans `amber`, comments `muted`.
+- OPEN QUESTION: separate config.toml vs a [ui] table in the host store TOML. The preview path is not final.

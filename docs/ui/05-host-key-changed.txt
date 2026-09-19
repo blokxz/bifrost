@@ -1,0 +1,45 @@
+ bifrost  v0.1.0     [Hosts]  Keys   Known hosts   Settings                              8 hosts · agent: 2 keys loaded
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+┌─ Hosts ────────────────────────────────────────┐ ┌─ homelab-incus ───────────────────────────────────────────────────┐
+│ / filter by name, host or tag…                 │ │ Host          10.0.3.14                                           │
+│                                                │ │ User          dev                                                 │
+│ ▾ ★ favorites (2)                              │ │ Port          22                                                  │
+│ › homelab-incus    dev@10.0.3.14               │ │ Identity      id_ed25519_homelab   ed25519 · in agent             │
+│   vps-web     ╔═ ▲ Stop — the server's identity changed ═════════════════════════════════════════════╗               │
+│               ║                                                                                      ║               │
+│ ▾ #work (3)   ║ The key presented by homelab-incus (10.0.3.14) is not the one Bifrost saved          ║               │
+│   bastion     ║ the first time you connected.                                                        ║               │
+│   db-primary  ║                                                                                      ║               │
+│   ci-runner   ║ This happens when the server was reinstalled or its keys were rotated.               ║───────────────┘
+│               ║ It can also mean someone is intercepting the connection.                             ║───────────────┐
+│ ▾ #home (3)   ║ Do not continue unless you know why it changed.                                      ║.14            │
+│   raspberry   ║                                                                                      ║earn the flags.│
+│   nas         ║ ┌──────────────────────────────────────────────────────────────────────────────────┐ ║               │
+│   printer-pi  ║ │ Saved      SHA256:7hB2kLq…Xw1e    ed25519 · first seen 2026-06-02                │ ║───────────────┘
+│               ║ │ Received   SHA256:pZ90vMe…c4Ts    ed25519 · now                                  │ ║───────────────┐
+│               ║ └──────────────────────────────────────────────────────────────────────────────────┘ ║               │
+│               ║                                                                                      ║               │
+│               ║ Tip: ask the server admin for the fingerprint, or run on the server:                 ║               │
+│               ║      ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub                                ║               │
+│               ║                                                                                      ║               │
+│               ║ [ ⏎ Abort (safe) ]   [ d  Show full details ]                  [ t  Trust new key… ] ║               │
+│               ║                                                                                      ║               │
+│               ║ Trusting requires typing the host name. The old key is kept in history.              ║               │
+│               ║                                                                                      ║               │
+│               ╚══════════════════════════════════════════════════════════════════════════════════════╝               │
+│                                                │ │                                                                   │
+│                                                │ │                                                                   │
+│                                                │ │                                                                   │
+│ ▸ ungrouped (0)                                │ │                                                                   │
+└────────────────────────────────────────────────┘ └───────────────────────────────────────────────────────────────────┘
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ⏎ abort   d details   t trust new key…
+
+==================== notes (not part of the render) ====================
+Screen: Host key changed. Modal over the full view.
+- Background screen: every cell rendered in `ghost` (very dim) color.
+- Dialog: double border in `red`, title bold `red`. Body text `bright`, explanation in `muted`.
+- Saved fingerprint in `green`, received in `red`. Fingerprint box background `bg-deep`.
+- [ ⏎ Abort (safe) ]: `accent` background, `bg` text, bold. It is the default action.
+- [ t  Trust new key… ]: `red` border/text. It opens a second prompt where the user must type the host name.
+- No key other than ⏎ / esc / d / t does anything while the dialog is open.

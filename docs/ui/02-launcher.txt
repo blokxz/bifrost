@@ -1,0 +1,45 @@
+
+
+
+
+
+                                                  b  i  f  r  o  s  t
+                                                  ━━━━━━━━━━━━━━━━━━━
+                                      type to find a host · ⏎ to cross the bridge
+
+                  ┌─ Connect ────────────────────────────────────────────────────────────────────────┐
+                  │ ❯ db█                                                                      3 / 8 │
+                  │                                                                                  │
+                  │ › db-primary        ops@10.20.0.5            ⇢ bastion    #work                  │
+                  │   debian-lab        root@192.168.1.70                     #home                  │
+                  │   deploy-box        deploy@203.0.113.20                   #work                  │
+                  ├──────────────────────────────────────────────────────────────────────────────────┤
+                  │ ⇢ will jump through bastion (ops@bastion.example.com), then db-primary           │
+                  │ $ ssh -J ops@bastion.example.com ops@10.20.0.5                                   │
+                  └──────────────────────────────────────────────────────────────────────────────────┘
+
+
+                   RECENT
+                   1  homelab-incus     18:42 today
+                   2  raspberry         yesterday
+                   3  vps-web           3 days ago
+
+
+
+
+
+
+
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+                     ↑↓ move   ⏎ connect   1-9 recent   tab full view   ctrl+n new host   esc quit
+
+==================== notes (not part of the render) ====================
+Screen: Quick launcher (start view "launcher" or `bifrost --launcher`). No tab bar.
+- Wordmark letters colored as in 01; the ━ line is 5 equal segments: red, amber, green, accent, violet.
+- Input line: "❯" in `accent`, typed text `bright`, █ is the cursor in `accent`. "3 / 8" in `muted`.
+- Fuzzy-matched characters are `accent`, bold, underlined (d…b in "db-primary", "debian-lab", "deploy-box").
+- Route preview (⇢ / $ lines) only shows when the selected host has a jump host.
+- RECENT: last 3 hosts; digits 1-9 connect directly.
+- tab switches to the full view (01) with the same host selected.

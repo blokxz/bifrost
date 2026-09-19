@@ -1,0 +1,48 @@
+ bifrost  v0.1.0     [Hosts]  Keys   Known hosts   Settings                              8 hosts · agent: 2 keys loaded
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+┌─ Hosts ────────────────────────────────────────┐ ┌─ homelab-incus ───────────────────────────────────────────────────┐
+│ / filter by name, host or tag…                 │ │ Host          10.0.3.14                                           │
+│                                                │ │ User          dev                                                 │
+│ ▾ ★ favorites (2)                              │ │ Port          22                                                  │
+│ › homelab-incus    dev@10.0.3.14               │ │ Identity      id_ed25519_homelab   ed25519 · in agent             │
+│   vps-web          deploy@203.0.113.20         │ │ Jump host     —                                                   │
+│                                                │ │ Tags          ★ favorite   #home   #incus                         │
+│ ▾ #work (3)                                    │ │ Host key      ✓ verified   SHA256:x3Jq…9fKc                       │
+│   bastion          ops@bastion.example.com     │ │ Last session  today 18:42                                         │
+│   db-primary       ops@10.20.0.5 ⇢ bastion     │ │                                                                   │
+│   ci-runner        ci@10.20.0.9 ⇢ bastion      │ └───────────────────────────────────────────────────────────────────┘
+│                                                │ ┌─ Equivalent command ──────────────────────────────────────────────┐
+│ ▾ #home (3)                                    │ │ $ ssh -i ~/.ssh/id_ed25519_homelab -p 22 dev@10.0.3.14            │
+│   raspberry        pi@192.168.1.50             │ │ Bifrost runs exactly this. Press c to copy it and learn the flags.│
+│   nas              admin@nas.local:2222        │ │                                                                   │
+│   printer-pi       pi@192.168.1.61             │ └───────────────────────────────────────────────────────────────────┘
+│                                                │ ┌─ Notes ───────────────────────────────────────────────────────────┐
+│                                                │ │ Incus container used for integration tests.                       │
+│                                                │ │ Reset with: incus restore bifrost-test clean                      │
+│                                                │ │                                                                   │
+│                                                │ │                                                                   │
+│                                                │ │                                                                   │
+│                                                │ │                                                                   │
+│                                                │ │                                                                   │
+│                                                │ │                                                                   │
+│                                                │ │                                                                   │
+│                                                │ │                                                                   │
+│                                                │ │                                                                   │
+│                                                │ │                                                                   │
+│                                                │ │                                                                   │
+│ ▸ ungrouped (0)                                │ │                                                                   │
+└────────────────────────────────────────────────┘ └───────────────────────────────────────────────────────────────────┘
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ⏎ connect   n new   e edit   f favorite   / filter   ctrl+p jump to…   tab next panel                  ? help   q quit
+
+==================== notes (not part of the render) ====================
+Screen: Full view (start view "full"). Tab bar: Hosts active.
+- Hosts panel has focus: border + title in `accent`. Other panels: border `border`, title `muted`.
+- Selected row (›): background `selection`, text `bright`. Only the focused panel shows a selection highlight.
+- Group headers: ★ favorites in `amber`, #work in `violet`, #home in `green`. Counts in `muted`.
+- Host address column and "⇢ bastion" jump hint: `muted`; the "⇢ bastion" part in `amber`.
+- Wordmark "bifrost": letters b,i,f,r,o in red, amber, green, accent, violet; "st" in `bright`, bold.
+- Active tab: `accent` background, `bg` text. Inactive tabs: `muted`.
+- Footer: key names rendered as keycaps (`keycap` background, `bright` text), labels in `muted`.
+- Details: labels `muted`; Identity name in `accent`; "✓ verified" in `green`.
+- "Equivalent command" is hidden when ui.show_command = false.

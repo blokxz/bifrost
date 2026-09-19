@@ -1,0 +1,44 @@
+ bifrost  v0.1.0      Hosts  [Keys]  Known hosts   Settings                                     ~/.ssh · agent: running
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+┌─ Keys (4) ───────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│   NAME                    TYPE        AGENT           PERMS    USED BY    HEALTH                                     │
+│                                                                                                                      │
+│   id_ed25519_homelab      ed25519     ● loaded        0600     2 hosts    ✓ ok                                       │
+│   id_ed25519_work         ed25519     ● loaded        0600     3 hosts    ✓ ok                                       │
+│ › id_rsa_old              rsa 2048    ○ not loaded    0644     1 host     ✗ 2 issues                                 │
+│   deploy_ecdsa            ecdsa 256   ○ not loaded    0600     unused     ✓ ok                                       │
+│                                                                                                                      │
+└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+┌─ id_rsa_old ─────────────────────────────────────────────┐ ┌─ ✗ Problems ────────────────────────────────────────────┐
+│ Private      ~/.ssh/id_rsa_old                           │ │                                                         │
+│ Public       ~/.ssh/id_rsa_old.pub                       │ │ 1. Other users can read this private key (0644).        │
+│ Fingerprint  SHA256:Qm4dN0x…t7Rw                         │ │    ssh will refuse to use it.                           │
+│ Comment      old-laptop                                  │ │    Fix: chmod 600 ~/.ssh/id_rsa_old                     │
+│ Passphrase   yes                                         │ │    F  apply fix now                                     │
+│ Used by      nas                                         │ │                                                         │
+│                                                          │ │ 2. RSA 2048 is a legacy key type.                       │
+│                                                          │ │    Generate an ed25519 key and replace it on "nas".     │
+│                                                          │ │    R  rotate key…                                       │
+│                                                          │ │                                                         │
+│                                                          │ │                                                         │
+│                                                          │ │                                                         │
+│                                                          │ │                                                         │
+│                                                          │ │                                                         │
+│                                                          │ │                                                         │
+│                                                          │ │                                                         │
+│                                                          │ │                                                         │
+│                                                          │ │                                                         │
+│                                                          │ │                                                         │
+│                                                          │ │                                                         │
+└──────────────────────────────────────────────────────────┘ └─────────────────────────────────────────────────────────┘
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ g generate   a add to agent   c copy public key   i install on host   R rotate                         ? help   q quit
+
+==================== notes (not part of the render) ====================
+Screen: Keys tab.
+- Column headers in `muted`.
+- ● loaded `green`; ○ not loaded `muted`; bad perms (0644) `red`; rsa 2048 `amber`; ✓ ok `green`; ✗ issues `red`.
+- Problems panel: border and title in `red`. Issue numbers: 1 `red` (blocking), 2 `amber` (advice).
+- Fix commands in `bright`; action labels ("apply fix now", "rotate key…") in `accent`.
+- F must ask for confirmation before running chmod.
