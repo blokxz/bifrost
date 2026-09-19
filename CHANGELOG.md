@@ -41,12 +41,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `~/.ssh/config`.
 - **Terminal interface** (Block 3)
   - A synchronous, single-threaded TUI built on ratatui and crossterm.
-  - Home screen with the number of saved hosts. A store that cannot be loaded
-    does not stop the TUI: the home screen explains what is wrong, which line,
-    and how to restore `hosts.toml.bak`.
+  - A store that cannot be loaded does not stop the TUI: the first screen
+    explains what is wrong, which line, and how to restore `hosts.toml.bak`.
   - Help screen, opened with `?` and closed with `?` or Esc.
-  - Keys: arrows and `j`/`k` scroll, `?` help, `q` or Esc quit, Ctrl+C quits.
-    A footer always lists the keys of the current screen.
+  - `q` or Esc quit, Ctrl+C quits. A footer always lists the keys of the
+    current screen.
   - A short message instead of a broken layout when the terminal is smaller
     than 60x15.
   - Colors from the terminal's 16 ANSI colors; `NO_COLOR` is respected. Errors
@@ -60,6 +59,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Store errors have clear English messages and a non-zero exit code.
   - Starting the TUI without an interactive terminal fails with a message that
     points to `bifrost list`.
+
+- **Host library** (Block 4)
+  - The host list: favorite marker, name, `user@hostname:port` (port only when
+    set) and tags. Favorites come first, then names ignoring case. Arrows and
+    `j`/`k`, Home/End and PageUp/PageDown move the selection, and a position
+    indicator shows when the list does not fit. An empty store explains how to
+    add the first host.
+  - Fuzzy search with `/`, with no new dependency: letters may be spread out
+    (`dbp` finds `db-prod`), prefixes and consecutive letters rank higher, and
+    name matches outrank hostname and tag matches. Results are ranked, matched
+    letters are shown in bold and underlined, and "no matches" is stated in
+    words. Enter keeps the filter, Esc clears it.
+  - `f` marks a host as a favorite and saves.
+  - `a` adds and `e` edits a host in a form: name, hostname, user, port,
+    identity file, tags and notes, then a collapsed Advanced section with jump
+    host, local and remote port forwards and agent forwarding. Every field shows
+    what it is for and an example, and is checked when you leave it. Saving is
+    blocked while anything is invalid. The jump host is chosen from a list of the
+    saved hosts that would be valid. Turning on agent forwarding shows a warning.
+    A missing key file is reported after saving. Esc asks before discarding
+    unsaved changes.
+  - `d` deletes a host after its name is typed. A host that other hosts jump
+    through is refused at once, with those hosts listed.
+  - `c` shows the ssh command for the selected host and asks the terminal to copy
+    it (OSC 52), which works over SSH. The command is always shown on screen too,
+    and the message says "copy requested", because a terminal that does not
+    support the request ignores it silently.
+  - Warnings found when loading stay visible as a one-line summary; `w` lists
+    them.
+  - A failed save never loses anything: the list is left as it was, and a form
+    keeps everything that was typed.
+- **ssh command** (Block 4)
+  - The arguments to spawn ssh with are built separately from the quoted text a
+    person pastes, and the two cannot be confused (see Security).
 
 ### Security
 
@@ -75,3 +108,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Error messages built by the library escape the same set of characters,
   including bidirectional controls, so a right-to-left override in a host name
   cannot reorder the text of a message.
+- The arguments for ssh are one element per argument with no quoting, never go
+  through a shell, and put the destination after `--`, so a hostname can never be
+  read as an option. Values are checked again where they become arguments, in
+  release builds too.
+- The command shown for pasting is quoted for the user's shell (single quotes on
+  Unix, double quotes on Windows). On Windows, values that a shell would still
+  expand inside quotes (`%`, `$`, `!`, the backtick, and a double quote) are not
+  shown at all rather than shown unsafely.
+- The clipboard request is write-only, carries the text base64-encoded so it
+  cannot end the escape sequence early, and is never sent for text containing
+  control characters. Bifrost never reads the clipboard.
+- Deleting a host requires typing its name exactly, and a host that others jump
+  through cannot be deleted.

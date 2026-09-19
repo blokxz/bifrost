@@ -167,6 +167,80 @@ settled: reopen one only with a clear new reason.
   `ratatui::crossterm`.** There is exactly one crossterm in the dependency tree,
   and no proc-macro or calendar dependencies.
 
+## Host library
+
+- **Search is fuzzy subsequence matching with scoring, written in the project.**
+  It is about 150 lines and needs no dependency. Letters can be spread out; a
+  prefix, a word start or consecutive letters score higher; a match in the name
+  outranks one in the hostname, which outranks one in a tag. Nothing is searched
+  that could not be seen: name, hostname and tags only, never the user or notes.
+- **Matched letters are shown bold and underlined, the selected row in reverse
+  video, and favorites with a `*`.** None of these needs color, so they survive
+  `NO_COLOR` and any palette.
+- **The selection is remembered by host name, not by row.** It follows its host
+  when the order changes, for example after a favorite moves to the top.
+- **Every change is applied to a copy, saved, and only then shown.** If saving
+  fails, the screen still matches the file, and the error says why. A form that
+  fails to save stays open with everything typed, so nothing is lost.
+- **If the store cannot be loaded there is no host list, and adding, editing and
+  deleting are switched off.** `Store::save` would refuse to overwrite the
+  damaged file anyway; the screen explains the problem instead of pretending.
+- **The form uses the store's own validators, and the whole collection is
+  validated again on save.** A field can never accept what the store would
+  refuse, and what one field cannot know (a name that is taken, a jump host that
+  no longer exists) is caught and shown on the right field.
+- **A field is checked when the focus leaves it, not while typing.** Errors do
+  not flash at someone still typing, and an error goes away as soon as the field
+  is edited. Surrounding whitespace is trimmed on single-line fields, since it is
+  never meaningful and the store would refuse it.
+- **The jump host is picked from a list of hosts that would be valid.** Each
+  candidate is tried against the real validation (no loops, at most 5 hops, and
+  not pushing a host that hops through this one over the limit), so the list can
+  never offer a choice that saving then refuses.
+- **Notes are edited on one line, with `\n`, `\t` and `\\` as escapes.** A
+  multi-line note from the store survives editing unchanged; a real multi-line
+  editor would be far more code for a field that is never sent anywhere. The
+  field's help says how to insert a line break.
+- **Ctrl+C in a form with unsaved changes asks first.** Pressing it again quits.
+  A keystroke must not throw away typed work.
+- **Deleting needs the host's name typed exactly, case included.** It is a
+  destructive action with no undo, so it takes a deliberate act, not a `y`.
+  A host that others jump through is refused before asking anything, using the
+  Block 2 error that lists them, because typing the name would lead nowhere.
+- **The ssh command exists in two forms that cannot be confused.** `SshArgs` is
+  what is spawned: one element per argument, no quoting, options first, then
+  `--` and the destination. `DisplayCommand` is text for a person, quoted for
+  their shell, and cannot become arguments. Real ssh confirms why `--` matters:
+  without it, `-oProxyCommand=evil` is read as an option.
+- **The display string is quoted for the shell, and refuses what it cannot quote
+  safely.** POSIX shells get single quotes, inside which nothing is special.
+  Windows gets double quotes, but `%`, `!`, `$`, the backtick and a double quote
+  are still interpreted inside them by cmd.exe or PowerShell, so a value holding
+  one is not shown rather than shown unsafely. A comma, bracket or leading `@` is
+  quoted there too, because PowerShell reads them as syntax.
+- **Copying asks the terminal to copy with OSC 52; there is no clipboard
+  library.** The clipboard belongs to the terminal, which is what makes it work
+  over SSH, where this tool is used. The alternative, a library such as `arboard`,
+  would add between 17 and 53 crates depending on features, and on Linux the
+  clipboard is served by the process that set it, so its contents vanish when
+  Bifrost exits (its own documentation says so); it also has no clipboard to talk
+  to over SSH or without a display.
+- **The command is always shown on screen, and the message says "copy
+  requested", never "copied".** A terminal that does not support OSC 52 ignores
+  it silently, some ask first or have it switched off, and tmux forwards it only
+  when its `set-clipboard` option allows. Bifrost cannot know whether it worked,
+  so the on-screen command is the part that always does. It is drawn across the
+  full width with no side borders, so selecting it with the mouse copies the
+  command and nothing else.
+- **The clipboard request is write-only and refuses control characters.** Bifrost
+  never asks the terminal for what is on the clipboard, and text with a line
+  break or escape is not sent: what is copied is meant to be pasted into a shell.
+- **The real binary is tested in a pseudo-terminal, and the real ssh in ignored
+  tests.** Screens are tested with `TestBackend`; the raw-mode, cursor, resize,
+  save-to-disk and clipboard behavior is only visible in a terminal, and whether
+  ssh reads the arguments as meant is only visible to ssh (`ssh -G`, which needs
+  no network), so that test is `#[ignore]` and run by hand.
+
 ## Known limitations in 0.1.0
 
 - **Jump host keys.** Bifrost expands a jump host to `user@host:port` from its
@@ -174,6 +248,14 @@ settled: reopen one only with a clear new reason.
   must be in `ssh-agent` or be one of ssh's default keys.
 - **Windows file permissions are not verified.** Bifrost relies on the ACLs
   inherited from `%APPDATA%` and does not check them. Verification is deferred.
+- **Copying cannot be confirmed.** OSC 52 is a request; support varies between
+  terminals and multiplexers. The command is always on screen as the fallback.
+- **On Windows, a command containing `%`, `!`, `$`, a backtick or a double quote
+  cannot be shown.** Those characters are still interpreted inside double quotes,
+  and showing them unquoted would be unsafe. Such values are rare (a key path
+  with a `%` in it, for example).
+- **Notes are edited on one line.** Line breaks and tabs are typed as `\n` and
+  `\t`.
 
 ## Out of scope for 0.1.0
 

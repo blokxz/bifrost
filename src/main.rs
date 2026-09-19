@@ -36,7 +36,10 @@ fn run(action: Action, out: &mut impl Write, err: &mut impl Write) -> Result<()>
         Action::OpenTui => {
             // A store that cannot be found or read must not stop the TUI from
             // opening: the home screen explains the problem.
-            let loaded = Store::from_process_env().and_then(|store| store.load());
+            let loaded = Store::from_process_env().and_then(|store| {
+                let loaded = store.load()?;
+                Ok((store, loaded))
+            });
             tui::run(loaded, &process_env)
         }
         // Block 5 stub. `{:?}` escapes control characters in the user-supplied

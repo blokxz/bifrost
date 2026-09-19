@@ -49,6 +49,39 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
+/// Cuts `text` to at most `width` cells, ending in `...` when something had to go.
+///
+/// Returns the text to show and how many characters of the original it keeps,
+/// so that highlights beyond the cut can be dropped. Text that fits is returned
+/// whole. With a `width` too small for the dots, the text is simply cut.
+pub fn truncate(text: &str, width: usize) -> (String, usize) {
+    if display_width(text) <= width {
+        return (text.to_string(), text.chars().count());
+    }
+    let dots = if width > 3 { "..." } else { "" };
+    let budget = width - dots.len();
+    let mut shown = String::new();
+    let mut used = 0;
+    let mut kept = 0;
+    for ch in text.chars() {
+        let ch_width = display_width(ch.encode_utf8(&mut [0; 4]));
+        if used + ch_width > budget {
+            break;
+        }
+        shown.push(ch);
+        used += ch_width;
+        kept += 1;
+    }
+    shown.push_str(dots);
+    (shown, kept)
+}
+
+/// `text` followed by spaces up to `width` cells (unchanged if already wider).
+pub fn pad(text: &str, width: usize) -> String {
+    let missing = width.saturating_sub(display_width(text));
+    format!("{text}{}", " ".repeat(missing))
+}
+
 fn take_trimmed(line: &mut String) -> String {
     let trimmed = line.trim_end_matches(' ').to_string();
     line.clear();
@@ -127,6 +160,52 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn text_that_fits_is_not_truncated() {
+        assert_eq!(truncate("web-01", 6), ("web-01".to_string(), 6));
+        assert_eq!(truncate("web", 10), ("web".to_string(), 3));
+        assert_eq!(truncate("", 4), (String::new(), 0));
+    }
+
+    #[test]
+    fn long_text_ends_in_dots_within_the_width() {
+        let (shown, kept) = truncate("production-database", 10);
+        assert_eq!(shown, "product...");
+        assert_eq!(kept, 7);
+        assert_eq!(display_width(&shown), 10);
+    }
+
+    #[test]
+    fn truncation_never_exceeds_the_width() {
+        for width in 0..30 {
+            let (shown, _) = truncate("production-database.example.com", width);
+            assert!(
+                display_width(&shown) <= width,
+                "width {width}: {shown:?} is too wide"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tiny_width_cuts_without_dots() {
+        assert_eq!(truncate("abcdef", 3), ("abc".to_string(), 3));
+        assert_eq!(truncate("abcdef", 0), (String::new(), 0));
+    }
+
+    #[test]
+    fn truncation_counts_wide_characters_double() {
+        let (shown, kept) = truncate("日本語日本語", 7);
+        assert!(display_width(&shown) <= 7, "{shown:?}");
+        assert_eq!(kept, 2);
+    }
+
+    #[test]
+    fn pad_fills_to_the_width_and_never_cuts() {
+        assert_eq!(pad("ab", 5), "ab   ");
+        assert_eq!(pad("abcdef", 3), "abcdef");
+        assert_eq!(pad("日本", 6), "日本  ");
     }
 
     #[test]

@@ -234,6 +234,11 @@ impl Store {
         Store::from_env(&sysenv::process_env)
     }
 
+    /// The home directory used to expand `~` in identity file paths, if known.
+    pub fn home(&self) -> Option<&Path> {
+        self.home.as_deref()
+    }
+
     pub fn dir(&self) -> &Path {
         &self.dir
     }
@@ -706,5 +711,13 @@ mod tests {
         let store = Store::from_env(&env).unwrap();
         store.save(&hosts).unwrap();
         assert_eq!(store.load().unwrap().warnings.len(), 1);
+    }
+
+    #[test]
+    fn home_is_the_one_given_to_the_store() {
+        let dir = std::env::temp_dir();
+        assert_eq!(Store::at(&dir).home(), None);
+        let store = Store::at(&dir).with_home(Some(abs("home/rein")));
+        assert_eq!(store.home(), Some(abs("home/rein").as_path()));
     }
 }

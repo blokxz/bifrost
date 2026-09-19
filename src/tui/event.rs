@@ -7,7 +7,7 @@ use ratatui::Terminal;
 use ratatui::backend::Backend;
 use ratatui::crossterm::event::{self, Event, KeyEvent, KeyEventKind};
 
-use super::app::App;
+use super::app::{App, Metrics};
 use super::theme::Theme;
 use super::ui;
 
@@ -40,23 +40,29 @@ pub fn next_crossterm_event(timeout: Duration) -> io::Result<Option<Event>> {
 /// Runs until the app asks to quit.
 ///
 /// `next_event` waits up to the given duration and returns the event that
-/// arrived, or `None` on timeout. It is a parameter so tests can script input.
+/// arrived, or `None` on timeout. `copy` asks the terminal to copy some text
+/// (see [`super::clipboard`]). Both are parameters so tests can script input
+/// and record what would be copied.
 pub fn run_loop<B: Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
     theme: &Theme,
     mut next_event: impl FnMut(Duration) -> io::Result<Option<Event>>,
+    mut copy: impl FnMut(&str) -> io::Result<()>,
 ) -> io::Result<()> {
     while !app.should_quit() {
-        let mut max_scroll = 0;
+        let mut metrics = Metrics::default();
         terminal
-            .draw(|frame| max_scroll = ui::render(app, theme, frame))
+            .draw(|frame| metrics = ui::render(app, theme, frame))
             .map_err(|err| io::Error::other(err.to_string()))?;
-        app.set_max_scroll(max_scroll);
+        app.apply_metrics(metrics);
 
         let event = next_event(TICK)?;
         if let Some(key) = event.as_ref().and_then(key_press) {
             app.handle_key(key);
+            if let Some(text) = app.take_copy_request() {
+                copy(&text)?;
+            }
         }
     }
     Ok(())
@@ -65,7 +71,9 @@ pub fn run_loop<B: Backend>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::Hosts;
     use crate::tui::app::Screen;
+    use crate::tui::persist::testing::FakeStore;
     use crate::tui::startup::Startup;
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{KeyCode, KeyModifiers, MouseEvent, MouseEventKind};
@@ -104,17 +112,24 @@ mod tests {
     /// runs out the source fails, so a loop that should have stopped by then
     /// but did not shows up as an error instead of hanging.
     fn run(script: Vec<Option<Event>>) -> (io::Result<()>, App) {
-        let mut app = App::new(Startup {
-            host_count: Some(0),
-            notices: Vec::new(),
-        });
+        let mut app = App::new(Startup::loaded(
+            Hosts::new(),
+            FakeStore::default(),
+            Vec::new(),
+        ));
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         let mut script: VecDeque<_> = script.into();
-        let result = run_loop(&mut terminal, &mut app, &Theme::ansi16(), |_| {
-            script
-                .pop_front()
-                .ok_or_else(|| io::Error::other("script exhausted"))
-        });
+        let result = run_loop(
+            &mut terminal,
+            &mut app,
+            &Theme::ansi16(),
+            |_| {
+                script
+                    .pop_front()
+                    .ok_or_else(|| io::Error::other("script exhausted"))
+            },
+            |_| Ok(()),
+        );
         (result, app)
     }
 
@@ -176,23 +191,110 @@ mod tests {
 
     #[test]
     fn the_loop_reports_the_scroll_limit_back_to_the_app() {
-        use crate::tui::startup::Notice;
-        let mut app = App::new(Startup {
-            host_count: Some(0),
-            notices: (1..=30)
-                .map(|n| Notice::warning(format!("problem {n}")))
-                .collect(),
-        });
+        let mut app = App::new(Startup::loaded(
+            Hosts::new(),
+            FakeStore::default(),
+            Vec::new(),
+        ));
         let mut terminal = Terminal::new(TestBackend::new(60, 15)).unwrap();
-        let mut script: VecDeque<_> = (0..100)
-            .map(|_| Some(press('j')))
+        // Open the help, which is longer than the screen, and scroll far past
+        // its end. Without the limit fed back after each draw this would end
+        // at 100.
+        let mut script: VecDeque<_> = std::iter::once(Some(press('?')))
+            .chain((0..100).map(|_| Some(press('j'))))
             .chain([Some(press('q'))])
             .collect();
-        run_loop(&mut terminal, &mut app, &Theme::ansi16(), |_| {
-            Ok(script.pop_front().unwrap())
-        })
+        run_loop(
+            &mut terminal,
+            &mut app,
+            &Theme::ansi16(),
+            |_| Ok(script.pop_front().unwrap()),
+            |_| Ok(()),
+        )
         .unwrap();
-        // 59 body lines, 10 visible: the last scroll position is 49, not 100.
-        assert_eq!(app.scroll(), 49);
+        assert!(app.scroll() > 0, "the help scrolled");
+        assert!(
+            app.scroll() < 100,
+            "but stopped at its end: {}",
+            app.scroll()
+        );
+    }
+
+    #[test]
+    fn the_loop_reports_the_number_of_visible_rows_to_the_list() {
+        use crate::domain::Host;
+        let hosts = Hosts::from_vec(
+            (0..40)
+                .map(|n| Host::new(format!("host-{n:02}"), "192.0.2.1"))
+                .collect(),
+        )
+        .unwrap();
+        let mut app = App::new(Startup::loaded(hosts, FakeStore::default(), Vec::new()));
+        let mut terminal = Terminal::new(TestBackend::new(60, 15)).unwrap();
+        let mut script: VecDeque<_> = [
+            Some(key_event(KeyCode::PageDown, KeyEventKind::Press)),
+            Some(press('q')),
+        ]
+        .into();
+        run_loop(
+            &mut terminal,
+            &mut app,
+            &Theme::ansi16(),
+            |_| Ok(script.pop_front().unwrap()),
+            |_| Ok(()),
+        )
+        .unwrap();
+        // One screenful down: more than one row, fewer than all of them.
+        let selected = app.list().selected.clone().unwrap();
+        let row: usize = selected.trim_start_matches("host-").parse().unwrap();
+        assert!((2..20).contains(&row), "{selected}");
+    }
+
+    #[test]
+    fn a_copy_request_reaches_the_copy_hook_once_and_only_for_key_presses() {
+        use crate::domain::Host;
+        let mut web = Host::new("web", "web.example.com");
+        web.user = Some("deploy".to_string());
+        let hosts = Hosts::from_vec(vec![web]).unwrap();
+        let mut app = App::new(Startup::loaded(hosts, FakeStore::default(), Vec::new()));
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut script: VecDeque<_> = [
+            // A release of `c` is not a key press: nothing happens.
+            Some(key_event(KeyCode::Char('c'), KeyEventKind::Release)),
+            Some(press('c')),
+            Some(press('x')),
+            Some(press('q')),
+        ]
+        .into();
+        let mut copied = Vec::new();
+        run_loop(
+            &mut terminal,
+            &mut app,
+            &Theme::ansi16(),
+            |_| Ok(script.pop_front().unwrap()),
+            |text| {
+                copied.push(text.to_string());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(copied, ["ssh -l deploy -- web.example.com"]);
+    }
+
+    #[test]
+    fn a_failing_copy_hook_stops_the_loop_with_its_error() {
+        use crate::domain::Host;
+        let hosts = Hosts::from_vec(vec![Host::new("web", "web.example.com")]).unwrap();
+        let mut app = App::new(Startup::loaded(hosts, FakeStore::default(), Vec::new()));
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut script: VecDeque<_> = [Some(press('c'))].into();
+        let result = run_loop(
+            &mut terminal,
+            &mut app,
+            &Theme::ansi16(),
+            |_| Ok(script.pop_front().unwrap()),
+            |_| Err(io::Error::other("terminal gone")),
+        );
+        assert_eq!(result.unwrap_err().to_string(), "terminal gone");
     }
 }

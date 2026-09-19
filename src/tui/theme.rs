@@ -23,6 +23,12 @@ pub struct Theme {
     pub key: Style,
     /// Secondary text such as scroll positions.
     pub muted: Style,
+    /// The selected row of a list. Reverse video, so it needs no color.
+    pub selected: Style,
+    /// Characters that matched a search. Bold and underlined, so it needs no color.
+    pub highlight: Style,
+    /// The favorite marker.
+    pub favorite: Style,
 }
 
 impl Theme {
@@ -34,6 +40,9 @@ impl Theme {
             warning: Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
             key: Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
             muted: Style::new().fg(Color::DarkGray),
+            selected: Style::new().add_modifier(Modifier::REVERSED),
+            highlight: Style::new().add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            favorite: Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         }
     }
 
@@ -45,6 +54,9 @@ impl Theme {
             warning: Style::new().add_modifier(Modifier::BOLD),
             key: Style::new().add_modifier(Modifier::BOLD),
             muted: Style::new().add_modifier(Modifier::DIM),
+            selected: Style::new().add_modifier(Modifier::REVERSED),
+            highlight: Style::new().add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            favorite: Style::new().add_modifier(Modifier::BOLD),
         }
     }
 
@@ -66,13 +78,16 @@ mod tests {
     use crate::sysenv::testing::fake_env;
     use std::ffi::OsString;
 
-    fn styles(theme: &Theme) -> [Style; 5] {
+    fn styles(theme: &Theme) -> [Style; 8] {
         [
             theme.title,
             theme.error,
             theme.warning,
             theme.key,
             theme.muted,
+            theme.selected,
+            theme.highlight,
+            theme.favorite,
         ]
     }
 
@@ -95,6 +110,19 @@ mod tests {
         let theme = Theme::plain();
         assert!(theme.error.add_modifier.contains(Modifier::BOLD));
         assert!(theme.muted.add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn selection_and_search_highlights_do_not_depend_on_color() {
+        // Both themes mark them with modifiers alone, so they survive NO_COLOR
+        // and terminals that cannot show the difference between colors.
+        for theme in [Theme::ansi16(), Theme::plain()] {
+            assert!(theme.selected.add_modifier.contains(Modifier::REVERSED));
+            assert_eq!(theme.selected.fg, None);
+            assert!(theme.highlight.add_modifier.contains(Modifier::UNDERLINED));
+            assert!(theme.highlight.add_modifier.contains(Modifier::BOLD));
+            assert_eq!(theme.highlight.fg, None);
+        }
     }
 
     #[test]

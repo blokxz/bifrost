@@ -237,7 +237,7 @@ fn render_host(out: &mut String, host: &Host, chain: &[&Host]) -> Result<(), Exp
 }
 
 /// `[user@]host:port` for one hop of a ProxyJump, with the port always explicit.
-fn jump_spec(hop: &Host) -> String {
+pub(super) fn jump_spec(hop: &Host) -> String {
     let endpoint = endpoint(&hop.hostname, hop.port.unwrap_or(22));
     match &hop.user {
         Some(user) => format!("{user}@{endpoint}"),
@@ -246,7 +246,7 @@ fn jump_spec(hop: &Host) -> String {
 }
 
 /// `host:port`, with brackets around IPv6 addresses.
-fn endpoint(host: &str, port: u16) -> String {
+pub(super) fn endpoint(host: &str, port: u16) -> String {
     if host.contains(':') {
         format!("[{host}]:{port}")
     } else {
