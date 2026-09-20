@@ -7,6 +7,7 @@
 //! - [`list`], [`fuzzy`], [`input`]: the host list, the search and text editing.
 //! - [`form`]: the add/edit form's state machine.
 //! - [`clipboard`]: asking the terminal to copy text (OSC 52).
+//! - [`effects`]: what the app asks the outside world to do, and how it is done.
 //! - [`handover`]: giving the terminal to ssh and taking it back.
 //! - [`ui`], [`theme`], [`wrap`]: rendering.
 //! - [`event`]: the single-threaded event loop.
@@ -19,12 +20,12 @@ use ratatui::backend::CrosstermBackend;
 use crate::error::{AppError, Result};
 use crate::ssh::binary::{resolve_keygen, resolve_ssh};
 use crate::ssh::interrupt;
-use crate::ssh::keygen::{Removal, remove_known_host};
 use crate::store::{Loaded, Store, StoreError};
 use crate::sysenv::{Env, Platform, home_dir};
 
 pub mod app;
 pub mod clipboard;
+pub mod effects;
 pub mod event;
 pub mod form;
 pub mod fuzzy;
@@ -38,7 +39,8 @@ pub mod theme;
 pub mod ui;
 pub mod wrap;
 
-use app::{App, ConnectResult};
+use app::App;
+use effects::System;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use startup::Startup;
 use terminal::{CrosstermOps, TerminalGuard};
@@ -57,8 +59,9 @@ pub fn run(loaded: std::result::Result<(Store, Loaded), StoreError>, env: Env<'_
     let mut app = App::new(Startup::from_load(loaded));
     let theme = Theme::from_env(env);
 
-    // Resolved once, before anything runs, to an absolute path. Not finding it is
-    // not fatal: the list still works, and connecting explains what is missing.
+    // Resolved once, before anything runs, to an absolute path. Not finding one
+    // is not fatal: the list still works, and the action that needs it explains
+    // what is missing.
     let ssh = resolve_ssh();
     let keygen = resolve_keygen();
     // The file `ssh-keygen -R` edits when it is not told which: the only one
@@ -74,6 +77,7 @@ pub fn run(loaded: std::result::Result<(Store, Loaded), StoreError>, env: Env<'_
     // Created before the ratatui terminal so that it is dropped after it.
     let mut guard = TerminalGuard::enter(CrosstermOps)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    let mut system = System::new(&mut guard, ssh, keygen);
 
     event::run_loop(
         &mut terminal,
@@ -90,16 +94,7 @@ pub fn run(loaded: std::result::Result<(Store, Loaded), StoreError>, env: Env<'_
             }
             event::next_crossterm_event(timeout)
         },
-        |text| clipboard::copy_to_terminal(&mut io::stdout().lock(), text),
-        |request| match &ssh {
-            Ok(path) => handover::connect(&mut guard, path, request),
-            Err(missing) => Ok(ConnectResult::Failed(missing.to_string())),
-        },
-        |target| match &keygen {
-            Ok(path) => remove_known_host(path, &target.entry)
-                .unwrap_or_else(|err| Removal::Failed(format!("Could not run ssh-keygen: {err}"))),
-            Err(missing) => Removal::Failed(missing.to_string()),
-        },
+        |request| system.execute(request),
     )?;
     Ok(())
 }

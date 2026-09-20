@@ -484,6 +484,7 @@ pub(super) fn render_help(app: &App, theme: &Theme, frame: &mut Frame, area: Rec
 mod tests {
     use super::super::testing::*;
     use super::*;
+    use crate::tui::effects::testing::take_connect_request;
     use crate::tui::startup::Notice;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -950,7 +951,7 @@ mod tests {
         let mut app = app_with(one_host(), Vec::new());
         app.set_known_hosts_file(Some(std::path::PathBuf::from(KNOWN_HOSTS)));
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        let request = app.take_connect_request().unwrap();
+        let request = take_connect_request(&mut app).unwrap();
         fail(&mut app, &changed_key_output(host, file));
         assert_eq!(request.name, "web");
         app
@@ -1034,7 +1035,7 @@ mod tests {
         app.set_known_hosts_file(Some(std::path::PathBuf::from(KNOWN_HOSTS)));
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        app.take_connect_request().unwrap();
+        take_connect_request(&mut app).unwrap();
         fail(&mut app, &changed_key_output("192.0.2.7", KNOWN_HOSTS));
         let words = flat(&text_of(&mut app, 100, 40));
         assert!(
@@ -1048,7 +1049,7 @@ mod tests {
         let mut app = app_with(one_host(), Vec::new());
         app.set_known_hosts_file(Some(std::path::PathBuf::from(KNOWN_HOSTS)));
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        app.take_connect_request().unwrap();
+        take_connect_request(&mut app).unwrap();
         fail(
             &mut app,
             "REMOTE HOST IDENTIFICATION HAS CHANGED!\r\n\
@@ -1068,7 +1069,7 @@ mod tests {
     fn with_no_key_type_the_tip_is_generic() {
         let mut app = app_with(one_host(), Vec::new());
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        app.take_connect_request().unwrap();
+        take_connect_request(&mut app).unwrap();
         fail(
             &mut app,
             "REMOTE HOST IDENTIFICATION HAS CHANGED!\r\nHost key verification failed.\r\n",
@@ -1181,7 +1182,7 @@ mod tests {
         let mut app = app_with(one_host(), Vec::new());
         app.set_known_hosts_file(Some(std::path::PathBuf::from(KNOWN_HOSTS)));
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        app.take_connect_request().unwrap();
+        take_connect_request(&mut app).unwrap();
         fail(
             &mut app,
             "REMOTE HOST IDENTIFICATION HAS CHANGED!\r\n\

@@ -405,6 +405,45 @@ settled: reopen one only with a clear new reason.
   Bifrost looks for it: the system OpenSSH directory under `SystemRoot` on
   Windows, a `PATH` entry elsewhere. The real ssh is never found.
 
+## Effects
+
+- **The app asks for outside work with one queue of requests, and the event loop
+  carries each out with one `execute` function.** `App` still does no I/O. A key
+  that means "copy this", "connect to that" or "remove this key" queues a
+  `Request`; the loop gives each to `execute` and hands the `Response` back to
+  the app. This replaced one hook per action: the loop was at clippy's limit of
+  seven parameters, and Block 6 adds about six more actions (keys, generating,
+  the agent, copying a key to a host, importing, exporting). Now the loop stays
+  the same size, and a test scripts the whole outside world with one closure.
+  It was done as a change of its own, with no change in behavior, and the
+  existing tests are what showed that.
+- **`System` is the real `execute`.** It owns the terminal guard and the programs
+  found at startup. A program that is missing is answered with what to install,
+  not with an error that would end the loop: an error from `execute` means the
+  terminal could not be recovered.
+- **Requests that take the terminal are known by the request.** A connection is
+  followed by a full repaint at the size the terminal has then; a copy is not.
+- **A response of the wrong kind is shown to the user as an internal error**
+  instead of being ignored, so a mistake in whoever carries requests out cannot
+  leave the app waiting for a result that will not come.
+
+## Keys (Block 6, decided before it is built)
+
+- **The generate form warns before, and Bifrost does not try to find out
+  afterwards whether a passphrase was set.** `ssh-keygen` asks for the passphrase
+  itself, on the real terminal, so Bifrost never sees it. The form says that
+  `ssh-keygen` will ask for one and that leaving it empty means anyone who has
+  the file can use the key: the moment the user can act on it. Three ways of
+  detecting it afterwards were considered and refused. Probing with
+  `ssh-keygen -y -P ''` puts a passphrase on the command line, and that rule has
+  no exceptions. Reading the cipher name from the private key's header is parsing
+  a private key file, which was decided against. And warning every time whatever
+  happened would teach people to ignore the warning. For the same reason the keys
+  list has no "passphrase" column: it is information Bifrost cannot get without
+  breaking one of these.
+- **Only ed25519 is generated.** Someone who needs RSA for an old server
+  generates it with `ssh-keygen` and Bifrost lists it.
+
 ## Known limitations in 0.1.0
 
 - **Jump host keys.** Bifrost expands a jump host to `user@host:port` from its

@@ -7,6 +7,7 @@
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use super::effects::{Request, Response};
 use super::form::{Form, FormField, FormMode, Outcome};
 use super::input::TextInput;
 use super::list::{self, ListState, Row};
@@ -19,6 +20,7 @@ use crate::ssh::command::{
 use crate::ssh::connect::Outcome as SshOutcome;
 use crate::ssh::diagnose::{FailureKind, Verdict, classify, host_key_change};
 use crate::ssh::keygen::Removal;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 
 /// The screens of the TUI.
@@ -311,10 +313,9 @@ pub struct App {
     form: Option<Form>,
     delete: Option<DeleteConfirm>,
     command: Option<CommandView>,
-    /// Text to ask the terminal to copy; taken by the event loop.
-    copy_request: Option<String>,
-    /// A connection to start; taken by the event loop.
-    connect_request: Option<ConnectRequest>,
+    /// What the app wants done outside itself, oldest first; taken by the event
+    /// loop (see [`super::effects`]).
+    requests: VecDeque<Request>,
     /// How the last connection ended.
     report: Option<ConnectionReport>,
     /// The `known_hosts` names of the connection that was last requested.
@@ -323,8 +324,6 @@ pub struct App {
     known_hosts_file: Option<PathBuf>,
     key_change: Option<KeyChangeView>,
     key_confirm: Option<RemovalConfirm>,
-    /// A removal to run; taken by the event loop.
-    removal_request: Option<KnownHostsTarget>,
     /// Where the ssh output goes back to when it is closed.
     output_return: Screen,
     status: Option<Status>,
@@ -348,14 +347,12 @@ impl App {
             form: None,
             delete: None,
             command: None,
-            copy_request: None,
-            connect_request: None,
+            requests: VecDeque::new(),
             report: None,
             pending_known_hosts: Vec::new(),
             known_hosts_file: None,
             key_change: None,
             key_confirm: None,
-            removal_request: None,
             output_return: Screen::List,
             status: None,
             help_scroll: 0,
@@ -409,18 +406,31 @@ impl App {
         self.command.as_ref()
     }
 
-    /// The text to ask the terminal to copy, if a copy was just requested. It is
-    /// returned once: the caller sends it to the terminal (see
-    /// [`super::clipboard`]).
-    pub fn take_copy_request(&mut self) -> Option<String> {
-        self.copy_request.take()
+    /// The oldest thing the app wants done outside itself, if there is one. It
+    /// is returned once: the caller carries it out and reports back with
+    /// [`App::handle_response`].
+    pub fn take_request(&mut self) -> Option<Request> {
+        self.requests.pop_front()
     }
 
-    /// The connection to start, if the user just asked for one. It is returned
-    /// once; the caller runs ssh and reports back with
-    /// [`App::connection_ended`].
-    pub fn take_connect_request(&mut self) -> Option<ConnectRequest> {
-        self.connect_request.take()
+    /// Takes in what came of `request`.
+    pub fn handle_response(&mut self, request: &Request, response: Response) {
+        match (request, response) {
+            (Request::Copy(_), Response::Copied) => {}
+            (Request::Connect(request), Response::Connected(result)) => {
+                self.connection_ended(&request.name, result);
+            }
+            (Request::RemoveKey(target), Response::KeyRemoved(result)) => {
+                self.key_removal_finished(target, result);
+            }
+            // Whoever carries requests out answers each with its own kind of
+            // response; anything else is a mistake there, and the user is told
+            // rather than left waiting for a result that will not come.
+            (_, other) => self.set_status(
+                StatusKind::Error,
+                format!("Internal error: unexpected response {other:?}."),
+            ),
+        }
     }
 
     /// Tells the app which `known_hosts` file removing an old key edits: the one
@@ -438,12 +448,6 @@ impl App {
     /// The removal confirmation, while it is showing.
     pub fn key_confirm(&self) -> Option<&RemovalConfirm> {
         self.key_confirm.as_ref()
-    }
-
-    /// The key to remove, if the user just confirmed it. Returned once; the
-    /// caller runs `ssh-keygen -R` and reports with [`App::key_removal_finished`].
-    pub fn take_removal_request(&mut self) -> Option<KnownHostsTarget> {
-        self.removal_request.take()
     }
 
     /// How the last connection ended, if there was one.
@@ -972,11 +976,11 @@ impl App {
         match built {
             Ok((args, known_hosts)) => {
                 self.pending_known_hosts.clone_from(&known_hosts);
-                self.connect_request = Some(ConnectRequest {
+                self.requests.push_back(Request::Connect(ConnectRequest {
                     name,
                     args,
                     known_hosts,
-                });
+                }));
             }
             Err(err) => self.set_status(StatusKind::Error, err.to_string()),
         }
@@ -1157,10 +1161,13 @@ impl App {
                 // The name must match exactly, case included.
                 if confirm.input.value() == saved_name {
                     self.key_confirm = None;
-                    self.removal_request = self
+                    if let Some(target) = self
                         .key_change
                         .as_ref()
-                        .and_then(|view| view.removal.clone());
+                        .and_then(|view| view.removal.clone())
+                    {
+                        self.requests.push_back(Request::RemoveKey(target));
+                    }
                 } else {
                     confirm.mismatch = true;
                 }
@@ -1227,7 +1234,7 @@ impl App {
                     host: host.name.clone(),
                     text: text.clone(),
                 });
-                self.copy_request = Some(text);
+                self.requests.push_back(Request::Copy(text));
                 self.mode = ListMode::Command;
             }
             Err(err) => self.set_status(StatusKind::Error, err.to_string()),
@@ -1408,6 +1415,9 @@ mod tests {
     use super::*;
     use crate::domain::Host;
     use crate::ssh::connect::Exit;
+    use crate::tui::effects::testing::{
+        take_connect_request, take_copy_request, take_removal_request,
+    };
     use crate::tui::persist::testing::FakeStore;
     use ratatui::crossterm::event::KeyEventKind;
 
@@ -2764,7 +2774,7 @@ mod tests {
         assert_eq!(view.host, "web");
         assert_eq!(view.text, "ssh -l deploy -p 2222 -- web.example.com");
         assert_eq!(
-            app.take_copy_request().as_deref(),
+            take_copy_request(&mut app).as_deref(),
             Some("ssh -l deploy -p 2222 -- web.example.com")
         );
     }
@@ -2773,8 +2783,8 @@ mod tests {
     fn a_copy_request_is_handed_out_once() {
         let (mut app, _) = app_with(deploy_host(), Vec::new());
         app.handle_key(ch('c'));
-        assert!(app.take_copy_request().is_some());
-        assert!(app.take_copy_request().is_none());
+        assert!(take_copy_request(&mut app).is_some());
+        assert!(take_copy_request(&mut app).is_none());
     }
 
     #[test]
@@ -2802,9 +2812,9 @@ mod tests {
     fn closing_the_command_does_not_ask_for_another_copy() {
         let (mut app, _) = app_with(deploy_host(), Vec::new());
         app.handle_key(ch('c'));
-        app.take_copy_request();
+        take_copy_request(&mut app);
         app.handle_key(ch('x'));
-        assert!(app.take_copy_request().is_none());
+        assert!(take_copy_request(&mut app).is_none());
     }
 
     #[test]
@@ -2848,7 +2858,7 @@ mod tests {
                 .text
                 .contains("no host to show a command for")
         );
-        assert!(app.take_copy_request().is_none());
+        assert!(take_copy_request(&mut app).is_none());
     }
 
     #[test]
@@ -2863,7 +2873,7 @@ mod tests {
                     .text
                     .contains("until the problem above is fixed")
             );
-            assert!(app.take_copy_request().is_none());
+            assert!(take_copy_request(&mut app).is_none());
         }
     }
 
@@ -2874,7 +2884,7 @@ mod tests {
         type_text(&mut app, "dc");
         assert_eq!(app.mode(), ListMode::Search);
         assert!(app.delete().is_none() && app.command().is_none());
-        assert!(app.take_copy_request().is_none());
+        assert!(take_copy_request(&mut app).is_none());
     }
 
     #[test]
@@ -2921,13 +2931,13 @@ mod tests {
 
         app.handle_key(press(KeyCode::Enter));
 
-        let request = app.take_connect_request().expect("a request");
+        let request = take_connect_request(&mut app).expect("a request");
         assert_eq!(request.name, "web");
         assert_eq!(
             request.args.as_slice(),
             ["-l", "deploy", "-p", "2222", "--", "web.example.com"]
         );
-        assert!(app.take_connect_request().is_none(), "handed out once");
+        assert!(take_connect_request(&mut app).is_none(), "handed out once");
         assert_eq!(app.screen(), Screen::List);
         assert!(!app.should_quit());
     }
@@ -2940,7 +2950,7 @@ mod tests {
         app.handle_key(press(KeyCode::Down));
         assert_eq!(selected(&app), Some("client"));
         app.handle_key(press(KeyCode::Enter));
-        let request = app.take_connect_request().unwrap();
+        let request = take_connect_request(&mut app).unwrap();
         assert!(request.args.as_slice().contains(&"-J".to_string()));
     }
 
@@ -2948,7 +2958,7 @@ mod tests {
     fn enter_with_no_host_says_so() {
         let (mut app, _) = app_with(hosts(Vec::new()), Vec::new());
         app.handle_key(press(KeyCode::Enter));
-        assert!(app.take_connect_request().is_none());
+        assert!(take_connect_request(&mut app).is_none());
         let status = app.status().unwrap();
         assert_eq!(status.kind, StatusKind::Info);
         assert!(status.text.contains("no host to connect to"));
@@ -2960,32 +2970,34 @@ mod tests {
         let mut app = app();
         app.handle_key(ch('/'));
         app.handle_key(press(KeyCode::Enter));
-        assert!(app.take_connect_request().is_none());
+        assert!(take_connect_request(&mut app).is_none());
         assert_eq!(app.mode(), ListMode::Browse);
 
         // Deleting: Enter confirms (or refuses) the typed name.
         let mut app = app_with(sample(), Vec::new()).0;
         app.handle_key(ch('d'));
         app.handle_key(press(KeyCode::Enter));
-        assert!(app.take_connect_request().is_none());
+        assert!(take_connect_request(&mut app).is_none());
 
-        // The command view: any key closes it.
+        // The command view: any key closes it. (Showing it queued a copy, which
+        // the event loop would have carried out after that key.)
         let mut app = app_with(sample(), Vec::new()).0;
         app.handle_key(ch('c'));
+        assert!(take_copy_request(&mut app).is_some());
         app.handle_key(press(KeyCode::Enter));
-        assert!(app.take_connect_request().is_none());
+        assert!(take_connect_request(&mut app).is_none());
 
         // The help and the warnings pages.
         let mut app = app_with(sample(), vec![Notice::warning("careful")]).0;
         app.handle_key(ch('?'));
         app.handle_key(press(KeyCode::Enter));
-        assert!(app.take_connect_request().is_none());
+        assert!(take_connect_request(&mut app).is_none());
         assert_eq!(app.screen(), Screen::Help);
 
         // Without hosts there is nothing to connect to.
         let mut app = unavailable();
         app.handle_key(press(KeyCode::Enter));
-        assert!(app.take_connect_request().is_none());
+        assert!(take_connect_request(&mut app).is_none());
     }
 
     #[test]
@@ -3227,7 +3239,7 @@ mod tests {
         let mut app = app_with(hosts, Vec::new()).0;
         app.set_known_hosts_file(Some(PathBuf::from(DEFAULT_KNOWN_HOSTS)));
         app.handle_key(press(KeyCode::Enter));
-        let request = app.take_connect_request().expect("a request");
+        let request = take_connect_request(&mut app).expect("a request");
         app.connection_ended(
             &request.name,
             ran_with(255, &changed_key_output(host, file)),
@@ -3266,7 +3278,7 @@ mod tests {
     fn a_rejected_key_is_not_this_screen() {
         let mut app = app();
         app.handle_key(press(KeyCode::Enter));
-        app.take_connect_request();
+        take_connect_request(&mut app);
         app.connection_ended("backup", ran_with(255, "Host key verification failed.\r\n"));
         assert_eq!(app.screen(), Screen::ConnectError);
         assert!(app.key_change().is_none());
@@ -3297,7 +3309,7 @@ mod tests {
         // The default file is not known: nothing is offered.
         let mut unknown = app_with(sample(), Vec::new()).0;
         unknown.handle_key(press(KeyCode::Enter));
-        let request = unknown.take_connect_request().unwrap();
+        let request = take_connect_request(&mut unknown).unwrap();
         unknown.connection_ended(
             &request.name,
             ran_with(
@@ -3311,7 +3323,7 @@ mod tests {
         let mut bare = app_with(sample(), Vec::new()).0;
         bare.set_known_hosts_file(Some(PathBuf::from(DEFAULT_KNOWN_HOSTS)));
         bare.handle_key(press(KeyCode::Enter));
-        bare.take_connect_request();
+        take_connect_request(&mut bare);
         bare.connection_ended(
             "backup",
             ran_with(
@@ -3333,7 +3345,7 @@ mod tests {
         app.handle_key(press(KeyCode::Down)); // bastion, client: the client
         assert_eq!(selected(&app), Some("client"));
         app.handle_key(press(KeyCode::Enter));
-        let request = app.take_connect_request().unwrap();
+        let request = take_connect_request(&mut app).unwrap();
         app.connection_ended(
             &request.name,
             ran_with(
@@ -3349,7 +3361,7 @@ mod tests {
         type_name(&mut app, "client");
         app.handle_key(press(KeyCode::Enter));
         assert!(
-            app.take_removal_request().is_none(),
+            take_removal_request(&mut app).is_none(),
             "the client's name is not it"
         );
         for _ in 0..6 {
@@ -3357,7 +3369,7 @@ mod tests {
         }
         type_name(&mut app, "bastion");
         app.handle_key(press(KeyCode::Enter));
-        let target = app.take_removal_request().expect("confirmed");
+        let target = take_removal_request(&mut app).expect("confirmed");
         assert_eq!(target.entry, "bastion.example.com");
     }
 
@@ -3368,7 +3380,7 @@ mod tests {
             app.handle_key(press(abort));
             assert_eq!(app.screen(), Screen::List);
             assert!(app.key_change().is_none());
-            assert!(app.take_removal_request().is_none());
+            assert!(take_removal_request(&mut app).is_none());
             assert!(!app.should_quit());
         }
     }
@@ -3381,9 +3393,9 @@ mod tests {
             assert_eq!(app.screen(), Screen::HostKeyChanged, "{key:?}");
             assert!(!app.should_quit(), "{key:?}");
             assert!(app.key_confirm().is_none(), "{key:?}");
-            assert!(app.take_removal_request().is_none(), "{key:?}");
-            assert!(app.take_connect_request().is_none(), "{key:?}");
-            assert!(app.take_copy_request().is_none(), "{key:?}");
+            assert!(take_removal_request(&mut app).is_none(), "{key:?}");
+            assert!(take_connect_request(&mut app).is_none(), "{key:?}");
+            assert!(take_copy_request(&mut app).is_none(), "{key:?}");
         }
         // Keys with modifiers do not act as their plain letter.
         for key in [
@@ -3407,7 +3419,7 @@ mod tests {
         app.handle_key(ch('r'));
         app.handle_key(with(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(app.should_quit());
-        assert!(app.take_removal_request().is_none());
+        assert!(take_removal_request(&mut app).is_none());
     }
 
     #[test]
@@ -3455,7 +3467,7 @@ mod tests {
             type_name(&mut app, wrong);
             app.handle_key(press(KeyCode::Enter));
             assert!(app.key_confirm().unwrap().mismatch, "{wrong:?}");
-            assert!(app.take_removal_request().is_none(), "{wrong:?}");
+            assert!(take_removal_request(&mut app).is_none(), "{wrong:?}");
             for _ in 0..wrong.len() {
                 app.handle_key(press(KeyCode::Backspace));
             }
@@ -3468,9 +3480,9 @@ mod tests {
         );
         app.handle_key(press(KeyCode::Enter));
         assert!(app.key_confirm().is_none());
-        let target = app.take_removal_request().expect("confirmed");
+        let target = take_removal_request(&mut app).expect("confirmed");
         assert_eq!(target.entry, "backup.example.com");
-        assert!(app.take_removal_request().is_none(), "handed out once");
+        assert!(take_removal_request(&mut app).is_none(), "handed out once");
     }
 
     #[test]
@@ -3481,7 +3493,7 @@ mod tests {
         app.handle_key(press(KeyCode::Esc));
         assert!(app.key_confirm().is_none());
         assert_eq!(app.screen(), Screen::HostKeyChanged);
-        assert!(app.take_removal_request().is_none());
+        assert!(take_removal_request(&mut app).is_none());
         // Asking again starts empty.
         app.handle_key(ch('r'));
         assert_eq!(app.key_confirm().unwrap().input.value(), "");
@@ -3492,7 +3504,7 @@ mod tests {
         let mut app = app_with_changed_key(sample(), "other.example.com", DEFAULT_KNOWN_HOSTS);
         app.handle_key(ch('r'));
         assert!(app.key_confirm().is_none());
-        assert!(app.take_removal_request().is_none());
+        assert!(take_removal_request(&mut app).is_none());
         assert_eq!(app.screen(), Screen::HostKeyChanged);
     }
 
@@ -3525,7 +3537,7 @@ mod tests {
             app.handle_key(ch('r'));
             type_name(&mut app, "backup");
             app.handle_key(press(KeyCode::Enter));
-            app.take_removal_request().unwrap();
+            take_removal_request(&mut app).unwrap();
             app.key_removal_finished(&target(), result.clone());
 
             assert_eq!(app.screen(), Screen::HostKeyChanged, "{result:?}");
@@ -3560,11 +3572,11 @@ mod tests {
         let mut app = app_with(sample(), Vec::new()).0;
         app.set_known_hosts_file(Some(PathBuf::from(DEFAULT_KNOWN_HOSTS)));
         app.handle_key(press(KeyCode::Enter)); // backup
-        app.take_connect_request();
+        take_connect_request(&mut app);
         app.connection_ended("backup", ran(Exit::Code(0), false));
         app.handle_key(press(KeyCode::Down)); // db
         app.handle_key(press(KeyCode::Enter));
-        let request = app.take_connect_request().unwrap();
+        let request = take_connect_request(&mut app).unwrap();
         assert_eq!(request.name, "db");
         // ssh names backup: not what this connection went to.
         app.connection_ended(
@@ -3585,7 +3597,7 @@ mod tests {
         let mut app = app_with(hosts(vec![host("bastion", false), client]), Vec::new()).0;
         app.handle_key(press(KeyCode::Down));
         app.handle_key(press(KeyCode::Enter));
-        let request = app.take_connect_request().unwrap();
+        let request = take_connect_request(&mut app).unwrap();
         let entries: Vec<_> = request
             .known_hosts
             .iter()
@@ -3595,5 +3607,60 @@ mod tests {
             entries,
             ["[client.example.com]:2222", "bastion.example.com"]
         );
+    }
+
+    // ---- the queue of requests -----------------------------------------------
+
+    #[test]
+    fn requests_are_handed_out_oldest_first_and_once() {
+        let mut app = removable_key_change_after_list();
+        // `c` queues a copy; Enter closes the command view; Enter again connects.
+        app.handle_key(ch('c'));
+        app.handle_key(press(KeyCode::Enter));
+        app.handle_key(press(KeyCode::Enter));
+
+        assert!(matches!(app.take_request(), Some(Request::Copy(_))));
+        assert!(matches!(app.take_request(), Some(Request::Connect(_))));
+        assert!(app.take_request().is_none());
+    }
+
+    /// An app back on the list, with nothing queued.
+    fn removable_key_change_after_list() -> App {
+        let mut app = removable_key_change();
+        app.handle_key(press(KeyCode::Esc));
+        assert_eq!(app.screen(), Screen::List);
+        app
+    }
+
+    #[test]
+    fn a_response_of_the_wrong_kind_is_reported_and_changes_nothing_else() {
+        let mut app = app();
+        let request = Request::Copy("ssh -- web".to_string());
+        app.handle_response(&request, Response::KeyRemoved(Removal::Removed));
+        let status = app.status().expect("the mistake is shown");
+        assert_eq!(status.kind, StatusKind::Error);
+        assert!(
+            status.text.contains("unexpected response"),
+            "{}",
+            status.text
+        );
+        assert_eq!(app.screen(), Screen::List);
+    }
+
+    #[test]
+    fn responses_reach_the_matching_handler() {
+        let mut app = app();
+        let connect = Request::Connect(ConnectRequest {
+            name: "web".to_string(),
+            args: build_args(&host("web", false), &sample()).unwrap(),
+            known_hosts: Vec::new(),
+        });
+        app.handle_response(&connect, Response::Connected(ran(Exit::Code(0), false)));
+        assert_eq!(app.status().unwrap().text, "Disconnected from 'web'.");
+
+        // A copy has nothing to report.
+        let mut quiet = self::app();
+        quiet.handle_response(&Request::Copy("x".to_string()), Response::Copied);
+        assert!(quiet.status().is_none());
     }
 }

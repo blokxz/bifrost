@@ -7,11 +7,10 @@ use ratatui::Terminal;
 use ratatui::backend::Backend;
 use ratatui::crossterm::event::{self, Event, KeyEvent, KeyEventKind};
 
-use super::app::{App, ConnectRequest, ConnectResult, Metrics};
+use super::app::{App, Metrics};
+use super::effects::{Request, Response};
 use super::theme::Theme;
 use super::ui;
-use crate::ssh::command::KnownHostsTarget;
-use crate::ssh::keygen::Removal;
 
 /// How long to wait for input before drawing again.
 ///
@@ -42,21 +41,17 @@ pub fn next_crossterm_event(timeout: Duration) -> io::Result<Option<Event>> {
 /// Runs until the app asks to quit.
 ///
 /// `next_event` waits up to the given duration and returns the event that
-/// arrived, or `None` on timeout. `copy` asks the terminal to copy some text
-/// (see [`super::clipboard`]). `connect` runs a connection: it hands the
-/// terminal to ssh and returns when ssh has ended and the terminal is back (see
-/// [`super::handover`]); an error from it ends the loop, because the terminal
-/// could not be recovered. `remove_key` runs `ssh-keygen -R` for a key the user
-/// confirmed removing. All four are parameters so tests can script input and
-/// record what would happen.
+/// arrived, or `None` on timeout. `execute` carries out what the app asks for
+/// (see [`super::effects`]): copying, connecting, removing a key. An error from
+/// it ends the loop, because it means the terminal could not be recovered; a
+/// problem with the action itself is part of its response. Both are parameters
+/// so tests can script input and record what would happen.
 pub fn run_loop<B: Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
     theme: &Theme,
     mut next_event: impl FnMut(Duration) -> io::Result<Option<Event>>,
-    mut copy: impl FnMut(&str) -> io::Result<()>,
-    mut connect: impl FnMut(&ConnectRequest) -> io::Result<ConnectResult>,
-    mut remove_key: impl FnMut(&KnownHostsTarget) -> Removal,
+    mut execute: impl FnMut(&Request) -> io::Result<Response>,
 ) -> io::Result<()> {
     while !app.should_quit() {
         let mut metrics = Metrics::default();
@@ -68,28 +63,24 @@ pub fn run_loop<B: Backend>(
         let event = next_event(TICK)?;
         if let Some(key) = event.as_ref().and_then(key_press) {
             app.handle_key(key);
-            if let Some(text) = app.take_copy_request() {
-                copy(&text)?;
-            }
-            if let Some(request) = app.take_connect_request() {
-                let result = connect(&request)?;
-                // The screen was given away: nothing of it can be trusted, so
-                // the next draw must repaint everything, at the size it has now
-                // (it may have been resized while ssh ran). This is not
-                // `Terminal::clear`, which first asks the terminal where the
-                // cursor is: a round trip that some terminals and multiplexers
-                // never answer, and whose reply competes with typed input.
-                let size = terminal
-                    .size()
-                    .map_err(|err| io::Error::other(err.to_string()))?;
-                terminal
-                    .resize(size.into())
-                    .map_err(|err| io::Error::other(err.to_string()))?;
-                app.connection_ended(&request.name, result);
-            }
-            if let Some(target) = app.take_removal_request() {
-                let result = remove_key(&target);
-                app.key_removal_finished(&target, result);
+            while let Some(request) = app.take_request() {
+                let response = execute(&request)?;
+                if request.gives_away_terminal() {
+                    // The screen was given away: nothing of it can be trusted,
+                    // so the next draw must repaint everything, at the size it
+                    // has now (it may have been resized meanwhile). This is not
+                    // `Terminal::clear`, which first asks the terminal where the
+                    // cursor is: a round trip that some terminals and
+                    // multiplexers never answer, and whose reply competes with
+                    // typed input.
+                    let size = terminal
+                        .size()
+                        .map_err(|err| io::Error::other(err.to_string()))?;
+                    terminal
+                        .resize(size.into())
+                        .map_err(|err| io::Error::other(err.to_string()))?;
+                }
+                app.handle_response(&request, response);
             }
         }
     }
@@ -100,21 +91,20 @@ pub fn run_loop<B: Backend>(
 mod tests {
     use super::*;
     use crate::domain::Hosts;
-    use crate::tui::app::Screen;
+    use crate::tui::app::{ConnectResult, Screen};
     use crate::tui::persist::testing::FakeStore;
     use crate::tui::startup::Startup;
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{KeyCode, KeyModifiers, MouseEvent, MouseEventKind};
     use std::collections::VecDeque;
 
-    /// For tests that never remove a key.
-    fn no_removal(_: &KnownHostsTarget) -> Removal {
-        Removal::Failed("no removal expected".to_string())
-    }
-
-    /// For tests that never connect: asking for a connection is a failure.
-    fn no_connect(_: &ConnectRequest) -> io::Result<ConnectResult> {
-        Err(io::Error::other("no connection expected"))
+    /// For tests that only ever copy: a copy succeeds, and asking for anything
+    /// else is a failure.
+    fn only_copies(request: &Request) -> io::Result<Response> {
+        match request {
+            Request::Copy(_) => Ok(Response::Copied),
+            other => Err(io::Error::other(format!("{other:?} was not expected"))),
+        }
     }
 
     fn key_event(code: KeyCode, kind: KeyEventKind) -> Event {
@@ -166,9 +156,7 @@ mod tests {
                     .pop_front()
                     .ok_or_else(|| io::Error::other("script exhausted"))
             },
-            |_| Ok(()),
-            no_connect,
-            no_removal,
+            only_copies,
         );
         (result, app)
     }
@@ -249,9 +237,7 @@ mod tests {
             &mut app,
             &Theme::ansi16(),
             |_| Ok(script.pop_front().unwrap()),
-            |_| Ok(()),
-            no_connect,
-            no_removal,
+            only_copies,
         )
         .unwrap();
         assert!(app.scroll() > 0, "the help scrolled");
@@ -283,9 +269,7 @@ mod tests {
             &mut app,
             &Theme::ansi16(),
             |_| Ok(script.pop_front().unwrap()),
-            |_| Ok(()),
-            no_connect,
-            no_removal,
+            only_copies,
         )
         .unwrap();
         // One screenful down: more than one row, fewer than all of them.
@@ -316,12 +300,13 @@ mod tests {
             &mut app,
             &Theme::ansi16(),
             |_| Ok(script.pop_front().unwrap()),
-            |text| {
-                copied.push(text.to_string());
-                Ok(())
+            |request| match request {
+                Request::Copy(text) => {
+                    copied.push(text.to_string());
+                    Ok(Response::Copied)
+                }
+                other => Err(io::Error::other(format!("{other:?} was not expected"))),
             },
-            no_connect,
-            no_removal,
         )
         .unwrap();
         assert_eq!(copied, ["ssh -l deploy -- web.example.com"]);
@@ -340,8 +325,6 @@ mod tests {
             &Theme::ansi16(),
             |_| Ok(script.pop_front().unwrap()),
             |_| Err(io::Error::other("terminal gone")),
-            no_connect,
-            no_removal,
         );
         assert_eq!(result.unwrap_err().to_string(), "terminal gone");
     }
@@ -379,12 +362,13 @@ mod tests {
             &mut app,
             &Theme::ansi16(),
             |_| Ok(script.pop_front().unwrap()),
-            |_| Ok(()),
-            |request| {
-                requests.push(request.clone());
-                Ok(quiet_outcome(0))
+            |request| match request {
+                Request::Connect(connect) => {
+                    requests.push(connect.clone());
+                    Ok(Response::Connected(quiet_outcome(0)))
+                }
+                other => Err(io::Error::other(format!("{other:?} was not expected"))),
             },
-            no_removal,
         )
         .unwrap();
 
@@ -413,9 +397,7 @@ mod tests {
                     .pop_front()
                     .ok_or_else(|| io::Error::other("script exhausted"))
             },
-            |_| Ok(()),
-            |_| Ok(quiet_outcome(7)),
-            no_removal,
+            |_| Ok(Response::Connected(quiet_outcome(7))),
         );
         assert_eq!(result.unwrap_err().to_string(), "script exhausted");
 
@@ -442,9 +424,7 @@ mod tests {
             &mut app,
             &Theme::ansi16(),
             |_| Ok(script.pop_front().unwrap()),
-            |_| Ok(()),
             |_| Err(io::Error::other("could not take the terminal back")),
-            no_removal,
         );
         assert_eq!(
             result.unwrap_err().to_string(),

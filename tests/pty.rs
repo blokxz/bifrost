@@ -384,14 +384,22 @@ fn c_shows_the_command_and_sends_the_clipboard_request_to_the_terminal() {
 
     // Alphabetical: db is selected; it has neither user nor port.
     session.send(b"c");
+    // The footer is the last thing of the frame: wait for it, so that a status
+    // drawn in the same frame would be on screen too.
     session.wait_until("the command on screen", |s| {
         s.contains("ssh command for 'db'")
             && s.contains("ssh -- 192.0.2.2")
             && s.contains("Copy requested")
+            && s.contains("Any key")
     });
     assert!(
         !session.screen().contains("Copied"),
         "the app cannot know it worked, so it must not say so"
+    );
+    assert!(
+        !session.screen().contains("Internal error"),
+        "asking the terminal to copy must be answered as a copy: {}",
+        session.screen().text()
     );
 
     session.send(b"x"); // any key closes it
