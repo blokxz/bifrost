@@ -9,8 +9,8 @@
 //! - [`list`]: the host list.
 //! - [`form`]: the add/edit form.
 //! - [`modal`]: boxes drawn over a screen.
-//! - [`page`]: text pages: help, warnings, and the explanation shown when the
-//!   hosts could not be loaded.
+//! - [`page`]: text pages: help, warnings, the explanation shown when the hosts
+//!   could not be loaded, why a connection failed, and what ssh printed.
 
 use std::borrow::Cow;
 
@@ -55,6 +55,9 @@ pub fn render(app: &App, theme: &Theme, frame: &mut Frame) -> Metrics {
         Screen::Help => page::render_help(app, theme, frame, area),
         Screen::Notices => page::render_notices(app, theme, frame, area),
         Screen::Form => form::render(app, theme, frame, area),
+        Screen::ConnectError => page::render_connect_error(app, theme, frame, area),
+        Screen::SshOutput => page::render_ssh_output(app, theme, frame, area),
+        Screen::HostKeyChanged => page::render_host_key_changed(app, theme, frame, area),
     }
 }
 
@@ -306,6 +309,18 @@ pub(crate) mod testing {
 
     pub fn text_of(app: &mut App, width: u16, height: u16) -> String {
         screen_text(&draw(app, width, height))
+    }
+
+    /// How many cells have a foreground or background color.
+    pub fn colored_cells_of(terminal: &Terminal<TestBackend>) -> usize {
+        use ratatui::style::Color;
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .filter(|cell| cell.fg != Color::Reset || cell.bg != Color::Reset)
+            .count()
     }
 }
 

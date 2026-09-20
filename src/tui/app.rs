@@ -13,7 +13,13 @@ use super::list::{self, ListState, Row};
 use super::startup::{Library, Notice, Startup};
 use crate::domain::validate::{self, Field};
 use crate::domain::{Hosts, HostsError, ValidationError};
-use crate::ssh::command::{Shell, build_args, display_command};
+use crate::ssh::command::{
+    KnownHostsTarget, Shell, SshArgs, build_args, display_command, known_hosts_targets,
+};
+use crate::ssh::connect::Outcome as SshOutcome;
+use crate::ssh::diagnose::{FailureKind, Verdict, classify, host_key_change};
+use crate::ssh::keygen::Removal;
+use std::path::PathBuf;
 
 /// The screens of the TUI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,6 +32,13 @@ pub enum Screen {
     Notices,
     /// Adding or editing a host.
     Form,
+    /// Why the last connection failed, and what to try.
+    ConnectError,
+    /// The server's key is not the one saved. A blocking screen: aborting is the
+    /// default, and removing the old key takes typing the host's name.
+    HostKeyChanged,
+    /// Everything ssh printed during the last connection.
+    SshOutput,
 }
 
 /// What the keys do on the list screen.
@@ -55,6 +68,67 @@ pub struct CommandView {
     pub host: String,
     /// The command for a person to read and paste: quoted, on one line.
     pub text: String,
+}
+
+/// A connection the user asked for. The event loop takes it and hands the
+/// terminal to ssh (see [`super::handover`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectRequest {
+    /// The saved host's name.
+    pub name: String,
+    pub args: SshArgs,
+    /// The `known_hosts` names of the host and of its jump hosts.
+    pub known_hosts: Vec<KnownHostsTarget>,
+}
+
+/// What came of a [`ConnectRequest`].
+#[derive(Debug)]
+pub enum ConnectResult {
+    /// ssh ran and ended.
+    Ran(SshOutcome),
+    /// ssh could not be started, or the terminal could not be handed over. The
+    /// text says why, in plain English.
+    Failed(String),
+}
+
+/// What the last connection left behind: enough to explain a failure and to
+/// show what ssh printed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionReport {
+    /// The saved host's name.
+    pub name: String,
+    /// Why it failed, when it did.
+    pub failure: Option<FailureKind>,
+    /// The end of ssh's stderr, raw. Sanitized when shown.
+    pub stderr: Vec<u8>,
+}
+
+/// What the blocking host key screen shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyChangeView {
+    /// The saved host that was being connected to.
+    pub name: String,
+    /// The kind of the key the server sent, as ssh named it and only if it looks
+    /// like one.
+    pub key_type: Option<String>,
+    /// The fingerprint of that key, only if it is one.
+    pub fingerprint: Option<String>,
+    /// The file that holds the old key, as ssh printed it.
+    pub file: Option<String>,
+    pub line: Option<u32>,
+    /// The old key that Bifrost can remove, if what ssh said matches a host it
+    /// connected through and the default `known_hosts`. `None` means Bifrost
+    /// offers no removal.
+    pub removal: Option<KnownHostsTarget>,
+}
+
+/// The confirmation before removing an old key: the saved host's name has to be
+/// typed.
+#[derive(Debug)]
+pub struct RemovalConfirm {
+    pub input: TextInput,
+    /// Set when Enter was pressed with something other than the name.
+    pub mismatch: bool,
 }
 
 /// How serious a [`Status`] message is.
@@ -120,7 +194,9 @@ pub const HELP: &[HelpSection] = &[
             row("Up/Down j/k", "Move the selection"),
             row("Home/End", "Jump to the first or last host"),
             row("PgUp/PgDn", "Move by a screenful"),
+            row("Enter", "Connect to the selected host"),
             row("/", "Search the hosts"),
+            row("o", "Read what ssh printed during the last connection"),
             row("a", "Add a host"),
             row("e", "Edit the selected host"),
             row(
@@ -157,6 +233,30 @@ pub const HELP: &[HelpSection] = &[
             row("Enter", "Delete it. It cannot be undone"),
             row("Esc", "Cancel"),
         ],
+    },
+    HelpSection {
+        title: "After a failed connection",
+        rows: &[
+            row("o", "Read everything ssh printed"),
+            row("Enter/Esc", "Go back to the list"),
+            row("Up/Down j/k", "Scroll"),
+        ],
+    },
+    HelpSection {
+        title: "When a server's identity changed",
+        rows: &[
+            row("Enter/Esc", "Abort. This is the safe choice"),
+            row("d", "Read what ssh printed"),
+            row(
+                "r",
+                "Remove the old key, after typing the host name. Then connect again",
+            ),
+            row("Up/Down j/k", "Scroll"),
+        ],
+    },
+    HelpSection {
+        title: "What ssh printed",
+        rows: &[row("Up/Down j/k", "Scroll"), row("o/Esc/Enter", "Go back")],
     },
     HelpSection {
         title: "The ssh command",
@@ -213,9 +313,25 @@ pub struct App {
     command: Option<CommandView>,
     /// Text to ask the terminal to copy; taken by the event loop.
     copy_request: Option<String>,
+    /// A connection to start; taken by the event loop.
+    connect_request: Option<ConnectRequest>,
+    /// How the last connection ended.
+    report: Option<ConnectionReport>,
+    /// The `known_hosts` names of the connection that was last requested.
+    pending_known_hosts: Vec<KnownHostsTarget>,
+    /// The `known_hosts` file that removing a key edits, when it is known.
+    known_hosts_file: Option<PathBuf>,
+    key_change: Option<KeyChangeView>,
+    key_confirm: Option<RemovalConfirm>,
+    /// A removal to run; taken by the event loop.
+    removal_request: Option<KnownHostsTarget>,
+    /// Where the ssh output goes back to when it is closed.
+    output_return: Screen,
     status: Option<Status>,
     help_scroll: usize,
     notices_scroll: usize,
+    error_scroll: usize,
+    output_scroll: usize,
     /// How far the current text page can scroll, as last reported by rendering.
     max_scroll: usize,
     quit: bool,
@@ -233,9 +349,19 @@ impl App {
             delete: None,
             command: None,
             copy_request: None,
+            connect_request: None,
+            report: None,
+            pending_known_hosts: Vec::new(),
+            known_hosts_file: None,
+            key_change: None,
+            key_confirm: None,
+            removal_request: None,
+            output_return: Screen::List,
             status: None,
             help_scroll: 0,
             notices_scroll: 0,
+            error_scroll: 0,
+            output_scroll: 0,
             max_scroll: 0,
             quit: false,
         };
@@ -290,6 +416,46 @@ impl App {
         self.copy_request.take()
     }
 
+    /// The connection to start, if the user just asked for one. It is returned
+    /// once; the caller runs ssh and reports back with
+    /// [`App::connection_ended`].
+    pub fn take_connect_request(&mut self) -> Option<ConnectRequest> {
+        self.connect_request.take()
+    }
+
+    /// Tells the app which `known_hosts` file removing an old key edits: the one
+    /// `ssh-keygen -R` uses without being told. Until this is set, no removal is
+    /// offered.
+    pub fn set_known_hosts_file(&mut self, file: Option<PathBuf>) {
+        self.known_hosts_file = file;
+    }
+
+    /// What the host key screen shows, while it is the screen.
+    pub fn key_change(&self) -> Option<&KeyChangeView> {
+        self.key_change.as_ref()
+    }
+
+    /// The removal confirmation, while it is showing.
+    pub fn key_confirm(&self) -> Option<&RemovalConfirm> {
+        self.key_confirm.as_ref()
+    }
+
+    /// The key to remove, if the user just confirmed it. Returned once; the
+    /// caller runs `ssh-keygen -R` and reports with [`App::key_removal_finished`].
+    pub fn take_removal_request(&mut self) -> Option<KnownHostsTarget> {
+        self.removal_request.take()
+    }
+
+    /// How the last connection ended, if there was one.
+    pub fn report(&self) -> Option<&ConnectionReport> {
+        self.report.as_ref()
+    }
+
+    /// Whether the last connection left any ssh output to read.
+    fn has_output(&self) -> bool {
+        self.report.as_ref().is_some_and(|r| !r.stderr.is_empty())
+    }
+
     pub fn should_quit(&self) -> bool {
         self.quit
     }
@@ -306,6 +472,8 @@ impl App {
         match self.screen {
             Screen::Help => self.help_scroll,
             Screen::Notices | Screen::List | Screen::Form => self.notices_scroll,
+            Screen::ConnectError | Screen::HostKeyChanged => self.error_scroll,
+            Screen::SshOutput => self.output_scroll,
         }
     }
 
@@ -322,6 +490,41 @@ impl App {
                 hint("w/Esc", "close"),
                 hint("q", "quit"),
             ],
+            Screen::ConnectError => {
+                let mut hints = vec![hint("Up/Down j/k", "scroll")];
+                if self.has_output() {
+                    hints.push(hint("o", "ssh output"));
+                }
+                hints.push(hint("Enter/Esc", "back"));
+                hints.push(hint("q", "quit"));
+                hints
+            }
+            Screen::SshOutput => vec![
+                hint("Up/Down j/k", "scroll"),
+                hint("o/Esc/Enter", "back"),
+                hint("q", "quit"),
+            ],
+            Screen::HostKeyChanged if self.key_confirm.is_some() => vec![
+                hint("Type", "the host name"),
+                hint("Enter", "remove"),
+                hint("Esc", "cancel"),
+            ],
+            // Blocking: aborting is first, and nothing but these does anything.
+            Screen::HostKeyChanged => {
+                let mut hints = vec![hint("Enter/Esc", "abort (safe)")];
+                if self.has_output() {
+                    hints.push(hint("d", "ssh output"));
+                }
+                if self
+                    .key_change
+                    .as_ref()
+                    .is_some_and(|v| v.removal.is_some())
+                {
+                    hints.push(hint("r", "remove old key..."));
+                }
+                hints.push(hint("Up/Down j/k", "scroll"));
+                hints
+            }
             Screen::Form => match self.form.as_ref().map(|form| (form.mode(), form.focus())) {
                 Some((FormMode::PickJump(_), _)) => vec![
                     hint("Up/Down j/k", "move"),
@@ -364,6 +567,7 @@ impl App {
                 ListMode::Browse => {
                     let mut hints = vec![
                         hint("Up/Down j/k", "move"),
+                        hint("Enter", "connect"),
                         hint("/", "search"),
                         hint("a", "add"),
                         hint("e", "edit"),
@@ -371,6 +575,9 @@ impl App {
                         hint("f", "favorite"),
                         hint("c", "copy"),
                     ];
+                    if self.has_output() {
+                        hints.push(hint("o", "ssh output"));
+                    }
                     if !self.notices.is_empty() {
                         hints.push(hint("w", "warnings"));
                     }
@@ -425,6 +632,9 @@ impl App {
             Screen::Help => self.help_key(key),
             Screen::Notices => self.notices_key(key),
             Screen::Form => self.form_key(key),
+            Screen::ConnectError => self.connect_error_key(key),
+            Screen::SshOutput => self.output_key(key),
+            Screen::HostKeyChanged => self.host_key_key(key),
         }
     }
 
@@ -449,6 +659,8 @@ impl App {
         match self.screen {
             Screen::Help => Some(&mut self.help_scroll),
             Screen::Notices | Screen::List => Some(&mut self.notices_scroll),
+            Screen::ConnectError | Screen::HostKeyChanged => Some(&mut self.error_scroll),
+            Screen::SshOutput => Some(&mut self.output_scroll),
             Screen::Form => None,
         }
     }
@@ -478,6 +690,8 @@ impl App {
         match screen {
             Screen::Help => self.help_scroll = 0,
             Screen::Notices => self.notices_scroll = 0,
+            Screen::ConnectError | Screen::HostKeyChanged => self.error_scroll = 0,
+            Screen::SshOutput => self.output_scroll = 0,
             Screen::List | Screen::Form => {}
         }
         // The limit belongs to the screen that was drawn; until the new one is
@@ -620,6 +834,8 @@ impl App {
             KeyCode::Char('d') => self.start_delete(),
             KeyCode::Char('f') => self.toggle_favorite(),
             KeyCode::Char('c') => self.show_command(),
+            KeyCode::Char('o') => self.show_output(Screen::List),
+            KeyCode::Enter => self.request_connect(),
             _ => {}
         }
     }
@@ -733,6 +949,260 @@ impl App {
                 self.set_status(StatusKind::Info, format!("Deleted host '{name}'."));
             }
             Err(message) => self.set_status(StatusKind::Error, message),
+        }
+    }
+
+    // ---- connecting ------------------------------------------------------
+
+    /// Asks the event loop to connect to the selected host.
+    fn request_connect(&mut self) {
+        let Some(hosts) = self.hosts() else {
+            return;
+        };
+        let Some(host) = self.list.selected.as_deref().and_then(|n| hosts.get(n)) else {
+            self.set_status(
+                StatusKind::Info,
+                "There is no host to connect to. Press a to add one.",
+            );
+            return;
+        };
+        let name = host.name.clone();
+        let built = build_args(host, hosts)
+            .and_then(|args| known_hosts_targets(host, hosts).map(|known| (args, known)));
+        match built {
+            Ok((args, known_hosts)) => {
+                self.pending_known_hosts.clone_from(&known_hosts);
+                self.connect_request = Some(ConnectRequest {
+                    name,
+                    args,
+                    known_hosts,
+                });
+            }
+            Err(err) => self.set_status(StatusKind::Error, err.to_string()),
+        }
+    }
+
+    /// Reports how a connection ended, once the terminal is back.
+    ///
+    /// A failure gets a screen of its own that explains it and says what to try.
+    /// Anything that is not a failure (a normal logout, the remote command's own
+    /// exit status, Ctrl-C) is one line at the bottom of the list.
+    pub fn connection_ended(&mut self, name: &str, result: ConnectResult) {
+        let outcome = match result {
+            ConnectResult::Failed(text) => {
+                self.report = None;
+                self.set_status(StatusKind::Error, text);
+                return;
+            }
+            ConnectResult::Ran(outcome) => outcome,
+        };
+
+        let verdict = classify(&outcome);
+        self.report = Some(ConnectionReport {
+            name: name.to_string(),
+            failure: match verdict {
+                Verdict::Failed(kind) => Some(kind),
+                _ => None,
+            },
+            stderr: outcome.stderr,
+        });
+        let (kind, text) = match verdict {
+            Verdict::Failed(FailureKind::HostKeyChanged) => {
+                self.show_key_change(name);
+                return;
+            }
+            Verdict::Failed(_) => {
+                self.open(Screen::ConnectError);
+                return;
+            }
+            Verdict::Ended => (StatusKind::Info, format!("Disconnected from '{name}'.")),
+            Verdict::RemoteStatus(code) => (
+                StatusKind::Info,
+                format!("The session on '{name}' ended with status {code}."),
+            ),
+            Verdict::Cancelled => (
+                StatusKind::Info,
+                format!("The connection to '{name}' was cancelled."),
+            ),
+            Verdict::ClosedByYou => (
+                StatusKind::Info,
+                format!("The connection to '{name}' was closed."),
+            ),
+            Verdict::Signalled(signal) => (
+                StatusKind::Warning,
+                format!("ssh for '{name}' was stopped by signal {signal}."),
+            ),
+        };
+        self.set_status(kind, text);
+    }
+
+    /// Opens the blocking host key screen with what ssh said about the change.
+    fn show_key_change(&mut self, name: &str) {
+        let stderr = self
+            .report
+            .as_ref()
+            .map(|report| report.stderr.as_slice())
+            .unwrap_or_default();
+        let read = host_key_change(stderr);
+        let removal = read
+            .removal_target(&self.pending_known_hosts, self.known_hosts_file.as_deref())
+            .cloned();
+        self.key_change = Some(KeyChangeView {
+            name: name.to_string(),
+            key_type: read.key_type,
+            fingerprint: read.fingerprint,
+            file: read.file,
+            line: read.line,
+            removal,
+        });
+        self.key_confirm = None;
+        self.open(Screen::HostKeyChanged);
+    }
+
+    /// Opens the page with everything ssh printed, if there is any. Closing it
+    /// goes back to `from`.
+    fn show_output(&mut self, from: Screen) {
+        if !self.has_output() {
+            self.set_status(
+                StatusKind::Info,
+                "There is no ssh output to show. It appears here after a connection.",
+            );
+            return;
+        }
+        self.output_return = from;
+        self.open(Screen::SshOutput);
+    }
+
+    fn connect_error_key(&mut self, key: KeyEvent) {
+        if !Self::is_plain(key) {
+            return;
+        }
+        match key.code {
+            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Enter | KeyCode::Esc => self.open(Screen::List),
+            KeyCode::Char('o') => self.show_output(Screen::ConnectError),
+            _ => {
+                self.scroll_key(key);
+            }
+        }
+    }
+
+    fn output_key(&mut self, key: KeyEvent) {
+        if !Self::is_plain(key) {
+            return;
+        }
+        match key.code {
+            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Char('o') | KeyCode::Esc | KeyCode::Enter => self.open(self.output_return),
+            _ => {
+                self.scroll_key(key);
+            }
+        }
+    }
+
+    /// The blocking screen. Aborting is the default (Enter or Esc), and no other
+    /// key does anything except reading ssh's output, removing the old key and
+    /// scrolling. Ctrl+C still quits, as everywhere.
+    fn host_key_key(&mut self, key: KeyEvent) {
+        if self.key_confirm.is_some() {
+            self.removal_confirm_key(key);
+            return;
+        }
+        if !Self::is_plain(key) {
+            return;
+        }
+        match key.code {
+            KeyCode::Enter | KeyCode::Esc => self.abort_key_change(),
+            KeyCode::Char('d') => self.show_output(Screen::HostKeyChanged),
+            KeyCode::Char('r') => {
+                if self
+                    .key_change
+                    .as_ref()
+                    .is_some_and(|v| v.removal.is_some())
+                {
+                    self.key_confirm = Some(RemovalConfirm {
+                        input: TextInput::default(),
+                        mismatch: false,
+                    });
+                }
+            }
+            _ => {
+                self.scroll_key(key);
+            }
+        }
+    }
+
+    fn abort_key_change(&mut self) {
+        self.key_change = None;
+        self.key_confirm = None;
+        self.open(Screen::List);
+    }
+
+    fn removal_confirm_key(&mut self, key: KeyEvent) {
+        let Some(saved_name) = self
+            .key_change
+            .as_ref()
+            .and_then(|view| view.removal.as_ref())
+            .map(|target| target.saved_name.clone())
+        else {
+            self.key_confirm = None;
+            return;
+        };
+        let Some(confirm) = self.key_confirm.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => self.key_confirm = None,
+            KeyCode::Enter => {
+                // The name must match exactly, case included.
+                if confirm.input.value() == saved_name {
+                    self.key_confirm = None;
+                    self.removal_request = self
+                        .key_change
+                        .as_ref()
+                        .and_then(|view| view.removal.clone());
+                } else {
+                    confirm.mismatch = true;
+                }
+            }
+            _ => {
+                if confirm.input.handle_key(key) {
+                    confirm.mismatch = false;
+                }
+            }
+        }
+    }
+
+    /// Reports what removing the old key did. Success goes back to the list, with
+    /// what to do next; anything else stays on the screen so it can be tried
+    /// again or aborted.
+    pub fn key_removal_finished(&mut self, target: &KnownHostsTarget, result: Removal) {
+        match result {
+            Removal::Removed => {
+                self.key_change = None;
+                self.open(Screen::List);
+                self.set_status(
+                    StatusKind::Info,
+                    format!(
+                        "Removed the old key of '{}' from your known_hosts; the previous file \
+                         is kept as known_hosts.old. Connect again: ssh will show the new key \
+                         and ask you to accept it.",
+                        target.saved_name
+                    ),
+                );
+            }
+            Removal::NotFound => self.set_status(
+                StatusKind::Warning,
+                format!(
+                    "ssh-keygen found no entry for '{}' in your known_hosts, so nothing was \
+                     removed.",
+                    target.saved_name
+                ),
+            ),
+            Removal::Failed(output) => self.set_status(
+                StatusKind::Error,
+                format!("The old key was not removed. ssh-keygen said: {output}"),
+            ),
         }
     }
 
@@ -937,6 +1407,7 @@ impl App {
 mod tests {
     use super::*;
     use crate::domain::Host;
+    use crate::ssh::connect::Exit;
     use crate::tui::persist::testing::FakeStore;
     use ratatui::crossterm::event::KeyEventKind;
 
@@ -1511,8 +1982,8 @@ mod tests {
         assert_eq!(
             labels(&app),
             [
-                "move", "search", "add", "edit", "delete", "favorite", "copy", "warnings", "help",
-                "quit"
+                "move", "connect", "search", "add", "edit", "delete", "favorite", "copy",
+                "warnings", "help", "quit"
             ]
         );
 
@@ -1527,6 +1998,7 @@ mod tests {
             labels(&app),
             [
                 "move",
+                "connect",
                 "search",
                 "add",
                 "edit",
@@ -2429,5 +2901,699 @@ mod tests {
         for key in ["d", "c"] {
             assert!(documented.contains(&key), "{key:?} is not in the help");
         }
+    }
+
+    // ---- connecting ------------------------------------------------------
+
+    fn ran(exit: Exit, interrupted: bool) -> ConnectResult {
+        ConnectResult::Ran(SshOutcome {
+            exit,
+            stderr: Vec::new(),
+            interrupted,
+        })
+    }
+
+    #[test]
+    fn enter_requests_a_connection_to_the_selected_host() {
+        let (mut app, _) = app_with(deploy_host(), Vec::new());
+        app.handle_key(press(KeyCode::Down));
+        assert_eq!(selected(&app), Some("web"));
+
+        app.handle_key(press(KeyCode::Enter));
+
+        let request = app.take_connect_request().expect("a request");
+        assert_eq!(request.name, "web");
+        assert_eq!(
+            request.args.as_slice(),
+            ["-l", "deploy", "-p", "2222", "--", "web.example.com"]
+        );
+        assert!(app.take_connect_request().is_none(), "handed out once");
+        assert_eq!(app.screen(), Screen::List);
+        assert!(!app.should_quit());
+    }
+
+    #[test]
+    fn enter_goes_through_the_jump_chain() {
+        let mut client = host("client", false);
+        client.proxy_jump = Some("bastion".to_string());
+        let (mut app, _) = app_with(hosts(vec![host("bastion", false), client]), Vec::new());
+        app.handle_key(press(KeyCode::Down));
+        assert_eq!(selected(&app), Some("client"));
+        app.handle_key(press(KeyCode::Enter));
+        let request = app.take_connect_request().unwrap();
+        assert!(request.args.as_slice().contains(&"-J".to_string()));
+    }
+
+    #[test]
+    fn enter_with_no_host_says_so() {
+        let (mut app, _) = app_with(hosts(Vec::new()), Vec::new());
+        app.handle_key(press(KeyCode::Enter));
+        assert!(app.take_connect_request().is_none());
+        let status = app.status().unwrap();
+        assert_eq!(status.kind, StatusKind::Info);
+        assert!(status.text.contains("no host to connect to"));
+    }
+
+    #[test]
+    fn enter_does_not_connect_when_it_means_something_else() {
+        // Searching: Enter keeps the filter.
+        let mut app = app();
+        app.handle_key(ch('/'));
+        app.handle_key(press(KeyCode::Enter));
+        assert!(app.take_connect_request().is_none());
+        assert_eq!(app.mode(), ListMode::Browse);
+
+        // Deleting: Enter confirms (or refuses) the typed name.
+        let mut app = app_with(sample(), Vec::new()).0;
+        app.handle_key(ch('d'));
+        app.handle_key(press(KeyCode::Enter));
+        assert!(app.take_connect_request().is_none());
+
+        // The command view: any key closes it.
+        let mut app = app_with(sample(), Vec::new()).0;
+        app.handle_key(ch('c'));
+        app.handle_key(press(KeyCode::Enter));
+        assert!(app.take_connect_request().is_none());
+
+        // The help and the warnings pages.
+        let mut app = app_with(sample(), vec![Notice::warning("careful")]).0;
+        app.handle_key(ch('?'));
+        app.handle_key(press(KeyCode::Enter));
+        assert!(app.take_connect_request().is_none());
+        assert_eq!(app.screen(), Screen::Help);
+
+        // Without hosts there is nothing to connect to.
+        let mut app = unavailable();
+        app.handle_key(press(KeyCode::Enter));
+        assert!(app.take_connect_request().is_none());
+    }
+
+    #[test]
+    fn what_is_not_a_failure_is_one_line_on_the_list() {
+        let cases = [
+            (
+                ran(Exit::Code(0), false),
+                StatusKind::Info,
+                "Disconnected from 'web'.",
+            ),
+            (
+                ran(Exit::Code(1), false),
+                StatusKind::Info,
+                "The session on 'web' ended with status 1.",
+            ),
+            (
+                ran(Exit::Signal(9), false),
+                StatusKind::Warning,
+                "ssh for 'web' was stopped by signal 9.",
+            ),
+            (
+                ran(Exit::Signal(2), false),
+                StatusKind::Info,
+                "The connection to 'web' was cancelled.",
+            ),
+            (
+                ran(Exit::Code(255), true),
+                StatusKind::Info,
+                "The connection to 'web' was cancelled.",
+            ),
+            (
+                ran_with(255, "Connection to 192.0.2.1 closed.\r\n"),
+                StatusKind::Info,
+                "The connection to 'web' was closed.",
+            ),
+            (
+                ConnectResult::Failed("Could not start ssh: no".to_string()),
+                StatusKind::Error,
+                "Could not start ssh: no",
+            ),
+        ];
+        for (result, kind, text) in cases {
+            let mut app = app();
+            app.connection_ended("web", result);
+            assert_eq!(app.screen(), Screen::List, "{text}");
+            let status = app.status().unwrap();
+            assert_eq!((status.kind, status.text.as_str()), (kind, text));
+        }
+    }
+
+    fn ran_with(code: i32, stderr: &str) -> ConnectResult {
+        ConnectResult::Ran(SshOutcome {
+            exit: Exit::Code(code),
+            stderr: stderr.as_bytes().to_vec(),
+            interrupted: false,
+        })
+    }
+
+    const REFUSED: &str = "ssh: connect to host 192.0.2.1 port 22: Connection refused\r\n";
+
+    /// An app that has just seen a connection to `web` fail with `stderr`.
+    fn app_after_failure(stderr: &str) -> App {
+        let mut app = app();
+        app.connection_ended("web", ran_with(255, stderr));
+        app
+    }
+
+    #[test]
+    fn a_failure_opens_the_error_screen_and_keeps_what_ssh_printed() {
+        let mut app = app();
+        app.connection_ended("web", ran_with(255, REFUSED));
+
+        assert_eq!(app.screen(), Screen::ConnectError);
+        assert!(app.status().is_none(), "the screen says it, not a status");
+        let report = app.report().unwrap();
+        assert_eq!(report.name, "web");
+        assert_eq!(report.failure, Some(FailureKind::ConnectionRefused));
+        assert_eq!(report.stderr, REFUSED.as_bytes());
+    }
+
+    #[test]
+    fn a_remote_exit_status_is_not_a_failure_even_with_error_text_on_stderr() {
+        let mut app = app();
+        app.connection_ended("web", ran_with(1, REFUSED));
+        assert_eq!(app.screen(), Screen::List);
+        assert_eq!(app.report().unwrap().failure, None);
+        assert!(!app.report().unwrap().stderr.is_empty(), "still viewable");
+    }
+
+    #[test]
+    fn the_error_screen_goes_back_with_enter_or_esc_and_o_reads_the_output() {
+        for back in [KeyCode::Enter, KeyCode::Esc] {
+            let mut app = app();
+            app.connection_ended("web", ran_with(255, REFUSED));
+            app.handle_key(press(back));
+            assert_eq!(app.screen(), Screen::List);
+            assert!(!app.should_quit());
+        }
+
+        let mut app = app();
+        app.connection_ended("web", ran_with(255, REFUSED));
+        app.handle_key(ch('o'));
+        assert_eq!(app.screen(), Screen::SshOutput);
+        // Back goes to where it came from: the error, not the list.
+        app.handle_key(ch('o'));
+        assert_eq!(app.screen(), Screen::ConnectError);
+        app.handle_key(ch('o'));
+        app.handle_key(press(KeyCode::Esc));
+        assert_eq!(app.screen(), Screen::ConnectError);
+        app.handle_key(ch('o'));
+        app.handle_key(press(KeyCode::Enter));
+        assert_eq!(app.screen(), Screen::ConnectError);
+    }
+
+    #[test]
+    fn q_quits_from_both_new_screens_and_ctrl_c_too() {
+        let mut on_error = app_after_failure(REFUSED);
+        on_error.handle_key(ch('q'));
+        assert!(on_error.should_quit());
+
+        let mut on_output = app_after_failure(REFUSED);
+        on_output.handle_key(ch('o'));
+        on_output.handle_key(ch('q'));
+        assert!(on_output.should_quit());
+
+        let mut ctrl_c = app_after_failure(REFUSED);
+        ctrl_c.handle_key(ch('o'));
+        ctrl_c.handle_key(with(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(ctrl_c.should_quit());
+    }
+
+    #[test]
+    fn o_on_the_list_reads_the_output_of_the_last_connection() {
+        let mut app = app();
+        app.connection_ended("web", ran_with(0, "Warning: Permanently added 'x'.\r\n"));
+        assert_eq!(app.screen(), Screen::List);
+
+        app.handle_key(ch('o'));
+        assert_eq!(app.screen(), Screen::SshOutput);
+        app.handle_key(press(KeyCode::Esc));
+        assert_eq!(app.screen(), Screen::List, "back to the list it came from");
+        assert!(!app.should_quit());
+    }
+
+    #[test]
+    fn o_with_nothing_to_show_says_so_and_stays() {
+        // Never connected.
+        let mut app = app();
+        app.handle_key(ch('o'));
+        assert_eq!(app.screen(), Screen::List);
+        assert!(app.status().unwrap().text.contains("no ssh output"));
+
+        // Connected, but ssh printed nothing.
+        let mut quiet = self::app();
+        quiet.connection_ended("web", ran(Exit::Code(0), false));
+        quiet.handle_key(ch('o'));
+        assert_eq!(quiet.screen(), Screen::List);
+        assert!(quiet.status().unwrap().text.contains("no ssh output"));
+    }
+
+    #[test]
+    fn a_connection_that_could_not_start_forgets_the_previous_output() {
+        let mut app = app();
+        app.connection_ended("web", ran_with(0, "old output\r\n"));
+        app.connection_ended("web", ConnectResult::Failed("no ssh".to_string()));
+        assert!(app.report().is_none(), "the output was of another run");
+    }
+
+    #[test]
+    fn the_new_screens_scroll_and_reopening_starts_at_the_top() {
+        let long: String = (0..60).map(|n| format!("line {n}\r\n")).collect();
+        let mut app = app();
+        app.connection_ended("web", ran_with(255, &long));
+        app.handle_key(ch('o'));
+        app.apply_metrics(Metrics {
+            max_scroll: 40,
+            ..Metrics::default()
+        });
+        for _ in 0..5 {
+            app.handle_key(ch('j'));
+        }
+        assert_eq!(app.scroll(), 5);
+        app.handle_key(ch('o'));
+        app.handle_key(ch('o'));
+        assert_eq!(app.scroll(), 0, "opened again from the top");
+    }
+
+    #[test]
+    fn the_footer_of_each_new_screen_lists_its_keys() {
+        let mut app = app();
+        app.connection_ended("web", ran_with(255, REFUSED));
+        assert_eq!(labels(&app), ["scroll", "ssh output", "back", "quit"]);
+        app.handle_key(ch('o'));
+        assert_eq!(labels(&app), ["scroll", "back", "quit"]);
+
+        // Nothing to read: no offer to.
+        let silent = app_after_failure("");
+        assert_eq!(silent.screen(), Screen::ConnectError);
+        assert_eq!(labels(&silent), ["scroll", "back", "quit"]);
+    }
+
+    #[test]
+    fn the_list_offers_o_only_when_there_is_output() {
+        let mut app = app();
+        assert!(!labels(&app).contains(&"ssh output"));
+        app.connection_ended("web", ran_with(0, "something\r\n"));
+        assert!(labels(&app).contains(&"ssh output"));
+    }
+
+    #[test]
+    fn the_message_goes_away_with_the_next_key() {
+        let mut app = app();
+        app.connection_ended("web", ran(Exit::Code(0), false));
+        assert!(app.status().is_some());
+        app.handle_key(ch('j'));
+        assert!(app.status().is_none());
+    }
+
+    // ---- a changed host key ----------------------------------------------
+
+    const DEFAULT_KNOWN_HOSTS: &str = "/home/dev/.ssh/known_hosts";
+    const FINGERPRINT: &str = "SHA256:pZ90vMeWq3ZkYc4TsAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+    /// What ssh prints for a changed key of `host`, whose old key is in `file`.
+    fn changed_key_output(host: &str, file: &str) -> String {
+        format!(
+            "@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\r\n\
+             The fingerprint for the ED25519 key sent by the remote host is\r\n\
+             {FINGERPRINT}.\r\n\
+             Offending ED25519 key in {file}:12\r\n\
+             Host key for {host} has changed and you have requested strict checking.\r\n\
+             Host key verification failed.\r\n"
+        )
+    }
+
+    /// An app that asked to connect to the selected host (`backup`) and was told
+    /// its key had changed, with `known_hosts` as the file the output names.
+    fn app_with_changed_key(hosts: Hosts, host: &str, file: &str) -> App {
+        let mut app = app_with(hosts, Vec::new()).0;
+        app.set_known_hosts_file(Some(PathBuf::from(DEFAULT_KNOWN_HOSTS)));
+        app.handle_key(press(KeyCode::Enter));
+        let request = app.take_connect_request().expect("a request");
+        app.connection_ended(
+            &request.name,
+            ran_with(255, &changed_key_output(host, file)),
+        );
+        app
+    }
+
+    fn removable_key_change() -> App {
+        app_with_changed_key(sample(), "backup.example.com", DEFAULT_KNOWN_HOSTS)
+    }
+
+    fn type_name(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.handle_key(ch(c));
+        }
+    }
+
+    #[test]
+    fn a_changed_key_opens_the_blocking_screen_with_what_ssh_reported() {
+        let app = removable_key_change();
+        assert_eq!(app.screen(), Screen::HostKeyChanged);
+        assert!(app.status().is_none());
+        let view = app.key_change().unwrap();
+        assert_eq!(view.name, "backup");
+        assert_eq!(view.key_type.as_deref(), Some("ED25519"));
+        assert_eq!(view.fingerprint.as_deref(), Some(FINGERPRINT));
+        assert_eq!(view.file.as_deref(), Some(DEFAULT_KNOWN_HOSTS));
+        assert_eq!(view.line, Some(12));
+        let target = view.removal.as_ref().expect("removable");
+        assert_eq!(target.entry, "backup.example.com");
+        assert_eq!(target.saved_name, "backup");
+        assert!(app.report().is_some(), "ssh's output is kept");
+    }
+
+    #[test]
+    fn a_rejected_key_is_not_this_screen() {
+        let mut app = app();
+        app.handle_key(press(KeyCode::Enter));
+        app.take_connect_request();
+        app.connection_ended("backup", ran_with(255, "Host key verification failed.\r\n"));
+        assert_eq!(app.screen(), Screen::ConnectError);
+        assert!(app.key_change().is_none());
+    }
+
+    #[test]
+    fn removal_is_offered_only_when_ssh_s_words_match_the_connection() {
+        // A host Bifrost did not connect through: what a server could print.
+        let forged = app_with_changed_key(sample(), "other.example.com", DEFAULT_KNOWN_HOSTS);
+        // A file Bifrost does not edit.
+        let elsewhere =
+            app_with_changed_key(sample(), "backup.example.com", "/etc/ssh/ssh_known_hosts");
+        // A file that is not the one ssh-keygen edits by default.
+        let authorized = app_with_changed_key(
+            sample(),
+            "backup.example.com",
+            "/home/dev/.ssh/authorized_keys",
+        );
+        for (what, app) in [
+            ("host", forged),
+            ("file", elsewhere),
+            ("authorized", authorized),
+        ] {
+            assert_eq!(app.screen(), Screen::HostKeyChanged, "{what}");
+            assert!(app.key_change().unwrap().removal.is_none(), "{what}");
+        }
+
+        // The default file is not known: nothing is offered.
+        let mut unknown = app_with(sample(), Vec::new()).0;
+        unknown.handle_key(press(KeyCode::Enter));
+        let request = unknown.take_connect_request().unwrap();
+        unknown.connection_ended(
+            &request.name,
+            ran_with(
+                255,
+                &changed_key_output("backup.example.com", DEFAULT_KNOWN_HOSTS),
+            ),
+        );
+        assert!(unknown.key_change().unwrap().removal.is_none());
+
+        // Details ssh did not give.
+        let mut bare = app_with(sample(), Vec::new()).0;
+        bare.set_known_hosts_file(Some(PathBuf::from(DEFAULT_KNOWN_HOSTS)));
+        bare.handle_key(press(KeyCode::Enter));
+        bare.take_connect_request();
+        bare.connection_ended(
+            "backup",
+            ran_with(
+                255,
+                "REMOTE HOST IDENTIFICATION HAS CHANGED!\r\nHost key verification failed.\r\n",
+            ),
+        );
+        assert_eq!(bare.screen(), Screen::HostKeyChanged);
+        assert!(bare.key_change().unwrap().removal.is_none());
+    }
+
+    #[test]
+    fn a_jump_host_s_changed_key_asks_for_the_jump_host_s_name() {
+        let mut client = host("client", false);
+        client.proxy_jump = Some("bastion".to_string());
+        let hosts = hosts(vec![host("bastion", false), client]);
+        let mut app = app_with(hosts, Vec::new()).0;
+        app.set_known_hosts_file(Some(PathBuf::from(DEFAULT_KNOWN_HOSTS)));
+        app.handle_key(press(KeyCode::Down)); // bastion, client: the client
+        assert_eq!(selected(&app), Some("client"));
+        app.handle_key(press(KeyCode::Enter));
+        let request = app.take_connect_request().unwrap();
+        app.connection_ended(
+            &request.name,
+            ran_with(
+                255,
+                &changed_key_output("bastion.example.com", DEFAULT_KNOWN_HOSTS),
+            ),
+        );
+
+        let view = app.key_change().unwrap();
+        assert_eq!(view.name, "client");
+        assert_eq!(view.removal.as_ref().unwrap().saved_name, "bastion");
+        app.handle_key(ch('r'));
+        type_name(&mut app, "client");
+        app.handle_key(press(KeyCode::Enter));
+        assert!(
+            app.take_removal_request().is_none(),
+            "the client's name is not it"
+        );
+        for _ in 0..6 {
+            app.handle_key(press(KeyCode::Backspace));
+        }
+        type_name(&mut app, "bastion");
+        app.handle_key(press(KeyCode::Enter));
+        let target = app.take_removal_request().expect("confirmed");
+        assert_eq!(target.entry, "bastion.example.com");
+    }
+
+    #[test]
+    fn enter_and_esc_abort_and_nothing_is_removed() {
+        for abort in [KeyCode::Enter, KeyCode::Esc] {
+            let mut app = removable_key_change();
+            app.handle_key(press(abort));
+            assert_eq!(app.screen(), Screen::List);
+            assert!(app.key_change().is_none());
+            assert!(app.take_removal_request().is_none());
+            assert!(!app.should_quit());
+        }
+    }
+
+    #[test]
+    fn no_other_key_does_anything_on_the_blocking_screen() {
+        for key in ['q', '?', 'e', 'a', 'f', 'c', 'w', '/', 'x', 'y', 't', ' '] {
+            let mut app = removable_key_change();
+            app.handle_key(ch(key));
+            assert_eq!(app.screen(), Screen::HostKeyChanged, "{key:?}");
+            assert!(!app.should_quit(), "{key:?}");
+            assert!(app.key_confirm().is_none(), "{key:?}");
+            assert!(app.take_removal_request().is_none(), "{key:?}");
+            assert!(app.take_connect_request().is_none(), "{key:?}");
+            assert!(app.take_copy_request().is_none(), "{key:?}");
+        }
+        // Keys with modifiers do not act as their plain letter.
+        for key in [
+            with(KeyCode::Char('r'), KeyModifiers::ALT),
+            with(KeyCode::Char('d'), KeyModifiers::ALT),
+        ] {
+            let mut app = removable_key_change();
+            app.handle_key(key);
+            assert_eq!(app.screen(), Screen::HostKeyChanged);
+            assert!(app.key_confirm().is_none());
+        }
+    }
+
+    #[test]
+    fn ctrl_c_still_quits_from_the_blocking_screen_and_from_the_confirmation() {
+        let mut app = removable_key_change();
+        app.handle_key(with(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.should_quit());
+
+        let mut app = removable_key_change();
+        app.handle_key(ch('r'));
+        app.handle_key(with(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.should_quit());
+        assert!(app.take_removal_request().is_none());
+    }
+
+    #[test]
+    fn scrolling_is_allowed_on_the_blocking_screen() {
+        let mut app = removable_key_change();
+        app.apply_metrics(Metrics {
+            max_scroll: 10,
+            ..Metrics::default()
+        });
+        app.handle_key(ch('j'));
+        app.handle_key(press(KeyCode::Down));
+        assert_eq!(app.scroll(), 2);
+        app.handle_key(ch('k'));
+        assert_eq!(app.scroll(), 1);
+        assert_eq!(app.screen(), Screen::HostKeyChanged);
+    }
+
+    #[test]
+    fn d_reads_the_output_and_comes_back_to_the_blocking_screen() {
+        let mut app = removable_key_change();
+        app.handle_key(ch('d'));
+        assert_eq!(app.screen(), Screen::SshOutput);
+        app.handle_key(press(KeyCode::Esc));
+        assert_eq!(app.screen(), Screen::HostKeyChanged, "not the list");
+        assert!(app.key_change().is_some());
+    }
+
+    #[test]
+    fn r_asks_for_the_name_and_only_the_exact_name_removes() {
+        let mut app = removable_key_change();
+        app.handle_key(ch('r'));
+        assert!(app.key_confirm().is_some());
+
+        // Letters are typed, not commands.
+        type_name(&mut app, "q?d");
+        assert_eq!(app.screen(), Screen::HostKeyChanged);
+        assert!(!app.should_quit());
+        assert_eq!(app.key_confirm().unwrap().input.value(), "q?d");
+        for _ in 0..3 {
+            app.handle_key(press(KeyCode::Backspace));
+        }
+
+        // Wrong: case counts, and so does a part of it.
+        for wrong in ["Backup", "back", "backup ", ""] {
+            type_name(&mut app, wrong);
+            app.handle_key(press(KeyCode::Enter));
+            assert!(app.key_confirm().unwrap().mismatch, "{wrong:?}");
+            assert!(app.take_removal_request().is_none(), "{wrong:?}");
+            for _ in 0..wrong.len() {
+                app.handle_key(press(KeyCode::Backspace));
+            }
+        }
+
+        type_name(&mut app, "backup");
+        assert!(
+            !app.key_confirm().unwrap().mismatch,
+            "typing clears the complaint"
+        );
+        app.handle_key(press(KeyCode::Enter));
+        assert!(app.key_confirm().is_none());
+        let target = app.take_removal_request().expect("confirmed");
+        assert_eq!(target.entry, "backup.example.com");
+        assert!(app.take_removal_request().is_none(), "handed out once");
+    }
+
+    #[test]
+    fn esc_cancels_the_confirmation_and_stays_on_the_screen() {
+        let mut app = removable_key_change();
+        app.handle_key(ch('r'));
+        type_name(&mut app, "backup");
+        app.handle_key(press(KeyCode::Esc));
+        assert!(app.key_confirm().is_none());
+        assert_eq!(app.screen(), Screen::HostKeyChanged);
+        assert!(app.take_removal_request().is_none());
+        // Asking again starts empty.
+        app.handle_key(ch('r'));
+        assert_eq!(app.key_confirm().unwrap().input.value(), "");
+    }
+
+    #[test]
+    fn r_does_nothing_when_no_removal_is_offered() {
+        let mut app = app_with_changed_key(sample(), "other.example.com", DEFAULT_KNOWN_HOSTS);
+        app.handle_key(ch('r'));
+        assert!(app.key_confirm().is_none());
+        assert!(app.take_removal_request().is_none());
+        assert_eq!(app.screen(), Screen::HostKeyChanged);
+    }
+
+    fn target() -> KnownHostsTarget {
+        KnownHostsTarget {
+            entry: "backup.example.com".to_string(),
+            saved_name: "backup".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_removal_goes_back_to_the_list_and_says_what_to_do_next() {
+        let mut app = removable_key_change();
+        app.key_removal_finished(&target(), Removal::Removed);
+        assert_eq!(app.screen(), Screen::List);
+        assert!(app.key_change().is_none());
+        let status = app.status().unwrap();
+        assert_eq!(status.kind, StatusKind::Info);
+        assert!(status.text.contains("known_hosts.old"), "{}", status.text);
+        assert!(status.text.contains("Connect again"), "{}", status.text);
+    }
+
+    #[test]
+    fn a_removal_that_did_not_happen_stays_on_the_screen_and_can_be_retried() {
+        for result in [
+            Removal::NotFound,
+            Removal::Failed("Cannot stat known_hosts".to_string()),
+        ] {
+            let mut app = removable_key_change();
+            app.handle_key(ch('r'));
+            type_name(&mut app, "backup");
+            app.handle_key(press(KeyCode::Enter));
+            app.take_removal_request().unwrap();
+            app.key_removal_finished(&target(), result.clone());
+
+            assert_eq!(app.screen(), Screen::HostKeyChanged, "{result:?}");
+            let status = app.status().unwrap();
+            assert_ne!(status.kind, StatusKind::Info, "{result:?}");
+            app.handle_key(ch('r'));
+            assert!(app.key_confirm().is_some(), "can ask again");
+        }
+    }
+
+    #[test]
+    fn the_footer_of_the_blocking_screen_puts_abort_first() {
+        let mut app = removable_key_change();
+        assert_eq!(
+            labels(&app),
+            ["abort (safe)", "ssh output", "remove old key...", "scroll"]
+        );
+        app.handle_key(ch('r'));
+        assert_eq!(labels(&app), ["the host name", "remove", "cancel"]);
+        app.handle_key(press(KeyCode::Esc));
+
+        let no_removal = app_with_changed_key(sample(), "other.example.com", DEFAULT_KNOWN_HOSTS);
+        assert_eq!(
+            labels(&no_removal),
+            ["abort (safe)", "ssh output", "scroll"]
+        );
+    }
+
+    #[test]
+    fn a_new_connection_forgets_the_previous_known_hosts_names() {
+        // A later failure must be judged against the connection it belongs to.
+        let mut app = app_with(sample(), Vec::new()).0;
+        app.set_known_hosts_file(Some(PathBuf::from(DEFAULT_KNOWN_HOSTS)));
+        app.handle_key(press(KeyCode::Enter)); // backup
+        app.take_connect_request();
+        app.connection_ended("backup", ran(Exit::Code(0), false));
+        app.handle_key(press(KeyCode::Down)); // db
+        app.handle_key(press(KeyCode::Enter));
+        let request = app.take_connect_request().unwrap();
+        assert_eq!(request.name, "db");
+        // ssh names backup: not what this connection went to.
+        app.connection_ended(
+            "db",
+            ran_with(
+                255,
+                &changed_key_output("backup.example.com", DEFAULT_KNOWN_HOSTS),
+            ),
+        );
+        assert!(app.key_change().unwrap().removal.is_none());
+    }
+
+    #[test]
+    fn the_request_carries_the_known_hosts_names_of_the_chain() {
+        let mut client = host("client", false);
+        client.proxy_jump = Some("bastion".to_string());
+        client.port = Some(2222);
+        let mut app = app_with(hosts(vec![host("bastion", false), client]), Vec::new()).0;
+        app.handle_key(press(KeyCode::Down));
+        app.handle_key(press(KeyCode::Enter));
+        let request = app.take_connect_request().unwrap();
+        let entries: Vec<_> = request
+            .known_hosts
+            .iter()
+            .map(|t| t.entry.as_str())
+            .collect();
+        assert_eq!(
+            entries,
+            ["[client.example.com]:2222", "bastion.example.com"]
+        );
     }
 }

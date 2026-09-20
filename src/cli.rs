@@ -7,16 +7,34 @@ use clap::{Parser, Subcommand};
 /// Run without arguments to open the TUI, pass a host to connect directly,
 /// or use `list` to print the saved hosts.
 #[derive(Debug, Parser)]
-#[command(name = "bifrost", version, args_conflicts_with_subcommands = true)]
+#[command(
+    name = "bifrost",
+    version,
+    args_conflicts_with_subcommands = true,
+    after_help = EXIT_STATUS_HELP
+)]
 pub struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
 
-    /// Saved host to connect to directly.
+    /// Saved host to connect to directly, without opening the interface.
     ///
     /// The name `list` is reserved for the `list` subcommand.
     host: Option<String>,
 }
+
+/// What `bifrost <host>` exits with, shown at the end of `--help`.
+const EXIT_STATUS_HELP: &str = "\
+Exit status of `bifrost <host>`:
+  0-255  The exit status of ssh or of the remote command, unchanged. ssh itself
+         uses 255 when it cannot connect.
+  128+N  ssh was ended by signal N (130 after Ctrl-C).
+  2      Bifrost itself could not connect: the host is not saved, the saved
+         hosts cannot be read, or ssh is not installed. A remote command can
+         also exit with 2; the message on stderr tells the two apart.
+
+`bifrost <host>` never opens the interface, and a connection failure is explained
+on stderr after ssh's own messages.";
 
 #[derive(Debug, Subcommand)]
 enum Command {
@@ -109,6 +127,23 @@ mod tests {
             assert!(text.contains("list"), "help should mention `list`: {text}");
             assert!(text.contains("[HOST]"), "help should mention host: {text}");
         }
+    }
+
+    #[test]
+    fn help_explains_the_exit_status_of_connecting() {
+        let text = parse_err(&["--help"]).to_string();
+        for line in [
+            "Exit status of `bifrost <host>`",
+            "unchanged",
+            "128+N",
+            "130 after Ctrl-C",
+            "Bifrost itself could not connect",
+            "A remote command can",
+        ] {
+            assert!(text.contains(line), "{line:?} missing from:\n{text}");
+        }
+        // Short help too: it is the one people read first.
+        assert!(parse_err(&["-h"]).to_string().contains("Exit status"));
     }
 
     #[test]

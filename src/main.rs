@@ -7,14 +7,19 @@ use bifrost_ssh::cli::{Action, Cli};
 use bifrost_ssh::commands;
 use bifrost_ssh::error::Result;
 use bifrost_ssh::sanitize::sanitize_lines;
+use bifrost_ssh::ssh::binary::resolve_ssh;
 use bifrost_ssh::store::Store;
 use bifrost_ssh::sysenv::process_env;
+use bifrost_ssh::sysenv::{Platform, home_dir};
 use bifrost_ssh::tui;
 use clap::Parser;
 
 fn main() -> ExitCode {
     let action = Cli::parse().action();
-    match run(action, &mut io::stdout().lock(), &mut io::stderr().lock()) {
+    if let Action::Connect { host } = action {
+        return exit_with(connect(&host));
+    }
+    match run(action, &mut io::stdout(), &mut io::stderr()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             // Error text can quote file contents and host names, so it is
@@ -30,6 +35,46 @@ fn main() -> ExitCode {
     }
 }
 
+/// Exits with `status`. Statuses above 255 (a Windows process can return any
+/// 32-bit value) cannot be an `ExitCode`, so they exit directly.
+fn exit_with(status: i32) -> ExitCode {
+    match u8::try_from(status) {
+        Ok(status) => ExitCode::from(status),
+        Err(_) => std::process::exit(status),
+    }
+}
+
+/// `bifrost <host>`: connects and returns the status to exit with. Bifrost's own
+/// failures are [`commands::OWN_ERROR`], not the 1 of the other commands, which
+/// a remote command can also return.
+///
+/// The streams are not locked for the whole run: connecting copies ssh's stderr
+/// to ours from another thread, which would wait forever for a lock held here.
+/// Each write takes the lock for itself.
+fn connect(host: &str) -> i32 {
+    let store = match Store::from_process_env() {
+        Ok(store) => store,
+        Err(err) => {
+            let _ = writeln!(
+                io::stderr(),
+                "bifrost: error: {}",
+                sanitize_lines(&err.to_string())
+            );
+            return commands::OWN_ERROR;
+        }
+    };
+    let known_hosts = home_dir(Platform::current(), &process_env)
+        .map(|home| home.join(".ssh").join("known_hosts"));
+    commands::connect(
+        host,
+        &store,
+        resolve_ssh,
+        known_hosts.as_deref(),
+        &mut io::stderr(),
+        io::stderr(),
+    )
+}
+
 /// `out` receives data meant for pipes; `err` receives messages for the user.
 fn run(action: Action, out: &mut impl Write, err: &mut impl Write) -> Result<()> {
     match action {
@@ -42,62 +87,12 @@ fn run(action: Action, out: &mut impl Write, err: &mut impl Write) -> Result<()>
             });
             tui::run(loaded, &process_env)
         }
-        // Block 5 stub. `{:?}` escapes control characters in the user-supplied
-        // host name.
-        Action::Connect { host } => {
-            writeln!(out, "Would connect to host {host:?}.")?;
-            Ok(())
-        }
+        // Handled by `connect` before this is reached: its exit status is not
+        // an error of this kind.
+        Action::Connect { .. } => Ok(()),
         Action::List => {
             let store = Store::from_process_env()?;
             commands::list(&store, out, err)
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn connect_output(host: &str) -> String {
-        let mut out = Vec::new();
-        let action = Action::Connect {
-            host: host.to_string(),
-        };
-        run(action, &mut out, &mut Vec::new()).expect("stub should not fail");
-        String::from_utf8(out).expect("stub output should be UTF-8")
-    }
-
-    #[test]
-    fn connect_is_still_a_stub() {
-        assert_eq!(
-            connect_output("prod-db"),
-            "Would connect to host \"prod-db\".\n"
-        );
-    }
-
-    #[test]
-    fn connect_stub_escapes_control_characters() {
-        let out = connect_output("evil\x1b[31m\nhost");
-        assert!(!out.contains('\x1b'));
-        assert_eq!(out.matches('\n').count(), 1, "only the final newline");
-    }
-
-    #[test]
-    fn write_failures_become_app_errors() {
-        struct Broken;
-        impl Write for Broken {
-            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
-                Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"))
-            }
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-        let action = Action::Connect {
-            host: "prod-db".to_string(),
-        };
-        let err = run(action, &mut Broken, &mut Vec::new()).expect_err("write should fail");
-        assert!(err.to_string().contains("closed"));
     }
 }

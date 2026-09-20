@@ -183,6 +183,59 @@ pub fn build_args(host: &Host, hosts: &Hosts) -> Result<SshArgs, CommandError> {
     Ok(SshArgs(args))
 }
 
+/// A name that ssh may use for a host in `known_hosts`, and the saved host it
+/// belongs to.
+///
+/// When a server's key changes, ssh names the host whose key it does not
+/// recognize. That text can be a jump host's, and it is not to be trusted
+/// (a server can print anything before login), so it is only ever accepted if
+/// it is one of these: the hosts Bifrost itself asked ssh to connect through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KnownHostsTarget {
+    /// The name as ssh writes it in `known_hosts` and in its messages: the host
+    /// name in lower case, as `[host]:port` unless the port is 22.
+    pub entry: String,
+    /// The saved host's name.
+    pub saved_name: String,
+}
+
+/// The `known_hosts` names of `host` and of each jump host on its way, the host
+/// itself first.
+pub fn known_hosts_targets(
+    host: &Host,
+    hosts: &Hosts,
+) -> Result<Vec<KnownHostsTarget>, CommandError> {
+    let chain = jump_chain(hosts.as_slice(), host).map_err(CommandError::Chain)?;
+    let target = |host: &Host| {
+        let name = host.hostname.to_ascii_lowercase();
+        KnownHostsTarget {
+            entry: match host.port {
+                Some(port) if port != 22 => format!("[{name}]:{port}"),
+                _ => name,
+            },
+            saved_name: host.name.clone(),
+        }
+    };
+    let mut targets = vec![target(host)];
+    targets.extend(chain.into_iter().map(target));
+    Ok(targets)
+}
+
+/// The command that removes `entry` from `known_hosts`, for a person to read
+/// and paste: `ssh-keygen -R`, then the entry quoted for `shell`.
+pub fn display_keygen_remove(entry: &str, shell: Shell) -> Result<String, CommandError> {
+    if !super::keygen::is_safe_entry(entry) {
+        return Err(CommandError::UnsafeValue {
+            field: "known_hosts entry",
+        });
+    }
+    let quoted = match shell {
+        Shell::Posix => quote_posix(entry),
+        Shell::Windows => quote_windows(entry)?,
+    };
+    Ok(format!("ssh-keygen -R {quoted}"))
+}
+
 /// Characters that need no quoting in a POSIX shell.
 fn posix_bare(c: char) -> bool {
     c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c)
@@ -263,6 +316,88 @@ mod tests {
 
     fn strs(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    // ---- known_hosts names -------------------------------------------------
+
+    #[test]
+    fn known_hosts_names_follow_ssh_s_port_rule() {
+        let mut plain = Host::new("plain", "Web.Example.COM");
+        let mut default_port = Host::new("default", "192.0.2.2");
+        default_port.port = Some(22);
+        let mut other = Host::new("other", "192.0.2.3");
+        other.port = Some(2222);
+        let mut v6 = Host::new("v6", "2001:DB8::1");
+        v6.port = Some(2200);
+        plain.proxy_jump = None;
+        let all = hosts(vec![
+            plain.clone(),
+            default_port.clone(),
+            other.clone(),
+            v6.clone(),
+        ]);
+        let entry = |h: &Host| known_hosts_targets(h, &all).unwrap()[0].entry.clone();
+        assert_eq!(entry(&plain), "web.example.com", "lower case");
+        assert_eq!(entry(&default_port), "192.0.2.2", "22 is the default");
+        assert_eq!(entry(&other), "[192.0.2.3]:2222");
+        assert_eq!(entry(&v6), "[2001:db8::1]:2200");
+    }
+
+    #[test]
+    fn the_jump_chain_is_included_with_the_saved_names() {
+        let mut inner = Host::new("inner", "10.0.0.5");
+        inner.port = Some(2200);
+        inner.proxy_jump = Some("outer".to_string());
+        let mut outer = Host::new("outer", "bastion.example.com");
+        outer.proxy_jump = None;
+        let mut target = Host::new("target", "10.0.1.9");
+        target.proxy_jump = Some("inner".to_string());
+        let all = hosts(vec![outer, inner, target.clone()]);
+
+        let targets = known_hosts_targets(&target, &all).unwrap();
+        let listed: Vec<(&str, &str)> = targets
+            .iter()
+            .map(|t| (t.entry.as_str(), t.saved_name.as_str()))
+            .collect();
+        assert_eq!(
+            listed,
+            // The target, then the jump hosts outermost first, as ssh connects.
+            [
+                ("10.0.1.9", "target"),
+                ("bastion.example.com", "outer"),
+                ("[10.0.0.5]:2200", "inner"),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_removal_command_is_quoted_for_the_shell() {
+        assert_eq!(
+            display_keygen_remove("192.0.2.2", Shell::Posix).unwrap(),
+            "ssh-keygen -R 192.0.2.2"
+        );
+        // Brackets are pattern characters in zsh and PowerShell.
+        assert_eq!(
+            display_keygen_remove("[192.0.2.9]:2222", Shell::Posix).unwrap(),
+            "ssh-keygen -R '[192.0.2.9]:2222'"
+        );
+        assert_eq!(
+            display_keygen_remove("[192.0.2.9]:2222", Shell::Windows).unwrap(),
+            "ssh-keygen -R \"[192.0.2.9]:2222\""
+        );
+    }
+
+    #[test]
+    fn a_removal_command_is_never_built_for_an_entry_that_is_not_plain() {
+        for entry in ["-f x", "a b", "x;y", "", "$(id)"] {
+            assert_eq!(
+                display_keygen_remove(entry, Shell::Posix),
+                Err(CommandError::UnsafeValue {
+                    field: "known_hosts entry"
+                }),
+                "{entry:?}"
+            );
+        }
     }
 
     // ---- test-only readers: what a shell would make of the display string --

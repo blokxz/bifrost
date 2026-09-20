@@ -241,6 +241,159 @@ settled: reopen one only with a clear new reason.
   ssh reads the arguments as meant is only visible to ssh (`ssh -G`, which needs
   no network), so that test is `#[ignore]` and run by hand.
 
+## Connecting
+
+- **ssh gets the real terminal; Bifrost leaves completely.** The terminal guard
+  suspends (cursor shown, alternate screen left, raw mode off), ssh runs on the
+  user's normal screen with the real stdin and stdout, and Bifrost only waits.
+  A screen that is drawn on top of a running ssh, or input read at the same time,
+  would fight it for the terminal. One line ("connecting to ...") is printed
+  first so ssh's output does not run into the old screen.
+- **ssh's stderr goes through a pipe, and is copied to the real stderr as it
+  arrives.** The user sees ssh's own messages exactly as ssh wrote them, and the
+  last 64 KiB are kept to explain a failure afterwards. Stdout is not captured:
+  it carries the session.
+- **A process that inherited the stderr pipe cannot hold Bifrost up.** A
+  `ControlPersist` master keeps the pipe open after ssh exits. Bifrost waits
+  200 ms for the end of stderr and then leaves the reader thread behind.
+- **Ctrl-C is caught in Bifrost, not ignored.** With the terminal in its normal
+  mode Ctrl-C signals the whole foreground group, ssh and Bifrost. A handler that
+  sets a flag is reset to the default when ssh is started, so ssh still dies from
+  Ctrl-C; `SIG_IGN` would be inherited and ssh would ignore it too. The handler
+  cannot be removed again (the signal library leaves the signal ignored), so it
+  stays for the process's life, and a SIGINT outside a connection is turned into
+  the Ctrl+C key, which quits, or asks first in a form with unsaved changes.
+- **Terminal modes are saved before ssh and restored after it.** ssh restores
+  its own changes when it exits normally, but not when it is killed. crossterm
+  records "the original modes" on every `enable_raw_mode`, so without this a
+  Bifrost that took the terminal back from a killed ssh would restore raw mode
+  when it quits. Unix only.
+- **Input typed during the connection that ssh did not read is discarded** when
+  the interface comes back. A `q` typed as ssh exits would otherwise quit.
+- **Only exit status 255 is an ssh failure.** Any other status is what the remote
+  session or command returned, and is reported neutrally.
+- **Repainting after a connection does not ask the terminal for the cursor
+  position.** ratatui's `Terminal::clear` does, and a terminal or multiplexer
+  that never answers makes that fail. The full repaint uses `Terminal::resize`
+  instead, which also picks up a resize that happened while ssh ran.
+- **ssh is killed if Bifrost fails while it runs.** The child is owned by a guard
+  that kills and reaps it on drop, so a panic cannot leave an ssh reading a
+  terminal that the shell has taken back.
+- **Bifrost must not hold the stdout or stderr locks across a connection.**
+  `io::stderr().lock()` held by the main thread makes the reader thread's copy of
+  ssh's stderr wait forever. `main` used to lock both for the whole run; the
+  pseudo-terminal tests found this.
+- **Signals in the pseudo-terminal tests are sent by the test.** A plain pty has
+  no controlling terminal, so the kernel has no foreground group to signal for
+  Ctrl-C or a resize. The tests put bifrost in its own process group and signal
+  that group, which is what the terminal driver does. The kernel's translation of
+  the key into the signal is not under test. The terminal's real modes are
+  compared before and after every session, and each safeguard above was checked
+  by removing it and watching a test fail.
+- **Every test process that forks holds one lock while it does.** A forked child
+  that has not yet run `exec` holds any file another thread has open for writing,
+  and executing that file then fails with "text file busy". Tests that write a
+  fake ssh and tests that start processes take the same lock.
+
+### Explaining failures
+
+- **The explanation is chosen from fixed text; nothing from ssh's output is put
+  into it.** A server can print a banner before login, and it arrives on ssh's
+  stderr next to ssh's own messages. Output can change *which* message is shown,
+  never *what it says*, and the message names only the saved host.
+- **The decision rests on the last meaningful line.** ssh says why it gave up
+  last, after anything a server printed, so a forged "Permission denied" earlier
+  in the output cannot decide. `\r` counts as a line break: ssh ends its log lines
+  with `\r\n`, and a lone `\r` in a server's text could otherwise overwrite what
+  came before it.
+- **The one exception is ssh's epilogue for a failed jump host.** ssh prints
+  `Connection closed by UNKNOWN port 65535` (and sometimes `stdio forwarding
+  failed`) after the real reason when a jump host fails. Without skipping those,
+  a jump host that refuses would read as a connection that merely closed. Both
+  lines were captured from OpenSSH 9.6.
+- **A line with a control or bidirectional character is never taken for ssh's
+  own.** ssh's messages have none. Such a line is not matched, so the failure is
+  "not recognized" and the raw output is there to read.
+- **A changed host key needs ssh's own last line and its warning.** The last line
+  must be `Host key verification failed.` and the warning `REMOTE HOST
+  IDENTIFICATION HAS CHANGED!` must be before it. Without the warning it is a
+  rejection, which says to read ssh's output first. A clean forged warning cannot
+  be told from a real one, so acting on it (removing a key) checks the host as
+  well.
+- **Only a failure gets a screen.** A failure is worth reading and answering; a
+  normal logout, the remote command's own exit status, Ctrl-C and `~.` are one
+  line on the list, so that leaving a session never has to be dismissed.
+- **The raw output is kept for the last connection and shown cleaned, from the
+  failure screen or the list with `o`.** It keeps blank lines and marks the cut
+  when only the last 64 KiB were kept. An unrecognized failure quotes its last 8
+  lines on the error screen itself, so it is never a dead end.
+- **Where the matched wording comes from.** Refused, unresolvable, timed out,
+  handshake failures and both jump host failures were captured from OpenSSH 9.6
+  (a closed port, a name that does not exist, and a small fake server that hangs
+  up). Login refused and the host key messages follow OpenSSH's documented text
+  and are confirmed by the ignored tests against a real server
+  (`BIFROST_TEST_SSH_TARGET`), to be run after an OpenSSH upgrade.
+- **The pseudo-terminal tests wait for everything they assert.** A frame arrives
+  in pieces, so a screen that has the title may not have the footer yet. Two
+  early tests asserted on a half-drawn screen and failed intermittently until
+  they waited for all of it.
+
+### The changed host key
+
+- **The screen blocks, and aborting is the default.** Enter or Esc leave, `d`
+  reads ssh's output, `r` starts a removal and scrolling works. Nothing else does
+  anything, including `q`. Ctrl+C still quits, as everywhere.
+- **The action is "remove the old key", not "trust the new one".** Bifrost never
+  edits `known_hosts`. What it can do is run `ssh-keygen -R`, and after that ssh
+  itself shows the new key and asks the user to accept it, which is the ordinary
+  first-connection question. Bifrost does not accept a key on anyone's behalf.
+- **The screen shows the fingerprint that was received, not the one that was
+  saved.** Showing the saved one means reading `known_hosts`, whose lines may be
+  hashed. The user is told how to read the fingerprint on the server.
+- **What ssh says chooses nothing that is removed.** A server can print text
+  before login, and text from a jump host's ssh is not the user's. So the host ssh
+  names must be one of the hosts Bifrost asked ssh to connect through (the host and
+  each jump host, as `host` or `[host]:port`, ignoring case), and the file it names
+  must be the user's default `~/.ssh/known_hosts`. If either is missing or
+  different, no removal is offered and the screen says so. A path taken from ssh's
+  output is never given to `ssh-keygen -f`: that would let a forged line point the
+  removal at any file.
+- **The name typed is the saved host whose key it is.** For a jump host that is
+  the jump host's name, not the name of the host being connected to.
+- **ssh-keygen's exit status is not read as success.** `ssh-keygen -R` exits 0
+  when it found nothing to remove. Success is what the tool says it did (an entry
+  found, the file updated); "no entry" is reported as such; anything unexpected is
+  a failure and is never reported as a removal.
+- **The entry is checked again before it is run**, in release builds too: plain
+  host name characters only, never starting with `-`.
+
+### The command line
+
+- **`bifrost <host>` exits 2 when Bifrost itself fails.** Any other status is
+  ssh's or the remote command's. The other commands keep exit status 1 for their
+  own errors, as before: only here can 1 be mistaken for a remote status. 2 can
+  still be a remote command's status, so `--help` says so and the message on
+  stderr (`bifrost: error:`) tells them apart. clap's usage errors are 2 as well.
+- **A signal is `128 + signal`, and Ctrl-C is 130**, as a shell reports them. The
+  status of a Windows process can be any 32-bit value; it is passed through as it
+  is.
+- **The explanation comes after ssh's own messages, on stderr.** ssh's stderr is
+  copied live, so the user sees exactly what ssh said, and Bifrost adds the plain
+  explanation of a failure below it. Nothing is added for a normal logout, a
+  remote status, Ctrl-C or `~.`.
+- **For a changed key it prints the command and does not run it.** There is no
+  interactive confirmation on the command line, so removing a key stays an
+  action of the interface. The command is printed only when it passes the same
+  checks as the screen, and is quoted for the user's shell.
+- **The logic lives in the library, with everything injected**: the store, the
+  ssh lookup, the known hosts file and the copy of stderr. `main` only wires them
+  to the process. Unknown hosts are reported before ssh is looked for, so a
+  typo is a typo and not an installation problem.
+- **The command line is tested on Windows too.** It needs no terminal, so a fake
+  ssh is compiled with `rustc` (a shell script cannot be `ssh.exe`) and put where
+  Bifrost looks for it: the system OpenSSH directory under `SystemRoot` on
+  Windows, a `PATH` entry elsewhere. The real ssh is never found.
+
 ## Known limitations in 0.1.0
 
 - **Jump host keys.** Bifrost expands a jump host to `user@host:port` from its
@@ -254,6 +407,20 @@ settled: reopen one only with a clear new reason.
   cannot be shown.** Those characters are still interpreted inside double quotes,
   and showing them unquoted would be unsafe. Such values are rare (a key path
   with a `%` in it, for example).
+- **On Windows, Ctrl-C while ssh has the terminal ends Bifrost too.** The console
+  sends Ctrl-C to every process attached to it, and catching it needs `unsafe`
+  code or another dependency. The terminal itself is not left broken, because it
+  was already handed to ssh in its normal mode. Other platforms return to the
+  list.
+- **Terminal modes are restored after ssh only on Unix.** The Windows console
+  has its own modes and restoring them needs `unsafe` code.
+- **The changed-key screen offers removal only for the default `known_hosts`.**
+  A key kept in another file (a system-wide `ssh_known_hosts`, or a
+  `UserKnownHostsFile` in ssh's config) is shown, and the user removes it by
+  hand. On Windows the file is compared ignoring case and the kind of slash; that
+  comparison, and what path ssh.exe prints, have not been verified there.
+- **`bifrost <host>` cannot tell its own status 2 from a remote status 2** by the
+  status alone. The message on stderr can.
 - **Notes are edited on one line.** Line breaks and tabs are typed as `\n` and
   `\t`.
 

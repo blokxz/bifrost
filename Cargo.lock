@@ -37,6 +37,7 @@ dependencies = [
  "ratatui",
  "rustix",
  "serde",
+ "signal-hook",
  "tempfile",
  "toml",
 ]

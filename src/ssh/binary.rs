@@ -1,6 +1,6 @@
-//! Locating the `ssh` binary.
+//! Locating the `ssh` and `ssh-keygen` binaries.
 //!
-//! The binary is resolved once to an absolute path and then spawned directly
+//! A binary is resolved once to an absolute path and then spawned directly
 //! with an argument vector, never through a shell. Relative and empty `PATH`
 //! entries are ignored and so is the current directory, so a hostile `ssh`
 //! dropped next to the user's files is never picked up. On Windows the system
@@ -27,6 +27,22 @@ impl fmt::Display for SshNotFound {
 
 impl std::error::Error for SshNotFound {}
 
+/// `ssh-keygen` could not be found in a trustworthy location.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeygenNotFound;
+
+impl fmt::Display for KeygenNotFound {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(
+            "Could not find the 'ssh-keygen' program, which comes with OpenSSH. Install it: \
+             on Debian/Ubuntu run 'sudo apt install openssh-client'; on Windows enable the \
+             'OpenSSH Client' optional feature.",
+        )
+    }
+}
+
+impl std::error::Error for KeygenNotFound {}
+
 /// Resolves `ssh` for the running process.
 pub fn resolve_ssh() -> Result<PathBuf, SshNotFound> {
     let cwd = std::env::current_dir().ok();
@@ -38,6 +54,20 @@ pub fn resolve_ssh() -> Result<PathBuf, SshNotFound> {
     )
 }
 
+/// Resolves `ssh-keygen` for the running process, the way [`resolve_ssh`]
+/// resolves `ssh`.
+pub fn resolve_keygen() -> Result<PathBuf, KeygenNotFound> {
+    let cwd = std::env::current_dir().ok();
+    find_program(
+        "ssh-keygen",
+        Platform::current(),
+        &sysenv::process_env,
+        cwd.as_deref(),
+        &is_executable_file,
+    )
+    .ok_or(KeygenNotFound)
+}
+
 /// Resolves `ssh` using injected inputs. `is_executable` decides whether a
 /// candidate path is a usable program.
 pub fn find_ssh(
@@ -46,34 +76,48 @@ pub fn find_ssh(
     cwd: Option<&Path>,
     is_executable: &dyn Fn(&Path) -> bool,
 ) -> Result<PathBuf, SshNotFound> {
+    find_program("ssh", platform, env, cwd, is_executable).ok_or(SshNotFound)
+}
+
+/// Finds the OpenSSH program `name` (without `.exe`): in the system OpenSSH
+/// directory on Windows, then in the absolute, non-current-directory entries of
+/// `PATH`.
+fn find_program(
+    name: &str,
+    platform: Platform,
+    env: Env<'_>,
+    cwd: Option<&Path>,
+    is_executable: &dyn Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    let program = if platform == Platform::Windows {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
+    };
+
     if platform == Platform::Windows
         && let Some(root) = sysenv::non_empty(env, "SystemRoot")
     {
         let system = PathBuf::from(root)
             .join("System32")
             .join("OpenSSH")
-            .join("ssh.exe");
+            .join(&program);
         if system.is_absolute() && is_executable(&system) {
-            return Ok(system);
+            return Some(system);
         }
     }
 
-    let program = if platform == Platform::Windows {
-        "ssh.exe"
-    } else {
-        "ssh"
-    };
-    let path_var = sysenv::non_empty(env, "PATH").ok_or(SshNotFound)?;
+    let path_var = sysenv::non_empty(env, "PATH")?;
     for dir in std::env::split_paths(&path_var) {
         if !dir.is_absolute() || cwd.is_some_and(|cwd| same_dir(&dir, cwd)) {
             continue;
         }
-        let candidate = dir.join(program);
+        let candidate = dir.join(&program);
         if is_executable(&candidate) {
-            return Ok(candidate);
+            return Some(candidate);
         }
     }
-    Err(SshNotFound)
+    None
 }
 
 fn same_dir(a: &Path, b: &Path) -> bool {
@@ -208,6 +252,40 @@ mod tests {
         assert_eq!(
             find_ssh(Platform::Windows, &env, None, &exists).unwrap(),
             other
+        );
+    }
+
+    #[test]
+    fn ssh_keygen_is_found_the_same_way_and_never_in_the_current_directory() {
+        let cwd = abs("home/rein/project");
+        let env = fake_env(&[("PATH", path_var(&[cwd.clone(), abs("usr/bin")]))]);
+        let name = if cfg!(windows) {
+            "ssh-keygen.exe"
+        } else {
+            "ssh-keygen"
+        };
+        let exists = existing(&[cwd.join(name), abs("usr/bin").join(name)]);
+        assert_eq!(
+            find_program("ssh-keygen", platform(), &env, Some(&cwd), &exists),
+            Some(abs("usr/bin").join(name))
+        );
+        let only_here = existing(&[cwd.join(name)]);
+        assert_eq!(
+            find_program("ssh-keygen", platform(), &env, Some(&cwd), &only_here),
+            None
+        );
+        assert!(KeygenNotFound.to_string().contains("ssh-keygen"));
+        assert!(KeygenNotFound.to_string().contains("Install"));
+    }
+
+    #[test]
+    fn windows_finds_ssh_keygen_next_to_the_system_ssh() {
+        let keygen = abs("Windows/System32/OpenSSH/ssh-keygen.exe");
+        let env = fake_env(&[("SystemRoot", abs("Windows").into_os_string())]);
+        let exists = existing(std::slice::from_ref(&keygen));
+        assert_eq!(
+            find_program("ssh-keygen", Platform::Windows, &env, None, &exists),
+            Some(keygen)
         );
     }
 

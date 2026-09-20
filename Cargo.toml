@@ -37,13 +37,28 @@ toml = { version = "1", default-features = false, features = [
     "serde",
 ] }
 
+[target.'cfg(unix)'.dependencies]
+# Keeps Bifrost alive when Ctrl-C reaches ssh's process group while ssh has the
+# terminal (a password prompt, a hanging connection). The handler it installs
+# is reset to the default on exec, so ssh itself still dies on Ctrl-C, which a
+# plain "ignore SIGINT" would not allow. Already in the tree through crossterm,
+# so it adds no crate. Registering a handler needs no `unsafe` on our side.
+signal-hook = { version = "0.3", default-features = false }
+# Saves the terminal's modes before ssh runs and puts them back afterwards, so an
+# ssh that dies in raw mode (SIGKILL, out of memory) cannot leave the terminal
+# raw. crossterm re-captures "the original modes" on every enable_raw_mode and
+# would otherwise restore the wrong ones at exit. Already in the tree through
+# crossterm, so it adds no crate.
+rustix = { version = "1", default-features = false, features = ["std", "termios"] }
+
 [dev-dependencies]
 # Temporary directories (removed on drop) so tests never touch the real config dir.
 tempfile = "3"
 
 [target.'cfg(unix)'.dev-dependencies]
-# Opens a pseudo-terminal so tests/pty.rs can run the real binary in a real
-# terminal. Safe wrappers only, so the test code needs no `unsafe`. It is already
-# in the tree through crossterm (this only enables its `fs`, `pty` and `termios`
-# features), and Windows never builds it: those tests are Unix-only.
-rustix = { version = "1", features = ["fs", "pty", "termios"] }
+# Opens a pseudo-terminal so the tests/pty*.rs files can run the real binary in
+# a real terminal, and sends it signals. Safe wrappers only, so the test code
+# needs no `unsafe`. It is already in the tree through crossterm (this only
+# enables its `fs`, `process`, `pty` and `termios` features), and Windows never
+# builds it: those tests are Unix-only.
+rustix = { version = "1", features = ["fs", "process", "pty", "termios"] }

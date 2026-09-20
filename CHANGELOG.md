@@ -10,8 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Command line** (Block 1)
-  - `bifrost` opens the TUI, `bifrost <host>` connects directly (not implemented
-    yet) and `bifrost list` prints the saved hosts.
+  - `bifrost` opens the TUI, `bifrost <host>` connects directly and `bifrost list`
+    prints the saved hosts.
   - Host arguments that look like ssh options (for example `-oProxyCommand=...`)
     are rejected.
   - CI on Linux and Windows: formatting, clippy with warnings denied, and tests.
@@ -94,8 +94,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The arguments to spawn ssh with are built separately from the quoted text a
     person pastes, and the two cannot be confused (see Security).
 
+- **Connecting** (Block 5)
+  - Enter on a host runs `ssh` for it, with the jump chain if it has one, and
+    returns to the list afterwards. The terminal is handed over completely:
+    ssh runs on the normal screen, Bifrost draws nothing and reads no input while
+    it does, and everything ssh prints stays in the scrollback. The result is
+    shown on the list ("Disconnected from 'web'.", "The connection to 'web' was
+    cancelled.").
+  - The terminal comes back correctly on every way ssh can end: a clean exit, a
+    failed remote command, a connection failure, Ctrl-C, being killed while in
+    raw mode, and a resize during the session.
+  - Ctrl-C while ssh has the terminal (a password prompt, a hanging connection)
+    ends ssh and returns to the list instead of quitting Bifrost. A SIGINT sent to
+    Bifrost itself quits it cleanly, like Ctrl+C in the interface.
+  - A status that is not 255 is the remote session's own exit status, not a
+    connection error.
+  - Everything ssh writes to stderr is still shown live, and its last 64 KiB are
+    kept.
+  - A failed connection gets a screen of its own that says what happened in plain
+    English and what to try next: login refused (permission denied), the
+    server's identity changed or was not accepted, connection refused, timed out,
+    host name not found, network unreachable, closed by the server, and a broken
+    connection. A failure Bifrost does not recognize gets a generic message and
+    quotes the end of ssh's own output. Failures through a jump host are
+    explained by the jump host's own error.
+  - `o` shows everything ssh printed during the last connection, cleaned of
+    control characters, from the failure screen or from the list. Enter or Esc
+    leave the failure screen.
+  - What is not a failure is one line on the list: a normal logout, the remote
+    command's exit status, Ctrl-C, closing with `~.`.
+  - When a server's key is not the one saved, a blocking screen says so: this
+    may be a reinstalled server or someone intercepting the connection, with the
+    fingerprint of the key received, where the old key is kept and how to check
+    the fingerprint on the server. Enter or Esc abort, which is the default, and
+    almost no other key does anything.
+  - From that screen `r` removes the old key, after the host's name is typed
+    exactly. Bifrost never edits `known_hosts` itself: it runs `ssh-keygen -R`,
+    which keeps the previous file as `known_hosts.old`. The next connection then
+    shows the new key for the user to accept. If the changed key is a jump host's,
+    the name to type is the jump host's.
+  - Removal is offered only when ssh's message can be tied to a host Bifrost
+    connected through and to the default `known_hosts`. Otherwise the screen says
+    Bifrost will not remove a key there.
+- **Command line** (Block 5)
+  - `bifrost <host>` connects without opening the interface and exits with ssh's
+    status, or the remote command's, unchanged. A process ended by a signal is
+    `128 + signal`, and Ctrl-C is 130. A connection failure is explained on stderr
+    after ssh's own messages, and for a changed key the command to remove the old
+    key is printed, never run.
+  - When Bifrost itself cannot connect (the host is not saved, the saved hosts
+    cannot be read, ssh is not installed) it exits with 2, and says so on stderr
+    with `bifrost: error:`. An unknown host lists the closest saved names. This
+    is documented at the end of `--help`.
+  - `ssh` and `ssh-keygen` are resolved to absolute paths, when the interface
+    opens or when connecting. When ssh is missing, the list still works and
+    connecting explains what to install.
+
 ### Security
 
+- Removing a host key is an explicit action confirmed by typing the host's name,
+  runs `ssh-keygen -R` with an argument vector and no shell, and only for a name
+  that Bifrost itself asked ssh to connect through and only in the default
+  `known_hosts`. What ssh prints (a host name, a file) can decide which message is
+  shown but never what is removed or from where: a path taken from ssh's output
+  is never passed to `ssh-keygen`. The entry is checked again before it is run.
+- ssh's output is treated as untrusted. A server can print text before login, on
+  the same stream as ssh's own messages, so only exit status 255 is explained as a
+  connection failure, the decision rests on the last line ssh printed, and a
+  line with control or bidirectional characters is never taken for ssh's own.
+  The explanations are fixed text that names only the saved host, so nothing from
+  ssh's output can reach them.
+- While ssh runs, Ctrl-C reaching Bifrost is caught rather than fatal, but ssh
+  keeps its default behavior for it. Terminal modes are saved before ssh runs and
+  restored after it, so an ssh that is killed in raw mode cannot leave the shell
+  raw. Input typed during a connection that ssh did not read is discarded, so it
+  cannot run as commands afterwards. ssh is killed if Bifrost fails while it
+  runs.
 - Bifrost stores no secrets: only paths to key files, never passwords,
   passphrases or key material.
 - Files and directories are user-only (0600 and 0700) on Unix.
