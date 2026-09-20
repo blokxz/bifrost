@@ -5,7 +5,7 @@ These files are the source of truth for how each Bifrost screen looks. Each one 
 | File | Screen |
 |------|--------|
 | `01-main.txt` | Full view (start view `"full"`) |
-| `02-launcher.txt` | Quick launcher (start view `"launcher"`, `bifrost --launcher`) |
+| `02-launcher.txt` | Launcher: the existing host list screen (start view `"launcher"`, `bifrost --launcher`) |
 | `03-new-host.txt` | New host wizard, step 2 |
 | `04-keys.txt` | Keys tab with health checks |
 | `05-host-key-changed.txt` | Host key changed dialog (modal over the full view) |
@@ -20,9 +20,25 @@ The design rationale is in `../ui-design.md`.
 - Only the 120×36 size is specified. Larger terminals: the right-hand panels grow and the lists get more rows. Smaller than 80×24: show a "terminal too small" message instead of a broken layout.
 - Selection highlight and colors cannot be shown in plain text. The `›` marker is where the selected row is; the notes say how it is styled.
 
-## Palette (src/ui/theme.rs)
+## Palette (src/tui/theme.rs)
 
-All colors come from the theme module. Never hardcode a color in a widget.
+Decided 2026-09-20: this palette replaces the ANSI-only theme (see `docs/DECISIONS.md`, Terminal interface).
+All colors come from `src/tui/theme.rs`. Never hardcode a color in a widget. `src/tui/ui/theme.rs` was a draft of this palette; merge it into `src/tui/theme.rs` and delete it.
+
+The existing theme roles map to the palette like this:
+
+| Role in `Theme` | Style |
+|-----------------|-------|
+| `title` | `accent`, bold |
+| `error` | `red`, bold |
+| `warning` | `amber`, bold |
+| `key` | `accent`, bold |
+| `muted` | `muted` |
+| `selected` | `selection` background, `bright` text (the `>` marker stays) |
+| `highlight` | `accent`, bold, underlined |
+| `favorite` | `amber`, bold |
+| tags (new) | `violet` |
+| borders (new) | `border`; `accent` on the focused panel |
 
 | Token | Hex | Use |
 |-------|-----|-----|
@@ -41,7 +57,7 @@ All colors come from the theme module. Never hardcode a color in a widget.
 | `red` | `#ff7a93` | Errors, danger, security alerts |
 | `green` | `#8bd67a` | OK states, success |
 
-Use `Color::Rgb` when the terminal supports truecolor (`COLORTERM=truecolor|24bit`). Otherwise fall back to the nearest ANSI 16 colors (accent → Cyan, violet → Magenta, amber → Yellow, red → LightRed, green → Green, muted → DarkGray).
+Use `Color::Rgb` when the terminal supports truecolor (`COLORTERM=truecolor|24bit`). Windows Terminal (`WT_SESSION` set) also counts as truecolor. Otherwise fall back to the nearest ANSI 16 colors (accent → Cyan, violet → Magenta, amber → Yellow, red → LightRed, green → Green, muted → DarkGray). With `NO_COLOR` set, keep the current plain theme (bold, dim, reverse video).
 
 ## Glyphs
 
