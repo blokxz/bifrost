@@ -173,7 +173,15 @@ exit 255"#,
 #[test]
 fn ctrl_c_at_a_prompt_ends_ssh_but_not_bifrost() {
     // A terminal in its normal mode: Ctrl-C is a signal to the whole group.
-    let fake = FakeSsh::new("echo FAKE-READY\nsleep 20");
+    //
+    // The fake waits for a line from the terminal, as ssh does at a password
+    // prompt, and does nothing else after it says it is ready. It must not start
+    // another program instead (`sleep`): while a shell forks one it has signals
+    // blocked, and a Ctrl-C that lands then is absorbed by the half-made child
+    // and never reaches the program that runs. The test sends Ctrl-C as soon as
+    // it sees the ready line, so on a busy machine, where a fork takes long, it
+    // hit that window about one time in thirty and the connection never ended.
+    let fake = FakeSsh::new("echo FAKE-READY\nread line");
     let (_dir, mut session) = start(&fake);
     connect(&mut session);
 
@@ -259,10 +267,13 @@ exit 0"#,
 #[test]
 fn a_resize_during_a_session_is_seen_by_ssh_and_bifrost_repaints_at_the_new_size() {
     let fake = FakeSsh::new(
+        // The background process is started, and `pid` set, before the ready
+        // line: after it the fake only waits, so a resize can arrive at any
+        // point without meeting a fork or an unset `pid`.
         r#"trap 'echo "RESIZED:$(stty size)"; kill $pid 2>/dev/null; exit 0' WINCH
-echo "FAKE-READY:$(stty size)"
 sleep 20 &
 pid=$!
+echo "FAKE-READY:$(stty size)"
 wait $pid"#,
     );
     let (_dir, mut session) = start(&fake);

@@ -227,6 +227,8 @@ pub fn write_script(path: &Path, content: &str, mode: u32) {
 
 /// A running `bifrost` with a pseudo-terminal as its stdin, stdout and stderr.
 pub struct Session {
+    /// What the last signal sent to the group did, for a failure message.
+    pub signal_note: std::cell::RefCell<String>,
     /// The terminal's modes as the shell would have left them.
     initial_modes: Modes,
     pub child: Child,
@@ -292,6 +294,7 @@ impl Session {
         });
 
         Session {
+            signal_note: std::cell::RefCell::new(String::new()),
             initial_modes,
             child,
             master: File::from(master),
@@ -337,14 +340,18 @@ impl Session {
 
     fn signal_foreground_group(&self, signal: Signal) {
         let group = Pid::from_raw(self.child.id().try_into().unwrap()).expect("a valid pid");
-        // The group may already be gone if the test is racing its own end; the
-        // assertions that follow are what decide the test.
-        let _ = kill_process_group(group, signal);
+        let before = self.describe_processes();
+        let result = kill_process_group(group, signal);
+        let after = self.describe_processes();
+        *self.signal_note.borrow_mut() = format!(
+            "sent {signal:?} to group {group:?}: {result:?}\nbefore:\n{before}\nafter:\n{after}"
+        );
     }
 
     /// Reads output until `ready` is true of the screen, or fails the test.
     pub fn wait_until(&mut self, what: &str, ready: impl Fn(&Screen) -> bool) {
-        let deadline = Instant::now() + PATIENCE;
+        let started = Instant::now();
+        let deadline = started + PATIENCE;
         loop {
             let screen = self.screen();
             if ready(&screen) {
@@ -353,15 +360,35 @@ impl Session {
             let left = deadline.saturating_duration_since(Instant::now());
             match self.chunks.recv_timeout(left) {
                 Ok(chunk) => self.output.extend(chunk),
-                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => panic!(
-                    "gave up waiting for {what}. The screen was:\n{}\n(alt screen: {}, cursor \
-                     visible: {}). Normal-screen text: {:?}. Last raw output: {:?}",
-                    screen.text(),
-                    screen.alt_screen,
-                    screen.cursor_visible,
-                    screen.normal_text,
-                    String::from_utf8_lossy(&self.output[self.output.len().saturating_sub(600)..])
-                ),
+                Err(reason) => {
+                    // "Nothing more will come" has two very different causes, and
+                    // a failure has to say which: bifrost still running but not
+                    // doing what was expected, or bifrost gone.
+                    let ended = match self.child.try_wait() {
+                        Ok(Some(status)) => format!("bifrost had exited ({status:?})"),
+                        Ok(None) => "bifrost was still running".to_string(),
+                        Err(err) => format!("bifrost's state is unknown ({err})"),
+                    };
+                    let cause = match reason {
+                        RecvTimeoutError::Timeout => "timed out",
+                        RecvTimeoutError::Disconnected => "the terminal closed",
+                    };
+                    panic!(
+                        "gave up waiting for {what} after {:?}: {cause}, and {ended}. The \
+                         processes in bifrost's group:\n{}\nThe last signal: {}\nThe screen was:\n{}\n(alt screen: \
+                         {}, cursor visible: {}). Normal-screen text: {:?}. Last raw output: {:?}",
+                        started.elapsed(),
+                        self.describe_processes(),
+                        self.signal_note.borrow(),
+                        screen.text(),
+                        screen.alt_screen,
+                        screen.cursor_visible,
+                        screen.normal_text,
+                        String::from_utf8_lossy(
+                            &self.output[self.output.len().saturating_sub(600)..]
+                        )
+                    );
+                }
             }
         }
     }
@@ -390,6 +417,55 @@ impl Session {
         }
         let output = std::mem::take(&mut self.output);
         (status, output)
+    }
+
+    /// What bifrost and everything in its process group are doing, read from
+    /// `/proc` (Linux only). For a failure message: "still running" says little
+    /// without knowing what it is waiting for and how it treats signals.
+    pub fn describe_processes(&self) -> String {
+        let group = self.child.id();
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return "(no /proc on this system)".to_string();
+        };
+        let mut lines = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(pid) = name.to_str().and_then(|n| n.parse::<u32>().ok()) else {
+                continue;
+            };
+            let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+                continue;
+            };
+            // Fields after the parenthesised name: state, ppid, pgrp, ...
+            let Some((before, after)) = stat.rsplit_once(") ") else {
+                continue;
+            };
+            let fields: Vec<&str> = after.split(' ').collect();
+            let (state, ppid, pgrp) = (fields[0], fields[1], fields[2]);
+            if pgrp.parse::<u32>().ok() != Some(group) {
+                continue;
+            }
+            let command = before.split_once('(').map_or("?", |(_, c)| c);
+            let status = std::fs::read_to_string(entry.path().join("status")).unwrap_or_default();
+            let field = |key: &str| {
+                status
+                    .lines()
+                    .find_map(|l| l.strip_prefix(key))
+                    .map(|v| v.trim().to_string())
+                    .unwrap_or_default()
+            };
+            let wchan = std::fs::read_to_string(entry.path().join("wchan")).unwrap_or_default();
+            lines.push(format!(
+                "pid {pid} ({command}) state {state} ppid {ppid} wchan {wchan:?} \
+                 SigBlk {} SigIgn {} SigCgt {} SigPnd {} ShdPnd {}",
+                field("SigBlk:"),
+                field("SigIgn:"),
+                field("SigCgt:"),
+                field("SigPnd:"),
+                field("ShdPnd:"),
+            ));
+        }
+        lines.join("\n")
     }
 
     /// Whether bifrost is still running.
@@ -482,6 +558,13 @@ pub struct FakeSsh {
 impl FakeSsh {
     /// `body` is shell code that runs after the arguments are recorded. `$GO`
     /// is the path of a file the test can create to release the script.
+    ///
+    /// **A fake that a test sends a signal to must print its ready line from the
+    /// process that will receive the signal, and start nothing after it.** A
+    /// shell blocks signals while it forks, and the half-made child absorbs one
+    /// that lands then, so "ready, then `sleep`" is ready too early: the signal
+    /// can be lost on a busy machine. Wait in a builtin (`read`, or `wait` with
+    /// a `trap` set before the ready line) instead.
     pub fn new(body: &str) -> FakeSsh {
         let fake = FakeSsh::absent();
         let script = format!(

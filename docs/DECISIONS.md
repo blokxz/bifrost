@@ -333,6 +333,17 @@ settled: reopen one only with a clear new reason.
   up). Login refused and the host key messages follow OpenSSH's documented text
   and are confirmed by the ignored tests against a real server
   (`BIFROST_TEST_SSH_TARGET`), to be run after an OpenSSH upgrade.
+- **A fake that says "ready" must be ready for what the test does next.** The
+  Ctrl-C test printed its ready line and then started `sleep`, and sent Ctrl-C the
+  moment it saw the line. A shell blocks signals while it forks, and the
+  half-made child absorbs one that lands then, so on a busy machine (a fork takes
+  long) about one run in thirty ended with a connection nothing had interrupted:
+  bifrost waiting, correctly, for an ssh that was still running. It showed up in
+  CI and not locally, and reproduced at about 1 to 3 % with the test run 32 at a
+  time. The fake now waits for a line from the terminal, as ssh does at a
+  password prompt, with nothing left to fork. When a test fails by timing out,
+  the harness now says whether bifrost was still running, and lists the group's
+  processes with their signal masks and what they wait on.
 - **The pseudo-terminal tests wait for everything they assert.** A frame arrives
   in pieces, so a screen that has the title may not have the footer yet. Two
   early tests asserted on a half-drawn screen and failed intermittently until
