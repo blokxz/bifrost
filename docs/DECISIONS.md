@@ -668,8 +668,10 @@ stays refused (see above).
   on disk (the identity file list, "the host already has it", the hosts listed
   before a key is deleted) goes through `names_this_key`, which compares the parts
   of the paths and never their text. `~` means the home only for a folder that is a
-  `.ssh`. The rules of Windows are a parameter of the comparison, so Linux runs
-  the same tests on Windows-style paths.
+  `.ssh`. The comparison works on text, never on `std::path`, whose separators
+  are those of the system running it: the rules of Windows and the rules of the
+  others are a parameter, and each set is tested the same on every system. Only
+  the production call picks one, with `cfg!(windows)`.
 - **The stored value is `~/.ssh/<name>`.** It is what people write, it keeps the
   hosts file readable and movable, and ssh expands the `~` itself for `-i` and
   `IdentityFile`. A key found in some other folder would be stored in full. A host
