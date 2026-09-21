@@ -223,10 +223,8 @@ the Windows VM, with the real `ssh.exe` (OpenSSH Client installed):
     double quotes are the risk: if the server answers that the command failed,
     note exactly what it printed.
 12. **The ssh config screen.** `s`, `i`, `e`. Look for: does `ssh -G` work for the
-    hosts in `%USERPROFILE%\.ssh\config`? Does the exported file work when
-    `Include ~/.ssh/bifrost_config` is added at the top of that config, or does
-    OpenSSH for Windows want the full path? Does the screen's include check see
-    it? Note what ssh printed if it does not.
+    hosts in `%USERPROFILE%\.ssh\config`? The Include line has its own step
+    (15). Note what ssh printed if it does not.
 13. **Deleting a key.** `K`, select a key, `D`, type the name. Look for: both
     files are gone, also when the `.pub` is read-only (Explorer shows the attribute),
     and a key whose file is a symbolic link (needs privileges or developer mode) is
@@ -234,3 +232,43 @@ the Windows VM, with the real `ssh.exe` (OpenSSH Client installed):
 14. **Choosing the identity file.** Does the list show the keys of
     `%USERPROFILE%\.ssh` with their types, and does `bifrost <host>` accept the
     stored `~/.ssh/<name>` for `-i`? Note what ssh printed if not.
+15. **The Include line, with the real `ssh.exe`.** Bifrost tells the user to add
+    `Include ~/.ssh/bifrost_config` on every platform, and that has to be read by
+    OpenSSH for Windows. Export a host that has a jump host and a key file (`e`, `y`),
+    then, with the line as the first line of `%USERPROFILE%\.ssh\config`:
+    - `ssh -G <exported host>` prints that host's `hostname`, `user`, `port` and
+      `identityfile`, plus `identitiesonly yes`. Without the line it prints the
+      alias as the `hostname`. Look for: the difference.
+    - The screen after the export says the config "already includes it". Move the
+      line below a `Host` line: the screen says it has to move to the top, and
+      `ssh -G` of a host that is not in that `Host` block stops seeing the export.
+      Does the screen agree with ssh in both cases?
+    - Do it again with a profile folder that has a space in its name (a local
+      account called `John Smith`): the same line has to work there too.
+    - If `~` is not read, try `Include bifrost_config` (relative to `~/.ssh`) and
+      then `Include "C:/Users/<you>/.ssh/bifrost_config"`, and note which of them
+      work. Do not change the line in Bifrost before reporting it: the decision to
+      use `~` everywhere is in `DECISIONS.md`.
+16. **A key file typed by hand, outside `.ssh`, through the export.** The list only
+    stores `~/.ssh/<name>`; a path typed under "Another file" is stored as typed,
+    and the export writes it quoted with `\` doubled. Make a key in a folder that
+    is not `.ssh` (`ssh-keygen -t ed25519 -f C:\keys\id`, and again in
+    `C:\my keys\id`), add it to a host that can log in with it, and for each
+    of `C:\keys\id`, `C:/keys/id` and `C:\my keys\id`:
+    - Save the host with that path (the form accepts it; the identity file
+      warning does not appear, since the file exists), then export (`e`, `y`) and
+      open `%USERPROFILE%\.ssh\bifrost_config`. Look for: the `IdentityFile` line
+      is quoted and its backslashes are doubled (`"C:\\keys\\id"`).
+    - With the Include line in place (step 15), `ssh -G <host>`: does
+      `identityfile` print the path as you typed it, with single backslashes, or
+      with the doubled ones? Doubled ones mean ssh.exe does not unescape, and the
+      export cannot be used for keys outside `.ssh` on Windows: note exactly what
+      it printed.
+    - `ssh <host>` and `bifrost <host>` both log in with that key. The second
+      passes the path as one argument to `-i` without quoting, so it should work
+      even if the first does not.
+    - The other direction, for a key that is in `~/.ssh`: type its full path
+      (`C:\Users\<you>\.ssh\id`, then again with `/`, then in another case) as a
+      host's identity file, save, and edit the host again. Look for: the list opens
+      on that key's entry, and after sending that key to the host Bifrost does not
+      ask whether to use it, because the host already does.

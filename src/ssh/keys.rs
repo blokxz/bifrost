@@ -150,13 +150,22 @@ pub fn is_plain_file_name(name: &str) -> bool {
         && !name.chars().any(|c| c.is_control())
 }
 
+/// The home directory that a `~` stands for, when `ssh_dir` is the `.ssh` of one.
+/// Any other folder says nothing about where `~` is.
+fn home_of(ssh_dir: &Path) -> Option<&Path> {
+    if ssh_dir.file_name().is_some_and(|name| name == ".ssh") {
+        ssh_dir.parent()
+    } else {
+        None
+    }
+}
+
 /// What is stored as a host's identity file for the key `file_name` of
 /// `ssh_dir`: `~/.ssh/name` when the directory is a `.ssh`, as everyone writes it,
-/// and the full path when it is anywhere else. ssh expands the `~` itself.
+/// and the full path when it is anywhere else. ssh expands the `~` itself, on
+/// every system, which is also why it is always written with `/`.
 pub fn identity_file_value(ssh_dir: &Path, file_name: &str) -> String {
-    let is_dot_ssh =
-        ssh_dir.file_name().is_some_and(|name| name == ".ssh") && ssh_dir.parent().is_some();
-    if is_dot_ssh {
+    if home_of(ssh_dir).is_some() {
         format!("~/.ssh/{file_name}")
     } else {
         ssh_dir.join(file_name).display().to_string()
@@ -165,44 +174,69 @@ pub fn identity_file_value(ssh_dir: &Path, file_name: &str) -> String {
 
 /// Whether `identity_file`, as saved on a host, is the key `file_name` of
 /// `ssh_dir`: the same file whether it is spelled with `~`, with the full path or
-/// with `.` and `..` in it. Decided from the words, without looking at the disk, so
-/// a link is not followed and a file that is not there yet still matches.
+/// with `.` and `..` in it (and, on Windows, with `/` or `\`, in any case).
+/// Decided from the words, without looking at the disk, so a link is not followed
+/// and a file that is not there yet still matches.
+///
+/// This is the one way a saved key path is compared with a key on disk. Comparing
+/// the text of two paths does not work: the same file is written with different
+/// separators on Windows.
 pub fn names_this_key(identity_file: &str, ssh_dir: &Path, file_name: &str) -> bool {
-    let Some(path) = expand_tilde(identity_file.trim(), ssh_dir.parent()) else {
+    if ssh_dir.as_os_str().is_empty() {
         return false;
-    };
-    same_path(&path, &ssh_dir.join(file_name))
+    }
+    names_key(
+        identity_file,
+        home_of(ssh_dir),
+        &ssh_dir.join(file_name),
+        cfg!(windows),
+    )
 }
 
-/// `path` written out with `.` dropped and `..` applied, as text that two
-/// spellings of one path agree on: with `/` between the parts and, on Windows,
-/// in lower case.
-fn same_path(a: &Path, b: &Path) -> bool {
-    fn normal(path: &Path) -> String {
-        use std::path::Component;
-        let mut parts: Vec<String> = Vec::new();
-        for component in path.components() {
-            match component {
-                Component::CurDir => {}
-                Component::ParentDir => {
-                    if parts
-                        .last()
-                        .is_some_and(|last| last != "/" && !last.ends_with(':'))
-                    {
-                        parts.pop();
-                    }
+/// [`names_this_key`] with the home and the system given, so that the rules of
+/// Windows are tested on every system.
+fn names_key(identity_file: &str, home: Option<&Path>, key: &Path, windows: bool) -> bool {
+    let Some(path) = expand_tilde(identity_file.trim(), home) else {
+        return false;
+    };
+    path_parts(&path, windows) == path_parts(key, windows)
+}
+
+/// The parts of `path` with `.` dropped and `..` applied, so that two spellings of
+/// one path have the same parts. The first part is `/` for a path that starts at
+/// a root. With `windows`, both `/` and `\` separate, a drive (`C:`) is kept as the
+/// start, and case does not matter.
+///
+/// It works on the text and not on [`Path::components`] because what counts as a
+/// separator depends on the system that runs it, and the rules of Windows have to be
+/// testable elsewhere.
+fn path_parts(path: &Path, windows: bool) -> Vec<String> {
+    let text = path.to_string_lossy();
+    let text = if windows {
+        text.replace('\\', "/")
+    } else {
+        text.into_owned()
+    };
+    let mut parts: Vec<String> = Vec::new();
+    for (at, part) in text.split('/').enumerate() {
+        match part {
+            "" if at == 0 => parts.push("/".to_string()),
+            "" | "." => {}
+            ".." => match parts.last() {
+                // Nothing to go up from, in a path that is not anchored.
+                None => parts.push("..".to_string()),
+                Some(last) if last == ".." => parts.push("..".to_string()),
+                // The root and a drive have no parent: `..` stays where it is.
+                Some(last) if last == "/" || (windows && last.ends_with(':')) => {}
+                Some(_) => {
+                    parts.pop();
                 }
-                other => parts.push(other.as_os_str().to_string_lossy().into_owned()),
-            }
-        }
-        let text = parts.join("/").replace("//", "/");
-        if cfg!(windows) {
-            text.to_lowercase()
-        } else {
-            text
+            },
+            other if windows => parts.push(other.to_lowercase()),
+            other => parts.push(other.to_string()),
         }
     }
-    normal(a) == normal(b)
+    parts
 }
 
 /// Sets the private key `name` in `ssh_dir` to 0600, so that only its owner can
@@ -1605,6 +1639,84 @@ mod tests {
             }
             assert!(!same, "{spelled:?}");
         }
+    }
+
+    #[test]
+    fn the_windows_way_of_writing_a_path_is_recognized_on_every_system() {
+        let home = Path::new(r"C:\Users\dev");
+        let key = Path::new(r"C:\Users\dev\.ssh").join("id_ed25519");
+        for spelled in [
+            "~/.ssh/id_ed25519",
+            r"~\.ssh\id_ed25519",
+            r"C:\Users\dev\.ssh\id_ed25519",
+            "C:/Users/dev/.ssh/id_ed25519",
+            r"C:\Users\dev/.ssh\id_ed25519",
+            r"c:\users\DEV\.SSH\ID_ED25519",
+            r"C:\Users\dev\.ssh\.\id_ed25519",
+            r"C:\Users\dev\.ssh\..\.ssh\id_ed25519",
+            r"C:\Users\dev\.ssh\\id_ed25519",
+            r"  ~\.ssh\id_ed25519  ",
+        ] {
+            assert!(names_key(spelled, Some(home), &key, true), "{spelled:?}");
+        }
+        for spelled in [
+            "",
+            r"D:\Users\dev\.ssh\id_ed25519",
+            r"\Users\dev\.ssh\id_ed25519",
+            r"C:\Users\other\.ssh\id_ed25519",
+            r"C:\Users\dev\.ssh\sub\id_ed25519",
+            r"C:\Users\dev\.ssh\id_ed25519.pub",
+            r"~\.ssh\id_ed25519_2",
+            r"C:\..\Users\dev\.ssh\id_ed25519_2",
+            "id_ed25519",
+        ] {
+            assert!(!names_key(spelled, Some(home), &key, true), "{spelled:?}");
+        }
+        // `..` cannot climb out of a drive.
+        assert!(names_key(
+            r"C:\..\..\Users\dev\.ssh\id_ed25519",
+            Some(home),
+            &key,
+            true
+        ));
+    }
+
+    #[test]
+    fn on_other_systems_a_backslash_is_part_of_a_name_and_case_matters() {
+        let home = Path::new("/home/dev");
+        let key = Path::new("/home/dev/.ssh").join("id_ed25519");
+        assert!(names_key(
+            "/home/dev/.ssh/id_ed25519",
+            Some(home),
+            &key,
+            false
+        ));
+        for spelled in [
+            r"~\.ssh\id_ed25519",
+            r"/home/dev/.ssh\id_ed25519",
+            "/home/dev/.ssh/ID_ED25519",
+            "/HOME/dev/.ssh/id_ed25519",
+        ] {
+            assert!(!names_key(spelled, Some(home), &key, false), "{spelled:?}");
+        }
+    }
+
+    #[test]
+    fn a_relative_path_is_never_a_key_of_an_absolute_folder() {
+        let home = Path::new("/home/dev");
+        let key = Path::new("/home/dev/.ssh").join("k");
+        for spelled in ["k", ".ssh/k", "../k", "../.ssh/k", "./.ssh/k"] {
+            assert!(!names_key(spelled, Some(home), &key, false), "{spelled:?}");
+        }
+    }
+
+    #[test]
+    fn a_tilde_only_means_the_home_when_the_folder_is_a_dot_ssh() {
+        // `/srv/keys` says nothing about where `~` is: `~/keys/k` is not its `k`.
+        assert!(!names_this_key("~/keys/k", Path::new("/srv/keys"), "k"));
+        assert!(names_this_key("/srv/keys/k", Path::new("/srv/keys"), "k"));
+        // No folder, no key: a bare file name is not one.
+        assert!(!names_this_key("k", Path::new(""), "k"));
     }
 
     #[test]

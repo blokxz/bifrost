@@ -2356,7 +2356,6 @@ impl App {
             .map(|entry| KeyChoice {
                 name: entry.name.clone(),
                 value: identity_file_value(&snapshot.dir, &entry.name),
-                full_path: snapshot.dir.join(&entry.name).display().to_string(),
                 kind: entry.fingerprint.as_ref().ok().map(Fingerprint::type_label),
             })
             .collect();
@@ -2383,7 +2382,11 @@ impl App {
             None
         };
         if let Some(form) = self.form.as_mut() {
-            form.open_key_picker(KeyList { choices, note });
+            form.open_key_picker(KeyList {
+                dir: snapshot.dir.clone(),
+                choices,
+                note,
+            });
         }
     }
 

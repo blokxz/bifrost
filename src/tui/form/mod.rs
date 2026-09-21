@@ -16,12 +16,14 @@
 //! - Saving is blocked while any field is invalid.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::input::TextInput;
 use crate::domain::validate::Field;
 use crate::domain::{Host, Hosts};
+use crate::ssh::keys::names_this_key;
 
 pub mod fields;
 
@@ -69,9 +71,6 @@ pub struct KeyChoice {
     pub name: String,
     /// What is stored as the identity file (`~/.ssh/name`).
     pub value: String,
-    /// The same file spelled in full, so that a host that has it written that way
-    /// is shown as having this key.
-    pub full_path: String,
     /// The type as a person reads it (`ed25519`, `rsa 3072`), when `ssh-keygen`
     /// could tell.
     pub kind: Option<String>,
@@ -80,6 +79,10 @@ pub struct KeyChoice {
 /// The keys the identity file can be chosen from.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct KeyList {
+    /// The folder the keys are in. A host that has one of them written in another
+    /// way (in full, with `.` in it, with the other slash on Windows) is shown as
+    /// having that key, and that is decided against this folder.
+    pub dir: PathBuf,
     pub choices: Vec<KeyChoice>,
     /// What to tell the user when the list is not what they would expect: no keys,
     /// or a folder that could not be read. Raw: sanitize before showing.
@@ -550,7 +553,7 @@ impl Form {
         } else {
             list.choices
                 .iter()
-                .position(|choice| choice.value == text || choice.full_path == text)
+                .position(|choice| names_this_key(&text, &list.dir, &choice.name))
                 .map_or(another, |at| at + 1)
         };
         self.mode = FormMode::PickKey(KeyPicker {
@@ -1522,13 +1525,13 @@ mod tests {
         KeyChoice {
             name: name.to_string(),
             value: format!("~/.ssh/{name}"),
-            full_path: format!("/home/dev/.ssh/{name}"),
             kind: kind.map(str::to_string),
         }
     }
 
     fn two_keys() -> KeyList {
         KeyList {
+            dir: PathBuf::from("/home/dev/.ssh"),
             choices: vec![
                 key("id_ed25519", Some("ed25519")),
                 key("id_rsa_old", Some("rsa 3072")),
@@ -1614,11 +1617,19 @@ mod tests {
 
     #[test]
     fn the_list_opens_on_the_key_the_field_already_has_however_it_is_spelled() {
-        for text in [
+        let mut spellings = vec![
             "~/.ssh/id_rsa_old",
             "/home/dev/.ssh/id_rsa_old",
             "  ~/.ssh/id_rsa_old  ",
-        ] {
+            "/home/dev/.ssh/./id_rsa_old",
+            "~/./.ssh//id_rsa_old",
+        ];
+        if cfg!(windows) {
+            // The folder is joined with `\` and typed with `/`: the same file.
+            spellings.push("/home/dev/.ssh\\id_rsa_old");
+            spellings.push("~\\.ssh\\ID_RSA_OLD");
+        }
+        for text in spellings {
             let hosts = sample();
             let mut form = Form::add();
             type_identity(&mut form, &hosts, text);
@@ -1762,18 +1773,17 @@ mod tests {
     #[test]
     fn a_key_whose_path_the_form_would_refuse_is_not_offered() {
         let list = KeyList {
+            dir: PathBuf::from("/home/dev/.ssh"),
             choices: vec![
                 key("fine", Some("ed25519")),
                 KeyChoice {
                     name: "odd.pub".to_string(),
                     value: "~/.ssh/odd.pub".to_string(),
-                    full_path: "/home/dev/.ssh/odd.pub".to_string(),
                     kind: None,
                 },
                 KeyChoice {
                     name: "ctl".to_string(),
                     value: "~/.ssh/ctl\u{7}".to_string(),
-                    full_path: String::new(),
                     kind: None,
                 },
             ],
@@ -1794,6 +1804,7 @@ mod tests {
     #[test]
     fn with_no_keys_the_list_still_has_none_and_another_file_and_carries_the_note() {
         let (form, _) = with_key_list(KeyList {
+            dir: PathBuf::from("/home/dev/.ssh"),
             choices: Vec::new(),
             note: Some("There are no key pairs in /home/dev/.ssh.".to_string()),
         });

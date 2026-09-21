@@ -663,6 +663,13 @@ stays refused (see above).
   it" is decided from the words of the path, not from the disk: `~/.ssh/k`, the full
   path and a path with `.` or `..` in it are the same key, a link is not followed and
   a key that is not there yet still matches. Case counts on Unix and not on Windows.
+  On Windows `/` and `\` are the same separator, so a key written with either, or
+  with both, is the same key. Every place that matches a saved key path with a key
+  on disk (the identity file list, "the host already has it", the hosts listed
+  before a key is deleted) goes through `names_this_key`, which compares the parts
+  of the paths and never their text. `~` means the home only for a folder that is a
+  `.ssh`. The rules of Windows are a parameter of the comparison, so Linux runs
+  the same tests on Windows-style paths.
 - **The stored value is `~/.ssh/<name>`.** It is what people write, it keeps the
   hosts file readable and movable, and ssh expands the `~` itself for `-i` and
   `IdentityFile`. A key found in some other folder would be stored in full. A host
@@ -780,6 +787,16 @@ stays refused (see above).
   generally available. The line is the constant `Include ~/.ssh/bifrost_config`,
   shown on a line of its own, so that selecting it copies exactly it. When there is
   no config at all Bifrost says to create one and does not.
+- **The `Include` line is the same on every platform, with `~` and forward
+  slashes.** Native paths are shown only where they inform (where the file is
+  written, which config was read), never in the line the user copies. A native
+  Windows path in an ssh config is worse in three ways: ssh may read a backslash
+  before `"`, `'`, `\` or a space as an escape, a profile folder with a space
+  (`C:\Users\John Smith`) needs quoting, and the line would differ between the
+  machines of one person. `~/.ssh/bifrost_config` has none of those. Not yet
+  confirmed with the real `ssh.exe`: see the Windows steps of `manual-tests.md`.
+  If it is not read there, the fallback is `Include bifrost_config`, which ssh
+  resolves against `~/.ssh` in a user config.
 - **The include check is an approximation of ssh, on purpose.** It follows
   `Include` (with `~`, relative paths against `~/.ssh`, and wildcards in the file
   name), compares the file by identity when it exists, and decides "inside a block"

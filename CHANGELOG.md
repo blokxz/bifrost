@@ -257,6 +257,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     are never held back however many there are. In the preview, hosts skipped for the
     same reason are shown as one entry.
 
+### Fixed
+
+- **A host's key file is recognized on Windows.** The identity file list, the
+  "use this key?" question after sending a key, and the list of hosts shown before
+  a key is deleted compared paths as text, so `/` and `\` made one key look like
+  two. They now compare the parts of the path, in one place, and on Windows ignore
+  the kind of slash and the case.
+
 ### Security
 
 - The commands that Bifrost waits for without being able to interrupt them have a

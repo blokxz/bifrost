@@ -455,10 +455,21 @@ mod tests {
             .join(" ")
     }
 
+    fn ssh_dir() -> PathBuf {
+        PathBuf::from("/home/dev/.ssh")
+    }
+
+    /// A file of the ssh directory as the screen writes it: joined by the system, so
+    /// with `\` before the name on Windows. Only what the screen makes by joining
+    /// needs this; a path that a test hands to the screen is shown as it was given.
+    fn in_ssh_dir(name: &str) -> String {
+        ssh_dir().join(name).display().to_string()
+    }
+
     /// The screen with `hosts` saved and the ssh directory set.
     fn on_menu(hosts: Vec<Host>) -> App {
         let mut app = app_with(hosts, Vec::new());
-        app.set_ssh_dir(Some(PathBuf::from("/home/dev/.ssh")));
+        app.set_ssh_dir(Some(ssh_dir()));
         app.handle_key(key('s'));
         app
     }
@@ -521,14 +532,20 @@ mod tests {
         let mut one = on_menu(vec![host("web", "192.0.2.1")]);
         let text = flat(&text_of(&mut one, 100, 24));
         for expected in [
-            "Import",
-            "Press i to read /home/dev/.ssh/config, and the files it includes",
-            "Nothing is saved until you confirm.",
-            "Export",
-            "Press e to write your 1 host to /home/dev/.ssh/bifrost_config",
-            "Your own ssh config is never edited.",
+            "Import".to_string(),
+            format!(
+                "Press i to read {}, and the files it includes",
+                in_ssh_dir("config")
+            ),
+            "Nothing is saved until you confirm.".to_string(),
+            "Export".to_string(),
+            format!(
+                "Press e to write your 1 host to {}",
+                in_ssh_dir("bifrost_config")
+            ),
+            "Your own ssh config is never edited.".to_string(),
         ] {
-            assert!(text.contains(expected), "{expected}:\n{text}");
+            assert!(text.contains(&expected), "{expected}:\n{text}");
         }
         let mut many = on_menu(vec![host("a", "a.example"), host("b", "b.example")]);
         assert!(flat(&text_of(&mut many, 100, 24)).contains("write your 2 hosts to"));
@@ -753,7 +770,10 @@ mod tests {
             "{text}"
         );
         assert!(
-            words.contains("add this line at the very top of /home/dev/.ssh/config, before any Host or Match line."),
+            words.contains(&format!(
+                "add this line at the very top of {}, before any Host or Match line.",
+                in_ssh_dir("config")
+            )),
             "{text}"
         );
         assert!(words.contains("Bifrost does not edit that file"), "{text}");
@@ -768,7 +788,10 @@ mod tests {
         let words = flat(&text);
         assert!(words.contains("You have no ssh config yet."), "{text}");
         assert!(
-            words.contains("create /home/dev/.ssh/config with this as its first line."),
+            words.contains(&format!(
+                "create {} with this as its first line.",
+                in_ssh_dir("config")
+            )),
             "{text}"
         );
         assert!(
@@ -783,8 +806,10 @@ mod tests {
         let mut app = with_done(Ok(IncludeStatus::Found));
         let text = text_of(&mut app, 100, 30);
         assert!(
-            flat(&text)
-                .contains("/home/dev/.ssh/config already includes it, so ssh uses these hosts."),
+            flat(&text).contains(&format!(
+                "{} already includes it, so ssh uses these hosts.",
+                in_ssh_dir("config")
+            )),
             "{text}"
         );
         assert_eq!(include_lines(&text), 0, "no line to add: {text}");
@@ -796,9 +821,10 @@ mod tests {
         let text = text_of(&mut app, 100, 30);
         let words = flat(&text);
         assert!(
-            words.contains(
-                "Warning: /home/dev/.ssh/config includes it, but after a Host or Match line"
-            ),
+            words.contains(&format!(
+                "Warning: {} includes it, but after a Host or Match line",
+                in_ssh_dir("config")
+            )),
             "{text}"
         );
         assert!(
