@@ -47,9 +47,11 @@ signal-hook = { version = "0.3", default-features = false }
 # Saves the terminal's modes before ssh runs and puts them back afterwards, so an
 # ssh that dies in raw mode (SIGKILL, out of memory) cannot leave the terminal
 # raw. crossterm re-captures "the original modes" on every enable_raw_mode and
-# would otherwise restore the wrong ones at exit. Already in the tree through
-# crossterm, so it adds no crate.
-rustix = { version = "1", default-features = false, features = ["std", "termios"] }
+# would otherwise restore the wrong ones at exit. Also ends the whole process
+# group of an `ssh -G` (or `ssh-add`) that missed its deadline, so that a hanging
+# `Match exec` command does not outlive it (`process` is the feature for that).
+# Already in the tree through crossterm, so it adds no crate.
+rustix = { version = "1", default-features = false, features = ["std", "termios", "process"] }
 
 [dev-dependencies]
 # Temporary directories (removed on drop) so tests never touch the real config dir.

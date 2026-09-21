@@ -26,15 +26,15 @@ use crate::tui::wrap::wrap;
 const HELP_KEY_COLUMN: usize = 14;
 
 /// The content of a page, ready to draw.
-struct Page {
-    title: String,
+pub(super) struct Page {
+    pub(super) title: String,
     /// Fixed lines above the scrolling text.
-    header: Vec<Line<'static>>,
+    pub(super) header: Vec<Line<'static>>,
     /// The scrolling text, already wrapped to the page width.
-    body: Vec<Line<'static>>,
+    pub(super) body: Vec<Line<'static>>,
 }
 
-fn draw(
+pub(super) fn draw(
     page: Page,
     mut cleaner: Cleaner,
     app: &App,

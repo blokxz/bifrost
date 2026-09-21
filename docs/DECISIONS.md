@@ -429,6 +429,26 @@ settled: reopen one only with a clear new reason.
 
 ## Keys (Block 6)
 
+Block 6 in one place. The **keys screen** (`K`) lists the key pairs of `~/.ssh`
+with what `ssh-keygen -l -f` says about their public files, and the agent's state;
+it can fix a private key's permissions to 0600 (never on a link), **make** an
+ed25519 key (`g`), **add** one to the agent (`a`) and **send** its public key to a
+saved host (`c`), **delete** one (`D`), and after a send offers to **use** that key for
+the host. The
+**host form** picks its identity file from those keys. The **ssh config screen**
+(`s`) imports hosts from the user's ssh config with a preview and a question, and
+exports Bifrost's hosts to `~/.ssh/bifrost_config`, showing the one line to add to
+`~/.ssh/config` and never adding it. Every action that changes something asks
+first and is answered by a plain key (`y`), except deleting a key, which needs its
+name typed; none overwrites a key; the tools that ask for a passphrase or password run on the real terminal, so Bifrost
+never sees either. Whatever the interface waits for without being able to be
+interrupted has a deadline and is killed with what it started when it misses it: the
+agent check 3 seconds, each `ssh -G` of an import 5 seconds and the whole import 60.
+What is not verified is listed under Known limitations: Windows for all of it, a
+real server for sending a key (the ignored test in `tests/copy_real.rs` has not been
+run), and csh as a server's login shell. What follows is why, in the order things
+were decided.
+
 - **The generate form warns before, and Bifrost does not try to find out
   afterwards whether a passphrase was set.** `ssh-keygen` asks for the passphrase
   itself, on the real terminal, so Bifrost never sees it. The form says that
@@ -570,6 +590,205 @@ settled: reopen one only with a clear new reason.
   asking the agent go through `KeyTools`, so everything else is tested with a fake
   and the real tools are checked by ignored tests against OpenSSH itself.
 
+### Deleting a key
+
+This replaces the earlier decision that Bifrost never deletes a key. What it
+protected was the user's access, and that is what the design below protects: not by
+refusing, but by making sure the user has seen what deleting costs. Overwriting
+stays refused (see above).
+
+- **`D`, a capital, and never one plain keypress.** Like `K`, because the lower case
+  is taken (`d` deletes a host on the list, and here it does nothing). On the keys
+  screen a mistyped or held key can therefore never remove a file.
+- **The key's exact name has to be typed, as for a host.** Enter with anything else,
+  the wrong case, a space, a prefix, a longer name, shows why and deletes nothing;
+  Esc gives up; Ctrl or Alt with Enter or Esc do nothing. A person who types the name
+  has read the question at least once.
+- **The question says what deleting costs before it asks.** It lists the saved hosts
+  whose identity file is this key, by name, whether the path is written with `~`
+  or in full, the way a jump host in use is reported.
+  Deleting is still allowed. It then says that Bifrost cannot know which servers have
+  this key in their `authorized_keys`, and that deleting it means losing access to
+  those servers until another key is installed. That is the warning that matters
+  most, so on a small screen it and the input are what stays: the other lines (which
+  files, a link, the agent, then how many hosts are named) go first.
+- **Only the pair, and only a pair.** The library removes exactly two files: the
+  private key and its `.pub`, private first, so a failure between them leaves a
+  public key and not a private key with nothing to say it exists. The request
+  carries a file name, which must be one plain path component, not one of the files
+  ssh reads for other purposes (compared ignoring case), not ending in `.pub`, and
+  both files must be there as files (through a link if they are one), neither a
+  folder. This is checked again where the files are removed, not just where the
+  screen decides to offer it, and it is a real check in release builds. It is the rule
+  the scan of the folder uses to list a pair, plus the names that are never a key.
+- **A link is removed as a link.** `remove_file` on a link removes the link. The file
+  it points to is not opened, read, followed or removed, and the question says so. A
+  link to a folder, or one that points nowhere, is not a key pair and is refused.
+- **The saved hosts are not changed.** Rewriting hosts that had the key would be a
+  second decision made for the user, and possibly a wrong one (they may be about to
+  put another key there). The message afterwards names the hosts that still point at
+  it and where to change them. Saving a host that names a missing key already warns
+  (the missing identity file warning).
+- **The agent is not touched.** A key that was loaded stays in the agent until it is
+  restarted, so `ssh` may still use it. Removing it with `ssh-add -d` would mean
+  handing the terminal over for something that was not asked; the question says
+  that it is still held and how to remove it.
+- **No secure erase.** The files are unlinked, not overwritten first. On a journalling
+  or copy-on-write file system, or an SSD, overwriting would not reliably remove
+  the bytes anyway, and claiming to would be worse than not. The passphrase, if
+  there was one, is what protects a copy that is recovered.
+- **The keys are read again afterwards, whatever happened**, since a deletion that
+  failed halfway has changed the folder, and the selection stays near where the key
+  was. The result is a message on the keys screen, in the same place as the other
+  actions: what was removed, or why nothing was, or, if the `.pub` could not be
+  removed after the private key was, that it is left over and can be removed by hand.
+- **The only Bifrost code that removes a key is `ssh::keys::delete_key`**, and its
+  only caller is the effect for this request. Nothing else in the program deletes
+  anything in the ssh directory.
+
+### Using a key after sending it, and choosing the identity file
+
+- **After a send, Bifrost asks whether to use the key for that host, and only asks.**
+  At that moment it knows both the key and the host, and going back to edit the
+  host is busywork it can do itself. The question names the key, the host and the
+  path that would be stored, says that ssh will then offer only that key (because a
+  key file goes with `IdentitiesOnly=yes`), and, if the host has another key file,
+  says which one is replaced. Only a plain `y` sets it: the host's identity file is
+  changed and saved through the same path as every other change (validated, atomic,
+  backed up), and if that fails nothing changed and the reason is said. `n` and Esc
+  change nothing.
+- **It is asked only when it can matter.** Not when the send did not succeed (a
+  refused login, a failed remote command, a cancel), not when the host already uses
+  that key, and not when the path would not be one a host may have. "Already uses
+  it" is decided from the words of the path, not from the disk: `~/.ssh/k`, the full
+  path and a path with `.` or `..` in it are the same key, a link is not followed and
+  a key that is not there yet still matches. Case counts on Unix and not on Windows.
+- **The stored value is `~/.ssh/<name>`.** It is what people write, it keeps the
+  hosts file readable and movable, and ssh expands the `~` itself for `-i` and
+  `IdentityFile`. A key found in some other folder would be stored in full. A host
+  that has the same key written in full is recognized as having it.
+- **The form's identity file is picked from a list, and typing stays.** Enter on the
+  field opens the list, as the jump host does: "(none)", each key with its type, and
+  "Another file". Choosing a key or none sets the box; choosing "Another file" goes
+  back to the box as it was, to type in, and a path already typed is kept and shown
+  there. Enter on any other field is what it was. This changes what Enter does on
+  this one field, which used to move on (Tab still does); it is what makes the
+  choice discoverable without a key to learn.
+- **The list is names and types, and never asks the agent.** The keys screen asks
+  `ssh-add -l`, waiting up to 3 seconds for a stuck agent; a form must not. The
+  request is its own (`ListKeys`), reads the same data with the agent left out, and
+  is made once, the first time the field is chosen from, and kept for the form.
+  Keys that arrive after the user moved on are kept and not shown, and never cover
+  a question that is open.
+- **The list never offers what saving would refuse.** A key whose path the form
+  would reject (ends in `.pub`, control characters) is left out. What is shown of
+  a name is cleaned, and the footer says when something was hidden: the popup's own
+  lines are built before the footer so that this is counted.
+
+### Testing what needs a terminal
+
+- **The PTY tests do not depend on the terminal they are run from.** A child inherits
+  its parent's controlling terminal, and crossterm asks `/dev/tty` for the size and
+  uses the terminal of stdout only when there is none, so under a person's terminal
+  the binary under test drew for that window and ignored the test pty's size and
+  resizes. The harness detaches its own process once with `setsid` (safe code: the
+  test code stays free of `unsafe`), and stops with a message that says why when
+  that is impossible (the binary is a process group leader), instead of timing out on
+  a screen of the wrong size.
+- **A test waits for the whole screen it asserts about.** A frame arrives in pieces,
+  the list and the keys screen share words in their footers, and a popup's wrapped
+  lines are joined, in a flattened screen, with what is drawn beside the popup. So
+  waits name something only the finished screen has, and a phrase that wraps is
+  checked in fragments that each sit on one line.
+- **One hostile field at a time.** A test that puts hostile text in every field
+  cannot say which one was cleaned; each source is tested alone, and every claim is
+  checked by breaking the code it is about and seeing a test fail.
+
+### The ssh config screen
+
+- **It is a screen of its own, opened with `s`, with two things to do.** Import
+  and export are opposite directions and each needs a question, so each has its
+  own steps: the choice, then what would happen, then the answer, then what was
+  done. The pages are text pages (a fixed header that holds the question, a
+  scrolling body) so the question is never scrolled out of view, including on the
+  smallest terminal.
+- **Nothing is saved or written until a plain `y`.** Enter does not confirm: a
+  keystroke that also moves through pages must not be what changes the store. `n`
+  and Esc go back one step; Esc from the choice goes back to the host list.
+- **The import preview is the engine's own report, and confirming saves that
+  report's hosts.** Reading the config runs `ssh -G` once per host found, and the
+  result (imported, already in Bifrost, skipped with the reason, warnings) is what
+  the page shows. The hosts saved are those of the report, through the store's
+  usual atomic write with `hosts.toml.bak`, so what is saved is what was shown and
+  not a second computation that could differ. Nothing changes between the two: the
+  app is single threaded. If the save fails the hosts are unchanged, the preview
+  stays and the reason is shown, so it can be tried again.
+- **Import asks ssh what the config means, with no `-F`.** The same `ssh` that
+  will later connect resolves each host, so the preview shows what ssh would do,
+  including the system-wide config. That evaluates `Match exec` commands, which is
+  fine for the user's own config and is why this is never pointed at anything
+  else. It runs while the screen waits: about 10 ms per host, and each host has a
+  deadline (next item). The home directory the engine is given is the parent of
+  `~/.ssh`.
+- **Each `ssh -G` has a deadline of 5 seconds, and a host that misses it is
+  skipped.** The screen waits for `ssh -G` and cannot be interrupted while it does
+  (Ctrl-C is a key in raw mode, and is not read until the wait ends), so the wait
+  has to end by itself: `ssh -G` runs the user's `Match exec` commands, and one of
+  them can hang. Five seconds: `ssh -G` answers in milliseconds, a `Match exec` that
+  checks something first (a VPN, a network, a host) takes a second or two, so this is
+  generous for what is legitimate and short for what is not; the agent check has 3
+  seconds for the same reason, for a question that is simpler. A host that misses
+  it is skipped whole, with the reason ("ssh did not answer within 5 seconds, so
+  this host was skipped. A Match exec command in your ssh config that does not
+  finish is the usual cause."), and is listed under Skipped in the preview like any
+  host ssh could not resolve. It is not the same as ssh being unavailable, which
+  stops the import: one host that hangs says nothing about the others.
+- **A timed-out `ssh -G` is killed with what it started.** What hangs is usually the
+  command, not ssh, and killing ssh alone would leave that command running, holding
+  the output open, one more for each host. On Unix `ssh -G` runs in a process group
+  of its own and the whole group is killed. This is one small module
+  (`ssh::timed`), shared with the agent check, which used to have its own copy of
+  the same wait. Being in a group of its own also means it is not in the terminal's
+  foreground group, so it is not given the terminal.
+- **The whole import has a budget of 60 seconds.** A deadline per host bounds one
+  hang, but if one `Match exec` hangs for every host they add up: 5 seconds for each of
+  200 hosts is about 17 minutes of a screen that is not drawn and cannot be
+  interrupted. So the import as a whole is given 60 seconds, counted from the first
+  `ssh -G`. Time is what is counted, and not timeouts: it is easy to explain, it
+  never holds back healthy hosts however many there are (they take milliseconds
+  each), and three timeouts in a row can happen by chance on a slow network. Each
+  host is given the shorter of its own 5 seconds and what is left of the 60, so the
+  import cannot overrun by a host's worth. When the time is spent, the hosts not yet
+  read are skipped, without running ssh for them, with the reason "the import was
+  taking too long, so the remaining hosts were not read; check for a Match exec
+  command in your ssh config that does not finish, then try again." A host that was
+  cut short by the budget is told that, and not that it "did not answer": it may
+  have been fine. Hosts that are already in Bifrost are not asked about at all, so
+  the budget is not spent on them. In the preview, hosts skipped for the same reason
+  are one entry (their names, then the reason once), so a spent budget is a line and
+  not a page; the count is still of hosts.
+- **Export says what it will do before it does it.** The plan renders the hosts
+  (so a host that cannot be exported is reported before anything is written) and
+  looks at the target: missing, made by Bifrost (replaced), or not made by Bifrost
+  (never offered). The write is the engine's: atomic, user-only, and refusing a
+  file without the `Generated by Bifrost` header or one named `config`.
+- **The `Include` line is shown, never added.** After writing, a read-only walk
+  of the user's `~/.ssh/config`, the same one the import scan uses, says whether
+  it already includes the file: yes, no, no config file at all, or yes but after
+  a `Host` or `Match` line. The last is a warning of its own because ssh then
+  applies the include only to that block, and the exported hosts silently are not
+  generally available. The line is the constant `Include ~/.ssh/bifrost_config`,
+  shown on a line of its own, so that selecting it copies exactly it. When there is
+  no config at all Bifrost says to create one and does not.
+- **The include check is an approximation of ssh, on purpose.** It follows
+  `Include` (with `~`, relative paths against `~/.ssh`, and wildcards in the file
+  name), compares the file by identity when it exists, and decides "inside a block"
+  by whether a `Host` or `Match` line came earlier in the file that holds the
+  `Include`. It does not evaluate `Match` conditions or `Host` patterns, does not
+  follow wildcards in directory names, and stops at 8 levels, as the import scan
+  does. When in doubt it says the line is missing, which costs a redundant line and
+  nothing else.
+
 ## Known limitations in 0.1.0
 
 - **Jump host keys.** Bifrost expands a jump host to `user@host:port` from its
@@ -614,11 +833,30 @@ settled: reopen one only with a clear new reason.
   under `sh`, bash, zsh, dash, fish and busybox here; csh was not available, and
   is judged from its quoting rules only. Against a real server it is checked by
   the ignored test in `tests/copy_real.rs`, which has not been run yet.
+- **An import can take up to 60 seconds with an undrawn screen** if commands in the
+  ssh config hang: each `ssh -G` is killed after 5 seconds and the import as a whole
+  is cut off at 60, and the hosts not read are listed as skipped, with the reason.
+  The screen still cannot be interrupted meanwhile. On Windows only ssh itself is
+  killed on a timeout: a hanging `Match exec` command it started is not, and remains
+  until it ends. See the ssh config screen above.
+- **Choosing the identity file has not been run on Windows.** Not checked: that
+  `~/.ssh/<name>` is accepted by ssh.exe for `-i` and that the keys found in
+  `%USERPROFILE%\.ssh` are named as the list expects.
+- **Enter on the Identity file field opens the list** and no longer moves to the next
+  field. Tab does.
+- **The ssh config screen has not been run on Windows.** Not checked: that
+  `Include ~/.ssh/bifrost_config` (with `~`) is what OpenSSH for Windows accepts in
+  `%USERPROFILE%\.ssh\config`, and how the import's `ssh -G` output paths look
+  there. The include check compares paths ignoring case and the kind of slash.
 - **Making a key and adding one to the agent have not been run on Windows.** They
   use the same handover as a connection, so the limits above hold, and how
   `ssh-keygen.exe` prompts on the legacy console host and in Windows Terminal, and
   whether the ssh-agent service is running, have not been checked. See
   `docs/manual-tests.md`.
+- **Deleting a key has not been run on Windows.** The same code removes files there,
+  not checked: whether a key file with the read-only attribute is removed, and
+  whether a link is removed as a link (links on Windows need privileges that were
+  not available to try). The whole flow is on the list in `docs/manual-tests.md`.
 - **Notes are edited on one line.** Line breaks and tabs are typed as `\n` and
   `\t`.
 

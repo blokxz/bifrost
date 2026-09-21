@@ -22,14 +22,23 @@
 //!   Bifrost store after the import (one hop; multi-hop lists are dropped).
 //!
 //! Note that `ssh -G` evaluates `Match exec` commands, so this must only be
-//! pointed at the user's own configuration.
+//! pointed at the user's own configuration. One of those commands can hang, so
+//! each `ssh -G` has a deadline ([`RESOLVE_TIMEOUT`]): a host whose `ssh -G` does not
+//! answer in time is skipped, with the reason, like any other host ssh could not
+//! resolve, and what it started is killed with it. The whole import has a budget
+//! as well ([`IMPORT_BUDGET`]): a deadline per host bounds one hang, and the budget
+//! bounds all of them together, however many hosts there are. When it is spent the
+//! hosts not yet read are skipped with the reason, and ssh is not run for them.
 
+use std::cell::Cell;
 use std::fmt;
 use std::io;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Command;
+use std::time::{Duration, Instant};
 
 use super::scan::scan_host_names;
+use super::timed::{Timed, output_within};
 use crate::domain::validate;
 use crate::domain::{Forward, Host, Hosts, Warning};
 use crate::sysenv::{self, Env, Platform};
@@ -46,6 +55,28 @@ const DEFAULT_IDENTITY_FILES: [&str; 7] = [
     "id_xmss",
     "id_dsa",
 ];
+
+/// How long each `ssh -G` is given. It normally answers in a few milliseconds; the
+/// time is for a `Match exec` command that checks something (a VPN, a network, a
+/// host) before it says yes or no, which can take a second or two. Five seconds is
+/// generous for that and short enough that a command that does not finish costs
+/// only that much per host.
+pub const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long the whole import may take, counted from the first `ssh -G`. Healthy
+/// hosts take a few milliseconds each, so this is never felt by them, whatever
+/// their number; it is there for the case where a command hangs for many hosts and
+/// the deadline per host, five seconds, would add up to minutes. Time is what is
+/// counted, and not timeouts: three slow answers in a row can be a slow network.
+pub const IMPORT_BUDGET: Duration = Duration::from_secs(60);
+
+/// What is said of a host that was not read because the budget ran out.
+const OUT_OF_TIME: &str = "the import was taking too long, so the remaining hosts were not \
+     read; check for a Match exec command in your ssh config that does not finish, then \
+     try again.";
+
+/// The most of `ssh -G`'s output that is read. It prints a few dozen lines.
+const MAX_RESOLVED_OUTPUT: u64 = 1024 * 1024;
 
 /// Why resolving one host with ssh failed.
 #[derive(Debug)]
@@ -64,10 +95,17 @@ pub trait SshResolver {
 /// Runs the real `ssh -G`. The binary must be an absolute path (see
 /// [`super::binary`]); it is spawned directly, never through a shell, and the
 /// host name is passed after `--`.
+///
+/// One resolver is for one import: the budget is counted from the first host it is
+/// asked about.
 #[derive(Debug, Clone)]
 pub struct SystemSshResolver {
     ssh: PathBuf,
     config_file: Option<PathBuf>,
+    timeout: Duration,
+    budget: Duration,
+    /// When the first host was asked about.
+    started: Cell<Option<Instant>>,
 }
 
 impl SystemSshResolver {
@@ -75,7 +113,22 @@ impl SystemSshResolver {
         SystemSshResolver {
             ssh,
             config_file: None,
+            timeout: RESOLVE_TIMEOUT,
+            budget: IMPORT_BUDGET,
+            started: Cell::new(None),
         }
+    }
+
+    /// How long each host is given instead of [`RESOLVE_TIMEOUT`].
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// How long the whole import may take instead of [`IMPORT_BUDGET`].
+    pub fn with_budget(mut self, budget: Duration) -> Self {
+        self.budget = budget;
+        self
     }
 
     /// Use an explicit config file (`ssh -F`) instead of ssh's default lookup.
@@ -93,21 +146,48 @@ impl SshResolver for SystemSshResolver {
                 self.ssh.display()
             )));
         }
+
+        // What is left of the import's time. A host is given at most that, so the
+        // import as a whole cannot run past its budget by a host's worth.
+        let started = self.started.get().unwrap_or_else(|| {
+            let now = Instant::now();
+            self.started.set(Some(now));
+            now
+        });
+        let left = self.budget.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            return Err(ResolveError::Failed(OUT_OF_TIME.to_string()));
+        }
+        let allowed = self.timeout.min(left);
+
         let mut command = Command::new(&self.ssh);
         command.arg("-G");
         if let Some(config) = &self.config_file {
             command.arg("-F").arg(config);
         }
-        command
-            .arg("--")
-            .arg(name)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        command.arg("--").arg(name);
 
-        let output = command.output().map_err(|err| {
-            ResolveError::Unavailable(format!("could not run {}: {err}", self.ssh.display()))
-        })?;
+        let output = match output_within(&mut command, allowed, MAX_RESOLVED_OUTPUT) {
+            Ok(Timed::Finished(done)) => done,
+            // Cut short by the budget, not by its own deadline: the host may have
+            // been fine, and it was not read.
+            Ok(Timed::TimedOut) if allowed < self.timeout => {
+                return Err(ResolveError::Failed(OUT_OF_TIME.to_string()));
+            }
+            Ok(Timed::TimedOut) => {
+                return Err(ResolveError::Failed(format!(
+                    "ssh did not answer within {}, so this host was skipped. A Match exec \
+                     command in your ssh config that does not finish is the usual cause.",
+                    describe_wait(self.timeout)
+                )));
+            }
+            Err(err) => {
+                return Err(ResolveError::Unavailable(format!(
+                    "could not run {}: {err}",
+                    self.ssh.display()
+                )));
+            }
+        };
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let first_line = stderr.lines().next().unwrap_or("").trim();
@@ -118,6 +198,15 @@ impl SshResolver for SystemSshResolver {
         }
         String::from_utf8(output.stdout)
             .map_err(|_| ResolveError::Failed("ssh -G printed text that is not UTF-8".into()))
+    }
+}
+
+/// A wait in words: "5 seconds", "1 second", "300 milliseconds".
+fn describe_wait(wait: Duration) -> String {
+    match wait.as_secs() {
+        0 => format!("{} milliseconds", wait.as_millis()),
+        1 => "1 second".to_string(),
+        seconds => format!("{seconds} seconds"),
     }
 }
 

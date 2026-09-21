@@ -4,6 +4,9 @@
 //! (following `Include`) so that each one can be resolved with `ssh -G`, which
 //! is the source of truth for what the configuration means. Everything else is
 //! ignored: `Match` blocks, patterns (`*`, `?`, `!`), and all other keywords.
+//!
+//! [`find_include`] uses the same walk to answer a different question, read-only:
+//! whether the config already includes a given file.
 
 use std::collections::HashSet;
 use std::fs;
@@ -41,12 +44,75 @@ pub fn scan_host_names(
         seen_names: HashSet::new(),
         visited: HashSet::new(),
         warnings: Vec::new(),
+        target: None,
+        found: None,
     };
     scanner.scan_file(config, 0, true)?;
     Ok(ScanReport {
         names: scanner.names,
         warnings: scanner.warnings,
     })
+}
+
+/// Whether an ssh config includes a given file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IncludeStatus {
+    /// There is no config file at all.
+    NoConfigFile,
+    /// The config has no `Include` that reaches the file.
+    Missing,
+    /// It has one, before any `Host` or `Match` line of the file it is in, so it
+    /// applies to everything.
+    Found,
+    /// It has one, but after a `Host` or `Match` line: ssh then applies it only
+    /// to the hosts of that block, so the file's hosts are not generally
+    /// available. It has to be moved to the top.
+    FoundInsideBlock,
+}
+
+/// Looks for an `Include` of `target` in `config`, following `Include`s as the
+/// scan for host names does, and reads nothing else. Nothing is written.
+///
+/// An include reaches `target` when it names it, as a path or with wildcards in
+/// the file name, or when a file it includes does. A `config` that does not
+/// exist is [`IncludeStatus::NoConfigFile`]; one that cannot be read is an error.
+pub fn find_include(
+    config: &Path,
+    ssh_dir: &Path,
+    home: Option<&Path>,
+    target: &Path,
+) -> io::Result<IncludeStatus> {
+    match fs::metadata(config) {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return Ok(IncludeStatus::NoConfigFile);
+        }
+        _ => {}
+    }
+    let mut scanner = Scanner {
+        ssh_dir,
+        home,
+        names: Vec::new(),
+        seen_names: HashSet::new(),
+        visited: HashSet::new(),
+        warnings: Vec::new(),
+        target: Some(same_file_key(target)),
+        found: None,
+    };
+    scanner.scan_file(config, 0, true)?;
+    Ok(scanner.found.unwrap_or(IncludeStatus::Missing))
+}
+
+/// A path as a string that two spellings of the same file agree on: resolved
+/// when the file exists, and otherwise only with the slashes made alike (and, on
+/// Windows, the case).
+fn same_file_key(path: &Path) -> String {
+    let resolved = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let text = resolved.to_string_lossy().replace('\\', "/");
+    if cfg!(windows) {
+        text.to_lowercase()
+    } else {
+        text
+    }
 }
 
 struct Scanner<'a> {
@@ -56,6 +122,10 @@ struct Scanner<'a> {
     seen_names: HashSet<String>,
     visited: HashSet<PathBuf>,
     warnings: Vec<Warning>,
+    /// The file [`find_include`] looks for, as [`same_file_key`] spells it.
+    target: Option<String>,
+    /// What was found about it. `Found` is not replaced by `FoundInsideBlock`.
+    found: Option<IncludeStatus>,
 }
 
 impl Scanner<'_> {
@@ -78,12 +148,16 @@ impl Scanner<'_> {
         };
         let text = String::from_utf8_lossy(&bytes);
 
+        // Whether a `Host` or `Match` line came before, in this file.
+        let mut in_block = false;
         for line in text.lines() {
             let Some((keyword, args)) = split_directive(line) else {
                 continue;
             };
             match keyword.as_str() {
+                "match" => in_block = true,
                 "host" => {
+                    in_block = true;
                     for arg in args {
                         if is_pattern(&arg) {
                             continue;
@@ -104,6 +178,7 @@ impl Scanner<'_> {
                     }
                     for arg in args {
                         for included in self.expand_include(&arg) {
+                            self.note_include(&included, in_block);
                             self.scan_file(&included, depth + 1, false)?;
                         }
                     }
@@ -112,6 +187,22 @@ impl Scanner<'_> {
             }
         }
         Ok(())
+    }
+
+    /// Records that `included` was included, if it is the file looked for.
+    fn note_include(&mut self, included: &Path, in_block: bool) {
+        let Some(target) = &self.target else {
+            return;
+        };
+        if same_file_key(included) != *target {
+            return;
+        }
+        // Applying everywhere wins over applying to one block.
+        self.found = Some(if !in_block || self.found == Some(IncludeStatus::Found) {
+            IncludeStatus::Found
+        } else {
+            IncludeStatus::FoundInsideBlock
+        });
     }
 
     /// Resolves an `Include` argument to files. Wildcards are supported in the
@@ -399,5 +490,215 @@ mod tests {
         assert!(!glob_match("a?c", "ac"));
         assert!(!glob_match("abc", "abcd"));
         assert!(glob_match("", ""));
+    }
+
+    // ---- find_include ----------------------------------------------------------
+
+    /// A `~/.ssh` with the given files, and the export target in it.
+    struct Ssh {
+        dir: tempfile::TempDir,
+    }
+
+    impl Ssh {
+        fn new(files: &[(&str, &str)]) -> Ssh {
+            let dir = tempfile::tempdir().unwrap();
+            for (name, text) in files {
+                let path = dir.path().join(name);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, text).unwrap();
+            }
+            Ssh { dir }
+        }
+
+        fn target(&self) -> PathBuf {
+            self.dir.path().join("bifrost_config")
+        }
+
+        fn check(&self) -> io::Result<IncludeStatus> {
+            // The home is the parent of the ssh directory, so `~/x` is `<dir>/x`.
+            find_include(
+                &self.dir.path().join("config"),
+                self.dir.path(),
+                Some(self.dir.path()),
+                &self.target(),
+            )
+        }
+    }
+
+    #[test]
+    fn no_config_file_is_told_apart_from_a_config_without_the_include() {
+        let none = Ssh::new(&[("bifrost_config", "")]);
+        assert_eq!(none.check().unwrap(), IncludeStatus::NoConfigFile);
+        let without = Ssh::new(&[
+            ("config", "Host web\n  HostName x\n"),
+            ("bifrost_config", ""),
+        ]);
+        assert_eq!(without.check().unwrap(), IncludeStatus::Missing);
+        let empty = Ssh::new(&[("config", ""), ("bifrost_config", "")]);
+        assert_eq!(empty.check().unwrap(), IncludeStatus::Missing);
+    }
+
+    #[test]
+    fn every_way_of_naming_the_file_counts_when_it_comes_first() {
+        // `{absolute}` is the target's own path, which is only known once the
+        // directory exists.
+        for line in [
+            "Include ~/bifrost_config",
+            "Include bifrost_config",
+            "Include {absolute}",
+            "Include \"{absolute}\"",
+            "include bifrost_config",
+            "INCLUDE=bifrost_config",
+            "Include bifrost_*",
+            "Include *",
+            "Include ./bifrost_config",
+            "Include other_config bifrost_config",
+            "  Include   bifrost_config   # the hosts of Bifrost",
+        ] {
+            let ssh = Ssh::new(&[("bifrost_config", "# Generated by Bifrost\n")]);
+            let line = line.replace("{absolute}", &ssh.target().display().to_string());
+            fs::write(
+                ssh.dir.path().join("config"),
+                format!("{line}\nHost web\n  HostName x\n"),
+            )
+            .unwrap();
+            assert_eq!(ssh.check().unwrap(), IncludeStatus::Found, "{line}");
+        }
+    }
+
+    #[test]
+    fn things_that_look_like_it_but_do_not_reach_the_file_do_not_count() {
+        for text in [
+            "Include other_config\n",
+            "Include bifrost_config.bak\n",
+            "# Include bifrost_config\n",
+            "Host web\n  HostName bifrost_config\n",
+            "Include bifrost_config2\n",
+            "Include sub/bifrost_config\n",
+            "Include nothing_*\n",
+            "IncludeX bifrost_config\n",
+        ] {
+            let ssh = Ssh::new(&[
+                ("config", text),
+                ("bifrost_config", ""),
+                ("other_config", ""),
+                ("bifrost_config.bak", ""),
+                ("bifrost_config2", ""),
+            ]);
+            assert_eq!(ssh.check().unwrap(), IncludeStatus::Missing, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn an_include_after_a_host_or_match_line_only_applies_to_that_block() {
+        for text in [
+            "Host web\n  HostName x\nInclude bifrost_config\n",
+            "Match host web\n  User me\nInclude bifrost_config\n",
+            "Host *\nInclude bifrost_config\n",
+        ] {
+            let ssh = Ssh::new(&[("config", text), ("bifrost_config", "")]);
+            assert_eq!(
+                ssh.check().unwrap(),
+                IncludeStatus::FoundInsideBlock,
+                "{text:?}"
+            );
+        }
+        // Comments and other keywords before it do not make a block.
+        let ssh = Ssh::new(&[
+            (
+                "config",
+                "# mine\nAddKeysToAgent yes\nInclude bifrost_config\nHost web\n",
+            ),
+            ("bifrost_config", ""),
+        ]);
+        assert_eq!(ssh.check().unwrap(), IncludeStatus::Found);
+    }
+
+    #[test]
+    fn the_include_that_applies_everywhere_wins_over_one_inside_a_block() {
+        let ssh = Ssh::new(&[
+            (
+                "config",
+                "Include bifrost_config\nHost web\n  HostName x\nInclude bifrost_config\n",
+            ),
+            ("bifrost_config", ""),
+        ]);
+        assert_eq!(ssh.check().unwrap(), IncludeStatus::Found);
+        let reversed = Ssh::new(&[
+            ("config", "Host web\nInclude bifrost_config\n"),
+            ("bifrost_config", ""),
+        ]);
+        assert_eq!(reversed.check().unwrap(), IncludeStatus::FoundInsideBlock);
+    }
+
+    #[test]
+    fn an_include_reached_through_another_included_file_counts() {
+        let ssh = Ssh::new(&[
+            ("config", "Include config.d/*\n"),
+            ("config.d/10-mine", "Include ~/bifrost_config\n"),
+            ("bifrost_config", ""),
+        ]);
+        assert_eq!(ssh.check().unwrap(), IncludeStatus::Found);
+        // What decides is the position in the file that has the line.
+        let nested = Ssh::new(&[
+            ("config", "Include config.d/*\n"),
+            ("config.d/10-mine", "Host x\nInclude ~/bifrost_config\n"),
+            ("bifrost_config", ""),
+        ]);
+        assert_eq!(nested.check().unwrap(), IncludeStatus::FoundInsideBlock);
+    }
+
+    #[test]
+    fn a_file_that_includes_itself_or_loops_does_not_hang() {
+        let ssh = Ssh::new(&[
+            ("config", "Include config\nInclude a\n"),
+            ("a", "Include config\nInclude a\n"),
+            ("bifrost_config", ""),
+        ]);
+        assert_eq!(ssh.check().unwrap(), IncludeStatus::Missing);
+    }
+
+    #[test]
+    fn the_target_is_matched_as_a_file_not_as_text() {
+        // Two spellings of one file, through a symbolic link.
+        #[cfg(unix)]
+        {
+            let ssh = Ssh::new(&[("config", "Include linked\n"), ("bifrost_config", "")]);
+            std::os::unix::fs::symlink(ssh.target(), ssh.dir.path().join("linked")).unwrap();
+            assert_eq!(ssh.check().unwrap(), IncludeStatus::Found);
+        }
+        // A target that does not exist yet is matched by its path.
+        let ssh = Ssh::new(&[("config", "Include ~/bifrost_config\n")]);
+        assert_eq!(ssh.check().unwrap(), IncludeStatus::Found);
+    }
+
+    #[test]
+    fn nothing_is_written_and_a_config_that_cannot_be_read_is_an_error() {
+        let ssh = Ssh::new(&[
+            ("config", "Include bifrost_config\n"),
+            ("bifrost_config", "x"),
+        ]);
+        let before: Vec<_> = fs::read_dir(ssh.dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        ssh.check().unwrap();
+        let after: Vec<_> = fs::read_dir(ssh.dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(before.len(), after.len());
+        assert_eq!(fs::read_to_string(ssh.target()).unwrap(), "x");
+
+        // A directory where the config should be: it exists and cannot be read.
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("config")).unwrap();
+        let result = find_include(
+            &dir.path().join("config"),
+            dir.path(),
+            None,
+            &dir.path().join("bifrost_config"),
+        );
+        assert!(result.is_err());
     }
 }

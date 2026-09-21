@@ -225,11 +225,14 @@ mod tests {
             Vec::new(),
         ));
         let mut terminal = Terminal::new(TestBackend::new(60, 15)).unwrap();
-        // Open the help, which is longer than the screen, and scroll far past
-        // its end. Without the limit fed back after each draw this would end
-        // at 100.
+        // Open the help, which is longer than the screen, and scroll past its
+        // end: more presses than it has lines (it scrolls to about 110 at this
+        // size). Without the limit fed back after each draw this would end at
+        // PRESSES, and if the help ever outgrows it the test says so. Each press
+        // is a redraw, so it is not made larger than that needs.
+        const PRESSES: usize = 300;
         let mut script: VecDeque<_> = std::iter::once(Some(press('?')))
-            .chain((0..100).map(|_| Some(press('j'))))
+            .chain((0..PRESSES).map(|_| Some(press('j'))))
             .chain([Some(press('q'))])
             .collect();
         run_loop(
@@ -242,7 +245,7 @@ mod tests {
         .unwrap();
         assert!(app.scroll() > 0, "the help scrolled");
         assert!(
-            app.scroll() < 100,
+            app.scroll() < PRESSES,
             "but stopped at its end: {}",
             app.scroll()
         );

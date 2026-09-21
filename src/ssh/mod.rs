@@ -14,4 +14,5 @@ pub mod interrupt;
 pub mod keygen;
 pub mod keys;
 pub mod scan;
+pub mod timed;
 pub mod tty;

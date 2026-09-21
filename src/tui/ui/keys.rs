@@ -19,7 +19,9 @@ use super::{
 use crate::ssh::agent::AgentState;
 use crate::ssh::keys::{KeyEntry, KeysSnapshot, Permissions, mode_label};
 use crate::tui::app::{App, Metrics};
-use crate::tui::keys::{CopyDialog, GenerateField, GenerateForm, KeysScreen};
+use crate::tui::keys::{
+    CopyDialog, DeleteQuestion, GenerateField, GenerateForm, KeysScreen, UseKeyQuestion,
+};
 use crate::tui::list::window_start;
 use crate::tui::theme::Theme;
 use crate::tui::wrap::{display_width, pad, truncate, wrap};
@@ -161,6 +163,241 @@ fn generate_lines(
         cleaner,
     ));
     (lines, cursor)
+}
+
+/// The most saved hosts that are named one by one in the question about deleting.
+const MAX_HOSTS_NAMED: usize = 8;
+
+/// The question before deleting a key, and where the cursor goes in it.
+///
+/// What it must say is fixed: which saved hosts use the key, that Bifrost cannot
+/// know which servers have it, and that the name has to be typed. On a small
+/// terminal the popup cannot hold everything, so what is only helpful goes first,
+/// in this order: the spacing, the note about the agent, the note that no host uses
+/// the key, the note about a link, and the paths.
+fn delete_lines(
+    question: &DeleteQuestion,
+    theme: &Theme,
+    area: Rect,
+    cleaner: &mut Cleaner,
+) -> (Vec<Line<'static>>, (usize, usize)) {
+    // A popup is at most this wide, less its border and padding.
+    let width = usize::from(area.width.saturating_sub(2))
+        .min(64)
+        .saturating_sub(4)
+        .max(1);
+    let paragraph =
+        |text: &str, cleaner: &mut Cleaner| labeled_lines("", Style::new(), text, width, cleaner);
+
+    let heading = paragraph(&format!("Delete the key '{}'?", question.key), cleaner);
+    // The hosts that use the key, `shown` of them by name.
+    let used_for = |shown: usize, cleaner: &mut Cleaner| {
+        if question.used_by.is_empty() {
+            return Vec::new();
+        }
+        let shown = shown.min(question.used_by.len());
+        let mut names = question.used_by[..shown].join(", ");
+        if question.used_by.len() > shown {
+            names.push_str(&format!(" and {} more", question.used_by.len() - shown));
+        }
+        labeled_lines(
+            "Used by:",
+            theme.warning,
+            &format!("{names}. Their key file is this key, and would be gone."),
+            width,
+            cleaner,
+        )
+    };
+    let mut shown = MAX_HOSTS_NAMED;
+    let mut used = used_for(shown, cleaner);
+    let nobody = if question.used_by.is_empty() {
+        paragraph("No saved host has this key as its key file.", cleaner)
+    } else {
+        Vec::new()
+    };
+    let warning = labeled_lines(
+        "Warning:",
+        theme.warning,
+        "Bifrost cannot know which servers have this key in their authorized_keys. Deleting it \
+         means losing access to those servers until another key is installed.",
+        width,
+        cleaner,
+    );
+    let removes = paragraph(
+        &format!("This removes {} and {}.", question.private, question.public),
+        cleaner,
+    );
+    let link = if question.symlink {
+        paragraph(
+            "It is a symbolic link: only the link is removed, and the file it points to stays.",
+            cleaner,
+        )
+    } else {
+        Vec::new()
+    };
+    let agent = if question.loaded {
+        paragraph(
+            "The agent holds this key and keeps holding it until it is restarted or you run \
+             ssh-add -d.",
+            cleaner,
+        )
+    } else {
+        Vec::new()
+    };
+    let prompt = Line::raw("Type the key's name to confirm:");
+    let typed = cleaner.clean(question.input.value()).into_owned();
+    let (visible, column) = input_window(&typed, question.input.cursor(), width.saturating_sub(2));
+    let input = Line::from(vec![Span::styled("> ", theme.key), Span::raw(visible)]);
+    let mismatch = if question.mismatch {
+        labeled_lines(
+            "Error:",
+            theme.error,
+            "That is not the key's name. Type it exactly, or press Esc to cancel.",
+            width,
+            cleaner,
+        )
+    } else {
+        Vec::new()
+    };
+
+    // What is left out, in the order it goes.
+    let (mut spaces, mut keep_agent, mut keep_nobody, mut keep_link, mut keep_removes) =
+        (2, true, true, true, true);
+    let budget = usize::from(area.height).saturating_sub(4);
+    loop {
+        let height = heading.len()
+            + used.len()
+            + warning.len()
+            + 2
+            + mismatch.len()
+            + spaces
+            + if keep_agent { agent.len() } else { 0 }
+            + if keep_nobody { nobody.len() } else { 0 }
+            + if keep_link { link.len() } else { 0 }
+            + if keep_removes { removes.len() } else { 0 };
+        if height <= budget {
+            break;
+        }
+        if spaces > 0 {
+            spaces -= 1;
+        } else if keep_agent {
+            keep_agent = false;
+        } else if keep_nobody {
+            keep_nobody = false;
+        } else if keep_link {
+            keep_link = false;
+        } else if keep_removes {
+            keep_removes = false;
+        } else if shown > 1 {
+            // Everything that can go has gone: the list of hosts gives way, since
+            // the line to type the name on may not.
+            shown -= 1;
+            used = used_for(shown, cleaner);
+        } else {
+            break;
+        }
+    }
+
+    let mut lines = heading;
+    if spaces > 0 {
+        lines.push(Line::raw(""));
+    }
+    lines.extend(used);
+    if keep_nobody {
+        lines.extend(nobody);
+    }
+    lines.extend(warning);
+    if keep_removes {
+        lines.extend(removes);
+    }
+    if keep_link {
+        lines.extend(link);
+    }
+    if keep_agent {
+        lines.extend(agent);
+    }
+    if spaces > 1 {
+        lines.push(Line::raw(""));
+    }
+    lines.push(prompt);
+    let cursor = (2 + column, lines.len());
+    lines.push(input);
+    lines.extend(mismatch);
+    (lines, cursor)
+}
+
+/// The question asked once a key was sent: use it for that host from now on?
+///
+/// It says what would change, and, when the host has a key file already, that it
+/// is replaced. On a small terminal the spaces go first and then the explanation
+/// from its end, and never that replacement or how to answer.
+fn use_key_lines(
+    question: &UseKeyQuestion,
+    area: Rect,
+    cleaner: &mut Cleaner,
+) -> Vec<Line<'static>> {
+    // A popup is at most this wide, less its border and padding.
+    let width = usize::from(area.width.saturating_sub(2))
+        .min(64)
+        .saturating_sub(4)
+        .max(1);
+    let host = &question.host;
+    let heading = labeled_lines(
+        "",
+        Style::new(),
+        &format!("Use this key for '{host}' from now on?"),
+        width,
+        cleaner,
+    );
+    let mut explanation = labeled_lines(
+        "",
+        Style::new(),
+        &format!(
+            "'{}' was just sent to '{host}'. To use it, Bifrost sets the host's identity file to \
+             {}, so ssh offers only that key when you connect to it.",
+            question.key, question.value
+        ),
+        width,
+        cleaner,
+    );
+    let replaces = question
+        .replaces
+        .as_deref()
+        .map(|old| {
+            labeled_lines(
+                "",
+                Style::new(),
+                &format!("This replaces {old}, which the host uses now."),
+                width,
+                cleaner,
+            )
+        })
+        .unwrap_or_default();
+    let answer = Line::raw("Press y to use it, or n to leave the host as it is.");
+
+    let budget = usize::from(area.height).saturating_sub(4);
+    let mut spaces = 2;
+    let total = |spaces: usize, explanation: &[Line<'static>]| {
+        heading.len() + explanation.len() + replaces.len() + 1 + spaces
+    };
+    while total(spaces, &explanation) > budget && spaces > 0 {
+        spaces -= 1;
+    }
+    while total(spaces, &explanation) > budget && !explanation.is_empty() {
+        explanation.pop();
+    }
+
+    let mut lines = heading;
+    if spaces > 0 {
+        lines.push(Line::raw(""));
+    }
+    lines.extend(explanation);
+    lines.extend(replaces);
+    if spaces > 1 {
+        lines.push(Line::raw(""));
+    }
+    lines.push(answer);
+    lines
 }
 
 /// The width of the labels in the confirmation of sending a key.
@@ -655,6 +892,12 @@ pub(super) fn render(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) ->
     let generate = screen
         .generating()
         .map(|form| generate_lines(form, theme, area.width, &mut cleaner));
+    let delete = screen
+        .deleting()
+        .map(|question| delete_lines(question, theme, area, &mut cleaner));
+    let use_key = screen
+        .using()
+        .map(|question| use_key_lines(question, area, &mut cleaner));
     let copy = screen
         .copying()
         .map(|dialog| copy_lines(dialog, screen, theme, area, &mut cleaner));
@@ -745,6 +988,13 @@ pub(super) fn render(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) ->
     }
     if let Some((lines, (column, row))) = generate {
         let inner = render_popup(frame, area, "New key", lines, theme);
+        place_cursor(frame, inner, column, row);
+    }
+    if let Some(lines) = use_key {
+        render_popup(frame, area, "Use this key?", lines, theme);
+    }
+    if let Some((lines, (column, row))) = delete {
+        let inner = render_popup(frame, area, "Delete key", lines, theme);
         place_cursor(frame, inner, column, row);
     }
     let mut copy_rows = 0;
@@ -1654,5 +1904,453 @@ mod tests {
             "{}",
             screen_text(&terminal)
         );
+    }
+
+    // ---- the question about using a key that was sent ------------------------------
+
+    /// The keys screen just after the key `key_name` was sent to `db`, which has
+    /// `identity_file` (or none).
+    fn after_sending(key_name: &str, identity_file: Option<&str>) -> App {
+        let mut db = host("db", "192.0.2.2");
+        db.identity_file = identity_file.map(str::to_string);
+        let mut snapshot = typical();
+        snapshot.keys[0].name = key_name.to_string();
+        let mut app = on_keys_with_hosts(vec![db], snapshot);
+        app.handle_key(key('c'));
+        app.handle_key(key_of(KeyCode::Enter));
+        app.handle_key(key('y'));
+        let request = app.take_request().unwrap();
+        assert!(matches!(request, Request::CopyKey { .. }));
+        app.handle_response(
+            &request,
+            Response::KeyCopied(crate::tui::app::HandoverResult::Ran(
+                crate::ssh::connect::Outcome {
+                    exit: crate::ssh::connect::Exit::Code(0),
+                    stderr: Vec::new(),
+                    interrupted: false,
+                },
+            )),
+        );
+        app
+    }
+
+    #[test]
+    fn the_question_names_the_key_the_host_and_what_will_be_set() {
+        let mut app = after_sending("id_ed25519_homelab", None);
+        let text = text_of(&mut app, 100, 30);
+        let words = flat(&text);
+        for expected in [
+            "Use this key?",
+            "Use this key for 'db' from now on?",
+            "'id_ed25519_homelab' was just sent to 'db'.",
+            "sets the host's identity file to ~/.ssh/id_ed25519_homelab",
+            "ssh offers only that key when you connect to it.",
+            "Press y to use it, or n to leave the host as it is.",
+        ] {
+            assert!(words.contains(expected), "{expected}:\n{text}");
+        }
+        assert!(
+            !words.contains("replaces"),
+            "a host with no key replaces nothing:\n{text}"
+        );
+        let footer = text.lines().last().unwrap();
+        assert!(
+            footer.contains("y use it") && footer.contains("n/Esc leave it"),
+            "{footer}"
+        );
+        // What was just said stays at the bottom, above the footer.
+        assert!(
+            words.contains("Sent the public key of 'id_ed25519_homelab' to 'db'."),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_host_with_another_key_is_told_what_would_be_replaced() {
+        let mut app = after_sending("id_ed25519_homelab", Some("~/.ssh/old_key"));
+        let words = flat(&text_of(&mut app, 100, 30));
+        assert!(
+            words.contains("This replaces ~/.ssh/old_key, which the host uses now."),
+            "{words}"
+        );
+    }
+
+    #[test]
+    fn on_the_smallest_terminal_the_question_keeps_the_replacement_and_the_answer() {
+        for identity in [None, Some("~/.ssh/old_key_with_a_rather_long_name_indeed")] {
+            for key_name in [
+                "id_ed25519_homelab",
+                "a-key-with-a-very-long-file-name-of-sixty-four-chars-x",
+            ] {
+                let mut app = after_sending(key_name, identity);
+                let text = text_of(&mut app, 60, 15);
+                let words = flat(&text);
+                assert!(
+                    words.contains("Press y to use it, or n to leave the host as it is."),
+                    "{key_name} {identity:?}:\n{text}"
+                );
+                assert!(words.contains("Use this key for 'db'"), "{text}");
+                if identity.is_some() {
+                    assert!(words.contains("This replaces"), "{text}");
+                }
+                for line in text.lines() {
+                    assert!(display_width(line) <= 60, "{line}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_key_name_from_outside_in_the_question_is_cleaned() {
+        // A bidi override passes the checks for a path, and must not be drawn. (A
+        // host's own identity file with one never gets here: ssh is not given it.)
+        let mut app = after_sending("evil\u{202e}key", None);
+        let terminal = draw(&mut app, 100, 30);
+        for cell in terminal.backend().buffer().content() {
+            assert!(
+                !cell.symbol().chars().any(crate::sanitize::is_unsafe_char),
+                "{:?}",
+                cell.symbol()
+            );
+        }
+        let text = screen_text(&terminal);
+        assert!(text.contains("evil"), "{text}");
+        assert!(
+            flat(&text).contains("non-printable characters were hidden"),
+            "the footer says so:\n{text}"
+        );
+    }
+
+    #[test]
+    fn the_answer_line_does_not_depend_on_color() {
+        let mut app = after_sending("id_ed25519_homelab", None);
+        let terminal = draw_with(&mut app, &Theme::plain(), 100, 30).0;
+        let text = screen_text(&terminal);
+        assert!(flat(&text).contains("Press y to use it"), "{text}");
+        assert!(text.contains("y use it"), "{text}");
+    }
+
+    // ---- the question before deleting a key -------------------------------------------
+
+    fn question(used_by: &[&str]) -> DeleteQuestion {
+        DeleteQuestion {
+            key: "id_ed25519_homelab".to_string(),
+            private: "/home/dev/.ssh/id_ed25519_homelab".to_string(),
+            public: "/home/dev/.ssh/id_ed25519_homelab.pub".to_string(),
+            symlink: false,
+            used_by: used_by.iter().map(|name| (*name).to_string()).collect(),
+            loaded: false,
+            input: crate::tui::input::TextInput::default(),
+            mismatch: false,
+        }
+    }
+
+    /// The popup's own text, with its wraps and indents made single spaces.
+    fn popup_text(
+        question: &DeleteQuestion,
+        width: u16,
+        height: u16,
+    ) -> (String, Vec<String>, (usize, usize)) {
+        let (lines, cursor) = delete_lines(
+            question,
+            &Theme::ansi16(),
+            Rect::new(0, 0, width, height),
+            &mut Cleaner::default(),
+        );
+        let rows: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        (
+            rows.join(" ")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "),
+            rows,
+            cursor,
+        )
+    }
+
+    const WARNING: &str = "Bifrost cannot know which servers have this key in their authorized_keys. \
+        Deleting it means losing access to those servers until another key is installed.";
+
+    #[test]
+    fn the_question_says_plainly_that_the_servers_cannot_be_known_and_access_is_lost() {
+        for (used, width, height) in [
+            (vec![], 100, 30),
+            (vec!["db"], 100, 30),
+            (vec!["db", "web"], 80, 24),
+            (vec!["db"], 60, 15),
+            (vec![], 60, 15),
+        ] {
+            let (text, _, _) = popup_text(&question(&used), width, height);
+            assert!(
+                text.contains(WARNING),
+                "{used:?} at {width}x{height}: {text}"
+            );
+            assert!(
+                text.contains("Delete the key 'id_ed25519_homelab'?"),
+                "{text}"
+            );
+            assert!(text.contains("Type the key's name to confirm:"), "{text}");
+        }
+    }
+
+    #[test]
+    fn the_hosts_that_use_the_key_are_listed_before_asking_and_no_host_is_said_too() {
+        let (text, _, _) = popup_text(&question(&["db", "web"]), 100, 30);
+        assert!(
+            text.contains("Used by: db, web. Their key file is this key, and would be gone."),
+            "{text}"
+        );
+        assert!(!text.contains("No saved host"), "{text}");
+        let (none, _, _) = popup_text(&question(&[]), 100, 30);
+        assert!(
+            none.contains("No saved host has this key as its key file."),
+            "{none}"
+        );
+        assert!(!none.contains("Used by"), "{none}");
+    }
+
+    #[test]
+    fn a_long_list_of_hosts_is_cut_with_how_many_more_and_a_small_terminal_cuts_it_further() {
+        let names: Vec<String> = (0..20).map(|n| format!("host{n:02}")).collect();
+        let hosts: Vec<&str> = names.iter().map(String::as_str).collect();
+        let (text, _, _) = popup_text(&question(&hosts), 100, 40);
+        assert!(
+            text.contains(
+                "host00, host01, host02, host03, host04, host05, host06, host07 and 12 more."
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("host08"), "{text}");
+        // The most demanding case at the smallest size: everything that must be said
+        // and a mismatch error, with the list giving way and not the line to type on.
+        let mut hard = question(&hosts);
+        hard.mismatch = true;
+        hard.loaded = true;
+        hard.symlink = true;
+        let (text, rows, (col, row)) = popup_text(&hard, 60, 15);
+        assert!(rows.len() <= 11, "{} rows: {rows:#?}", rows.len());
+        assert!(text.contains(WARNING), "{text}");
+        assert!(text.contains("Type the key's name to confirm:"), "{text}");
+        assert!(
+            text.contains("Error: That is not the key's name."),
+            "{text}"
+        );
+        assert!(
+            text.contains("host00") && text.contains("more."),
+            "some hosts, and how many more: {text}"
+        );
+        assert!(
+            rows[row].starts_with("> "),
+            "the cursor is on the line to type on: {rows:#?}"
+        );
+        assert_eq!(col, 2);
+    }
+
+    #[test]
+    fn what_is_only_helpful_goes_first_when_there_is_no_room_and_stays_when_there_is() {
+        let mut full = question(&["db"]);
+        full.loaded = true;
+        full.symlink = true;
+        let (roomy, rows, _) = popup_text(&full, 100, 40);
+        for present in [
+            "This removes /home/dev/.ssh/id_ed25519_homelab and /home/dev/.ssh/id_ed25519_homelab.pub.",
+            "It is a symbolic link: only the link is removed, and the file it points to stays.",
+            "The agent holds this key and keeps holding it until it is restarted or you run ssh-add -d.",
+        ] {
+            assert!(roomy.contains(present), "{present}: {roomy}");
+        }
+        assert!(
+            rows.iter().any(String::is_empty),
+            "spaced out when there is room"
+        );
+
+        let (tight, _, _) = popup_text(&full, 60, 15);
+        assert!(
+            !tight.contains("The agent holds"),
+            "the agent note went first: {tight}"
+        );
+        assert!(tight.contains("Used by: db"), "the hosts stay: {tight}");
+        assert!(tight.contains(WARNING), "the warning stays: {tight}");
+    }
+
+    #[test]
+    fn the_optional_lines_go_in_a_fixed_order_as_the_room_shrinks() {
+        // The agent note first, then the link note, then which files are removed: at
+        // any height, a line that is there means the ones that go after it are too.
+        let mut full = question(&["db"]);
+        full.loaded = true;
+        full.symlink = true;
+        for width in [60, 100] {
+            let mut seen = Vec::new();
+            for height in 10..=40 {
+                let (text, _, _) = popup_text(&full, width, height);
+                assert!(text.contains(WARNING), "{width}x{height}: {text}");
+                let present = (
+                    text.contains("The agent holds"),
+                    text.contains("It is a symbolic link"),
+                    text.contains("This removes"),
+                );
+                assert!(
+                    !present.0 || present.1,
+                    "the agent note stays only with the link note, {width}x{height}: {text}"
+                );
+                assert!(
+                    !present.1 || present.2,
+                    "the link note stays only with the files, {width}x{height}: {text}"
+                );
+                seen.push(present);
+            }
+            // The test would mean nothing if the lines were never dropped one at a time.
+            assert!(seen.contains(&(false, true, true)), "{width}: {seen:?}");
+            assert!(seen.contains(&(false, false, true)), "{width}: {seen:?}");
+            assert!(seen.contains(&(false, false, false)), "{width}: {seen:?}");
+            assert!(seen.contains(&(true, true, true)), "{width}: {seen:?}");
+        }
+    }
+
+    #[test]
+    fn however_little_room_there_is_at_least_one_host_is_named() {
+        let names: Vec<String> = (0..20).map(|n| format!("host{n:02}")).collect();
+        let hosts: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut hard = question(&hosts);
+        hard.mismatch = true;
+        hard.loaded = true;
+        hard.symlink = true;
+        for height in 6..=15 {
+            let (text, _, _) = popup_text(&hard, 60, height);
+            assert!(
+                text.contains("Used by: host00"),
+                "a list that names nobody says nothing, at height {height}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_cursor_is_on_the_line_to_type_on_after_what_was_typed() {
+        let mut q = question(&["db"]);
+        q.input = crate::tui::input::TextInput::new("id_ed");
+        let (_, rows, (col, row)) = popup_text(&q, 100, 30);
+        assert_eq!(rows[row], "> id_ed");
+        assert_eq!(col, 2 + 5);
+    }
+
+    fn delete_app(hosts_list: Vec<crate::domain::Host>, select: usize) -> App {
+        let mut app = on_keys_with_hosts(hosts_list, typical());
+        for _ in 0..select {
+            app.handle_key(key('j'));
+        }
+        app.handle_key(key('D'));
+        app
+    }
+
+    #[test]
+    fn on_screen_the_question_shows_the_footer_and_puts_the_cursor_after_the_typed_name() {
+        let mut db = host("db", "192.0.2.2");
+        db.identity_file = Some("~/.ssh/id_ed25519_homelab".to_string());
+        let mut app = delete_app(vec![db], 0);
+        for c in "id_ed".chars() {
+            app.handle_key(key(c));
+        }
+        let mut terminal = draw(&mut app, 100, 30);
+        let text = screen_text(&terminal);
+        assert!(text.contains("Delete key"), "{text}");
+        assert!(
+            text.contains("Delete the key 'id_ed25519_homelab'?"),
+            "{text}"
+        );
+        assert!(text.contains("Used by: db"), "{text}");
+        let footer = text.lines().last().unwrap();
+        assert!(
+            footer.contains("Type the key's name")
+                && footer.contains("Enter delete")
+                && footer.contains("Esc cancel"),
+            "{footer}"
+        );
+        let cursor = terminal.get_cursor_position().unwrap();
+        let row = text.lines().nth(usize::from(cursor.y)).unwrap();
+        assert!(
+            row.contains("> id_ed"),
+            "the cursor is on the typing line: {row}"
+        );
+        let start = row.find("> id_ed").unwrap();
+        assert_eq!(
+            usize::from(cursor.x),
+            row[..start].chars().count() + "> id_ed".len()
+        );
+    }
+
+    #[test]
+    fn on_the_smallest_terminal_the_question_keeps_the_warning_and_the_line_to_type_on() {
+        for (select, used) in [(0, true), (1, false)] {
+            let mut db = host("db", "192.0.2.2");
+            if used {
+                db.identity_file = Some("~/.ssh/id_ed25519_homelab".to_string());
+            }
+            let mut app = delete_app(vec![db], select);
+            app.handle_key(key_of(KeyCode::Enter)); // a mismatch: the error line is there too
+            let terminal = draw(&mut app, 60, 15);
+            let text = screen_text(&terminal);
+            assert!(text.contains("Type the key's name to confirm:"), "{text}");
+            assert!(
+                text.contains("Error: That is not the key's name."),
+                "{text}"
+            );
+            assert!(text.contains("Bifrost cannot know which servers"), "{text}");
+            assert!(
+                text.contains("another key is installed."),
+                "the whole warning: {text}"
+            );
+            for line in text.lines() {
+                assert!(display_width(line) <= 60, "{line}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_key_name_and_what_is_typed_are_cleaned_and_the_footer_says_so() {
+        let mut snapshot = typical();
+        snapshot.keys[0].name = "evil\u{202e}key".to_string();
+        let mut app = on_keys_with_hosts(vec![host("db", "192.0.2.2")], snapshot);
+        app.handle_key(key('D'));
+        for c in "ty\u{2066}ped".chars() {
+            app.handle_key(key(c));
+        }
+        let terminal = draw(&mut app, 100, 30);
+        for cell in terminal.backend().buffer().content() {
+            assert!(
+                !cell.symbol().chars().any(crate::sanitize::is_unsafe_char),
+                "{:?}",
+                cell.symbol()
+            );
+        }
+        assert!(
+            flat(&screen_text(&terminal)).contains("non-printable characters were hidden"),
+            "{}",
+            screen_text(&terminal)
+        );
+    }
+
+    #[test]
+    fn the_result_of_deleting_is_shown_cleaned_like_every_message() {
+        let mut app = on_keys_with_hosts(vec![host("db", "192.0.2.2")], typical());
+        app.handle_response(
+            &Request::DeleteKey {
+                file_name: "x".to_string(),
+            },
+            Response::KeyDeleted(Err("boom \x1b[31m\u{202e}bad".to_string())),
+        );
+        let terminal = draw(&mut app, 100, 30);
+        for cell in terminal.backend().buffer().content() {
+            assert!(!cell.symbol().chars().any(crate::sanitize::is_unsafe_char));
+        }
+        assert!(screen_text(&terminal).contains("Error: boom"));
     }
 }

@@ -10,10 +10,10 @@ use super::{
     Cleaner, footer_lines, input_window, labeled_lines, page_block, render_chrome, split_chrome,
 };
 use crate::tui::app::{App, Metrics};
-use crate::tui::form::{AGENT_WARNING, Form, FormField, FormMode, Picker};
+use crate::tui::form::{AGENT_WARNING, Form, FormField, FormMode, KeyPick, KeyPicker, Picker};
 use crate::tui::list::window_start;
 use crate::tui::theme::Theme;
-use crate::tui::wrap::{truncate, wrap};
+use crate::tui::wrap::{display_width, pad, truncate, wrap};
 
 /// Marker, space, then the label padded to this many cells.
 const LABEL_WIDTH: usize = 14;
@@ -205,6 +205,91 @@ fn picker_lines(
         .collect()
 }
 
+/// The widest a key's name is allowed to be in the list of keys.
+const KEY_NAME_WIDTH: usize = 24;
+
+/// The list of key files: each key with its type, "none" and "another file", and
+/// under it what is worth saying about the list. `height` is how many lines the
+/// popup has room for.
+fn key_picker_lines(
+    picker: &KeyPicker,
+    theme: &Theme,
+    cleaner: &mut Cleaner,
+    width: usize,
+    height: usize,
+) -> Vec<Line<'static>> {
+    let note: Vec<Line<'static>> = picker
+        .note
+        .as_deref()
+        .map(|note| {
+            let mut lines = vec![Line::raw("")];
+            lines.extend(
+                wrap(&cleaner.clean(note), width.max(1))
+                    .into_iter()
+                    .map(|piece| Line::styled(piece, theme.muted)),
+            );
+            lines
+        })
+        .unwrap_or_default();
+    // The note is what explains an empty list, so it keeps its room and the list
+    // is what gives way.
+    let rows = height.saturating_sub(note.len()).max(3);
+    let rows = rows.min(picker.options.len());
+
+    let names: Vec<String> = picker
+        .options
+        .iter()
+        .map(|option| match option {
+            KeyPick::None => "(none)".to_string(),
+            KeyPick::Key(choice) => cleaner.clean(&choice.name).into_owned(),
+            KeyPick::Typed => "Another file".to_string(),
+        })
+        .collect();
+    let name_width = names
+        .iter()
+        .map(|name| display_width(name))
+        .max()
+        .unwrap_or(0)
+        .min(KEY_NAME_WIDTH);
+    let start = window_start(0, Some(picker.selected), rows, picker.options.len());
+
+    let mut lines: Vec<Line<'static>> = picker
+        .options
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(rows)
+        .map(|(index, option)| {
+            let detail = match option {
+                KeyPick::None => "ssh uses its default keys".to_string(),
+                KeyPick::Key(choice) => choice
+                    .kind
+                    .clone()
+                    .unwrap_or_else(|| "type unknown".to_string()),
+                KeyPick::Typed => match &picker.typed {
+                    Some(path) => format!("keeps {}", cleaner.clean(path)),
+                    None => "type a path yourself".to_string(),
+                },
+            };
+            let name = truncate(&names[index], name_width).0;
+            let selected = index == picker.selected;
+            let text = format!(
+                "{}{}  {}",
+                if selected { "> " } else { "  " },
+                pad(&name, name_width),
+                truncate(&detail, width.saturating_sub(name_width + 4)).0
+            );
+            if selected {
+                Line::styled(pad(&text, width), theme.selected)
+            } else {
+                Line::raw(text)
+            }
+        })
+        .collect();
+    lines.extend(note);
+    lines
+}
+
 pub(super) fn render(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) -> Metrics {
     let Some(form) = app.form() else {
         return Metrics::default();
@@ -231,6 +316,20 @@ pub(super) fn render(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) ->
         .unwrap_or_default();
     let help = help_lines(form.focus(), inner_width, theme);
     let title = cleaner.clean(&form.title()).into_owned();
+
+    // Built before the footer: what it cleans is counted in what the footer says.
+    let key_popup = match form.mode() {
+        FormMode::PickKey(picker) => {
+            // A popup is at most this wide, less its border and padding.
+            let width = usize::from(area.width.saturating_sub(2))
+                .min(64)
+                .saturating_sub(4)
+                .max(1);
+            let height = usize::from(area.height).saturating_sub(4).max(1);
+            Some(key_picker_lines(picker, theme, &mut cleaner, width, height))
+        }
+        _ => None,
+    };
 
     let footer = footer_lines(
         &app.footer_hints(),
@@ -290,6 +389,15 @@ pub(super) fn render(app: &App, theme: &Theme, frame: &mut Frame, area: Rect) ->
             let room = usize::from(area.height).saturating_sub(6).max(1);
             let lines = picker_lines(picker, theme, &mut cleaner, room.min(picker.options.len()));
             render_popup(frame, area, "Jump host", lines, theme);
+        }
+        FormMode::PickKey(_) => {
+            render_popup(
+                frame,
+                area,
+                "Key file",
+                key_popup.unwrap_or_default(),
+                theme,
+            );
         }
         FormMode::ConfirmDiscard => {
             let lines = vec![
@@ -764,5 +872,202 @@ mod tests {
             }
             tab(&mut app, 1);
         }
+    }
+
+    // ---- the list of key files ---------------------------------------------------
+
+    fn flat_words(text: &str) -> String {
+        text.split_whitespace()
+            .filter(|word| !word.chars().all(|c| "│┌┐└┘─".contains(c)))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// An add form on the identity file, with these keys' names and types listed
+    /// (`None` for a key whose type could not be read).
+    fn key_list_app(keys: Vec<(&str, Option<&str>)>, snapshot_note: bool) -> App {
+        use crate::ssh::keys::Permissions;
+        use crate::tui::effects::{Request, Response};
+        use crate::tui::keys::testing::{entry, snapshot};
+        let mut app = app_with(vec![Host::new("web", "192.0.2.1")], Vec::new());
+        app.handle_key(key('a'));
+        tab(&mut app, 4);
+        app.handle_key(press(KeyCode::Enter));
+        let request = app.take_request().unwrap();
+        assert_eq!(request, Request::ListKeys);
+        let entries = keys
+            .into_iter()
+            .map(|(name, kind)| {
+                let mut key = entry(name, Permissions::Fine, false);
+                match kind {
+                    Some(kind) => {
+                        if let Ok(found) = &mut key.fingerprint {
+                            let (name, bits) = kind.split_once(' ').unwrap_or((kind, "256"));
+                            found.key_type = name.to_uppercase();
+                            found.bits = bits.parse().unwrap_or(256);
+                        }
+                    }
+                    None => key.fingerprint = Err("ssh-keygen could not read it".to_string()),
+                }
+                key
+            })
+            .collect();
+        let mut snap = snapshot(entries);
+        snap.missing_dir = snapshot_note;
+        app.handle_response(&request, Response::KeyList(snap));
+        app
+    }
+
+    #[test]
+    fn the_list_shows_none_each_key_with_its_type_and_another_file() {
+        let mut app = key_list_app(
+            vec![
+                ("id_ed25519", Some("ed25519")),
+                ("id_rsa_old", Some("rsa 3072")),
+                ("odd", None),
+            ],
+            false,
+        );
+        let text = text_of(&mut app, 100, 30);
+        assert!(text.contains("Key file"), "{text}");
+        let words = flat_words(&text);
+        for expected in [
+            "> (none) ssh uses its default keys",
+            "id_ed25519 ed25519",
+            "id_rsa_old rsa 3072",
+            "odd type unknown",
+            "Another file type a path yourself",
+        ] {
+            assert!(words.contains(expected), "{expected}:\n{text}");
+        }
+        let footer = text.lines().last().unwrap();
+        assert!(
+            footer.contains("Up/Down j/k move")
+                && footer.contains("Enter choose")
+                && footer.contains("Esc close"),
+            "{footer}"
+        );
+    }
+
+    #[test]
+    fn the_selection_marker_follows_the_choice_and_a_typed_path_is_kept_in_view() {
+        let mut app = key_list_app(vec![("id_ed25519", Some("ed25519"))], false);
+        app.handle_key(key('j'));
+        assert!(flat_words(&text_of(&mut app, 100, 30)).contains("> id_ed25519 ed25519"));
+        app.handle_key(press(KeyCode::Esc));
+        type_text(&mut app, "/elsewhere/key");
+        app.handle_key(press(KeyCode::Enter));
+        let words = flat_words(&text_of(&mut app, 100, 30));
+        assert!(
+            words.contains("> Another file keeps /elsewhere/key"),
+            "{words}"
+        );
+    }
+
+    #[test]
+    fn with_no_keys_the_list_says_what_to_do_about_it() {
+        let mut app = key_list_app(Vec::new(), false);
+        let words = flat_words(&text_of(&mut app, 100, 30));
+        assert!(
+            words.contains("(none)") && words.contains("Another file"),
+            "{words}"
+        );
+        assert!(
+            words.contains("There are no key pairs in /home/dev/.ssh. Make one from the keys screen (K, then g)"),
+            "{words}"
+        );
+        let mut missing = key_list_app(Vec::new(), true);
+        assert!(flat_words(&text_of(&mut missing, 100, 30)).contains("does not exist yet"));
+    }
+
+    #[test]
+    fn on_the_smallest_terminal_the_list_keeps_every_choice_and_its_note() {
+        let mut app = key_list_app(Vec::new(), false);
+        let text = text_of(&mut app, 60, 15);
+        let words = flat_words(&text);
+        for expected in [
+            "(none)",
+            "Another file",
+            "There are no key pairs",
+            "Another file and type a path.",
+        ] {
+            assert!(words.contains(expected), "{expected}:\n{text}");
+        }
+        for line in text.lines() {
+            assert!(display_width(line) <= 60, "{line}");
+        }
+    }
+
+    #[test]
+    fn many_keys_scroll_with_the_choice_and_the_last_ones_are_reachable() {
+        let names: Vec<String> = (0..30).map(|n| format!("key{n:02}")).collect();
+        let mut app = key_list_app(
+            names
+                .iter()
+                .map(|n| (n.as_str(), Some("ed25519")))
+                .collect(),
+            false,
+        );
+        draw(&mut app, 60, 15);
+        for _ in 0..40 {
+            app.handle_key(key('j'));
+            draw(&mut app, 60, 15);
+        }
+        let words = flat_words(&text_of(&mut app, 60, 15));
+        assert!(
+            words.contains("> Another file"),
+            "the last choice is selected and shown: {words}"
+        );
+        assert!(
+            !words.contains("key00"),
+            "the first ones scrolled away: {words}"
+        );
+    }
+
+    #[test]
+    fn key_names_from_outside_are_cleaned_and_the_footer_says_so() {
+        // A name with control characters never gets this far (the form refuses
+        // the path it would give), but a bidirectional override is not a control
+        // character, so it can, and must not be drawn.
+        let mut app = key_list_app(vec![("evil\u{202e}key", Some("ed25519"))], false);
+        let terminal = draw(&mut app, 100, 30);
+        for cell in terminal.backend().buffer().content() {
+            assert!(
+                !cell.symbol().chars().any(crate::sanitize::is_unsafe_char),
+                "{:?}",
+                cell.symbol()
+            );
+        }
+        let text = screen_text(&terminal);
+        assert!(text.contains("evil"), "still shown, cleaned:\n{text}");
+        assert!(
+            flat_words(&text).contains("non-printable characters were hidden"),
+            "and the footer says so:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_key_whose_name_has_control_characters_is_not_offered_at_all() {
+        let mut app = key_list_app(
+            vec![
+                ("fine", Some("ed25519")),
+                ("evil\x1b]0;pwned\x07key", Some("ed25519")),
+            ],
+            false,
+        );
+        let text = text_of(&mut app, 100, 30);
+        assert!(flat_words(&text).contains("fine ed25519"), "{text}");
+        assert!(!text.contains("evil"), "{text}");
+        assert!(!text.contains("pwned"), "{text}");
+    }
+
+    #[test]
+    fn the_identity_file_row_shows_what_was_chosen() {
+        let mut app = key_list_app(vec![("id_ed25519", Some("ed25519"))], false);
+        app.handle_key(key('j'));
+        app.handle_key(press(KeyCode::Enter));
+        let words = flat_words(&text_of(&mut app, 100, 30));
+        assert!(words.contains("Identity file ~/.ssh/id_ed25519"), "{words}");
+        assert!(!words.contains("Key file"), "the list is closed: {words}");
     }
 }

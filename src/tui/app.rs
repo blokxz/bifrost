@@ -7,11 +7,15 @@
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use super::effects::{Request, Response};
-use super::form::{Form, FormField, FormMode, Outcome};
+use super::effects::{ExportDone, ExportPlan, ImportPreview, Request, Response};
+use super::form::{Form, FormField, FormMode, KeyChoice, KeyList, Outcome};
 use super::input::TextInput;
-use super::keys::{Copying, FixOutcome, Generation, HostChoice, KeysScreen};
+use super::keys::{
+    Copying, DeleteQuestion, Deletion, FixOutcome, Generation, HostChoice, KeysScreen,
+    UseKeyQuestion,
+};
 use super::list::{self, ListState, Row};
+use super::sshconfig::{SshConfigScreen, Stage};
 use super::startup::{Library, Notice, Startup};
 use crate::domain::validate::{self, Field};
 use crate::domain::{Hosts, HostsError, ValidationError};
@@ -22,8 +26,11 @@ use crate::ssh::command::{
 };
 use crate::ssh::connect::{Exit, Outcome as SshOutcome};
 use crate::ssh::diagnose::{FailureKind, Verdict, classify, host_key_change};
+use crate::ssh::export::TargetState;
 use crate::ssh::keygen::Removal;
-use crate::ssh::keys::{KeysSnapshot, Permissions};
+use crate::ssh::keys::{
+    Deleted, Fingerprint, KeysSnapshot, Permissions, identity_file_value, names_this_key,
+};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 
@@ -47,6 +54,8 @@ pub enum Screen {
     SshOutput,
     /// The user's ssh keys, and whether the agent holds them.
     Keys,
+    /// Importing from the user's ssh config and exporting Bifrost's hosts to one.
+    SshConfig,
 }
 
 /// What the keys do on the list screen.
@@ -256,6 +265,10 @@ pub const HELP: &[HelpSection] = &[
             row("Enter", "Connect to the selected host"),
             row("/", "Search the hosts"),
             row("K", "Show your ssh keys and what the agent holds"),
+            row(
+                "s",
+                "Import hosts from your ssh config, or export yours to an ssh config file",
+            ),
             row("o", "Read what ssh printed during the last connection"),
             row("a", "Add a host"),
             row("e", "Edit the selected host"),
@@ -318,11 +331,47 @@ pub const HELP: &[HelpSection] = &[
                 "c",
                 "Send the selected key's public key to a saved host, after you choose one \
                  and confirm. It is added to ~/.ssh/authorized_keys there. ssh asks for the \
-                 password itself",
+                 password itself. Afterwards Bifrost asks whether to use the key for that host \
+                 from now on (y to set the host's identity file, n to leave it)",
+            ),
+            row(
+                "D",
+                "Delete the selected key: its private file and its .pub, and nothing else. \
+                 Saved hosts that use it are listed first. Bifrost cannot know which servers \
+                 have the key, so deleting it can cost you access to them",
+            ),
+            row(
+                "Type",
+                "In that question, the key's name exactly, then Enter. Esc cancels",
             ),
             row("r", "Read the keys and ask the agent again"),
             row("?", "Open this help, then come back here"),
             row("Esc", "Back to the host list"),
+        ],
+    },
+    HelpSection {
+        title: "Your ssh config",
+        rows: &[
+            row(
+                "i",
+                "Read your ~/.ssh/config and show what importing it would add. Nothing is \
+                 saved until you confirm",
+            ),
+            row(
+                "e",
+                "Show where your hosts would be written as an ssh config file, and how many",
+            ),
+            row(
+                "y",
+                "Confirm: import the hosts shown, or write the file. Nothing else confirms",
+            ),
+            row("n/Esc", "Cancel the question and go back"),
+            row("Up/Down j/k", "Scroll a long list"),
+            row(
+                "Esc",
+                "Back. Bifrost never edits your ~/.ssh/config: after an export it shows the \
+                 line to add yourself",
+            ),
         ],
     },
     HelpSection {
@@ -362,7 +411,8 @@ pub const HELP: &[HelpSection] = &[
             ),
             row(
                 "Enter",
-                "Next field. On Jump host it opens the list; on Advanced it shows or hides the section",
+                "Next field. On Identity file and on Jump host it opens a list to choose from; on \
+                 Advanced it shows or hides the section",
             ),
             row("Space", "Turn Forward agent on or off"),
             row(
@@ -371,6 +421,20 @@ pub const HELP: &[HelpSection] = &[
             ),
             row("Esc", "Cancel. Asks first if there are unsaved changes"),
             row("y/n", "Answer the question about discarding changes"),
+        ],
+    },
+    HelpSection {
+        title: "Choosing an identity file",
+        rows: &[
+            row(
+                "Up/Down j/k",
+                "Move through your keys, \"none\" and \"Another file\"",
+            ),
+            row(
+                "Enter",
+                "Use the key, or none. Another file goes back to the box to type a path",
+            ),
+            row("Esc", "Close the list and leave the box as it was"),
         ],
     },
     HelpSection {
@@ -422,6 +486,11 @@ pub struct App {
     failure_return: Screen,
     /// The keys screen, once it has been opened.
     keys: Option<KeysScreen>,
+    /// The ssh config screen, while it is open.
+    sshconfig: Option<SshConfigScreen>,
+    sshconfig_scroll: usize,
+    /// `~/.ssh`, when the home directory is known.
+    ssh_dir: Option<PathBuf>,
     /// The key to select once the keys have been read again: the one just made.
     select_key: Option<String>,
     status: Option<Status>,
@@ -455,6 +524,9 @@ impl App {
             help_return: Screen::List,
             failure_return: Screen::List,
             keys: None,
+            sshconfig: None,
+            sshconfig_scroll: 0,
+            ssh_dir: None,
             select_key: None,
             status: None,
             help_scroll: 0,
@@ -529,6 +601,9 @@ impl App {
             (Request::FixKeyPermissions { file_name }, Response::PermissionsFixed(result)) => {
                 self.permissions_fixed(file_name, result);
             }
+            (Request::DeleteKey { file_name }, Response::KeyDeleted(result)) => {
+                self.key_deleted(file_name, result);
+            }
             (Request::GenerateKey { file_name, .. }, Response::KeyGenerated(result)) => {
                 self.key_generated(file_name, result);
             }
@@ -538,6 +613,14 @@ impl App {
             (Request::CopyKey { file_name, connect }, Response::KeyCopied(result)) => {
                 self.key_copied(file_name, &connect.name, result);
             }
+            (Request::ListKeys, Response::KeyList(snapshot)) => self.key_list_loaded(snapshot),
+            (Request::PreviewImport { .. }, Response::ImportPreview(result)) => {
+                self.import_previewed(result);
+            }
+            (Request::PlanExport { .. }, Response::ExportPlan(result)) => {
+                self.export_planned(result);
+            }
+            (Request::Export { .. }, Response::Exported(result)) => self.export_done(result),
             // Whoever carries requests out answers each with its own kind of
             // response; anything else is a mistake there, and the user is told
             // rather than left waiting for a result that will not come.
@@ -553,6 +636,23 @@ impl App {
     /// offered.
     pub fn set_known_hosts_file(&mut self, file: Option<PathBuf>) {
         self.known_hosts_file = file;
+    }
+
+    /// Tells the app where the user's ssh files are (`~/.ssh`), so that the ssh
+    /// config screen can say which files it reads and writes. Until this is set it
+    /// says it does not know.
+    pub fn set_ssh_dir(&mut self, dir: Option<PathBuf>) {
+        self.ssh_dir = dir;
+    }
+
+    /// `~/.ssh`, if it is known.
+    pub fn ssh_dir(&self) -> Option<&std::path::Path> {
+        self.ssh_dir.as_deref()
+    }
+
+    /// The ssh config screen's state, while it is open.
+    pub fn sshconfig(&self) -> Option<&SshConfigScreen> {
+        self.sshconfig.as_ref()
     }
 
     /// What the host key screen shows, while it is the screen.
@@ -598,6 +698,7 @@ impl App {
             Screen::Notices | Screen::List | Screen::Form => self.notices_scroll,
             Screen::ConnectError | Screen::HostKeyChanged => self.error_scroll,
             Screen::SshOutput => self.output_scroll,
+            Screen::SshConfig => self.sshconfig_scroll,
             // The keys list scrolls by selection, not as a page.
             Screen::Keys => 0,
         }
@@ -630,7 +731,16 @@ impl App {
                 hint("o/Esc/Enter", "back"),
                 hint("q", "quit"),
             ],
+            Screen::SshConfig => self.ssh_config_hints(),
             Screen::Keys => match self.keys.as_ref() {
+                Some(keys) if keys.deleting().is_some() => vec![
+                    hint("Type", "the key's name"),
+                    hint("Enter", "delete"),
+                    hint("Esc", "cancel"),
+                ],
+                Some(keys) if keys.using().is_some() => {
+                    vec![hint("y", "use it"), hint("n/Esc", "leave it")]
+                }
                 Some(keys) if keys.copying().is_some_and(|dialog| dialog.confirming()) => {
                     vec![hint("y", "send the key"), hint("n/Esc", "back")]
                 }
@@ -664,6 +774,7 @@ impl App {
                     }
                     if keys.and_then(KeysScreen::selected_entry).is_some() {
                         hints.push(hint("c", "send to host"));
+                        hints.push(hint("D", "delete"));
                     }
                     hints.push(hint("r", "refresh"));
                     hints.push(hint("?", "help"));
@@ -699,6 +810,11 @@ impl App {
                     hint("Enter", "choose"),
                     hint("Esc", "close"),
                 ],
+                Some((FormMode::PickKey(_), _)) => vec![
+                    hint("Up/Down j/k", "move"),
+                    hint("Enter", "choose"),
+                    hint("Esc", "close"),
+                ],
                 Some((FormMode::ConfirmDiscard, _)) => {
                     vec![hint("y", "discard"), hint("n", "keep editing")]
                 }
@@ -706,6 +822,7 @@ impl App {
                     let mut hints = vec![hint("Tab/Shift+Tab", "move"), hint("Ctrl+S", "save")];
                     match other.map(|(_, focus)| focus) {
                         Some(FormField::ProxyJump) => hints.push(hint("Enter", "choose")),
+                        Some(FormField::IdentityFile) => hints.push(hint("Enter", "choose a key")),
                         Some(FormField::Advanced) => hints.push(hint("Enter", "show/hide")),
                         Some(FormField::ForwardAgent) => hints.push(hint("Space", "toggle")),
                         _ => {}
@@ -743,6 +860,7 @@ impl App {
                         hint("f", "favorite"),
                         hint("c", "copy"),
                         hint("K", "keys"),
+                        hint("s", "ssh config"),
                     ];
                     if self.has_output() {
                         hints.push(hint("o", "ssh output"));
@@ -809,6 +927,7 @@ impl App {
             Screen::SshOutput => self.output_key(key),
             Screen::HostKeyChanged => self.host_key_key(key),
             Screen::Keys => self.keys_key(key),
+            Screen::SshConfig => self.ssh_config_key(key),
         }
     }
 
@@ -835,6 +954,7 @@ impl App {
             Screen::Notices | Screen::List => Some(&mut self.notices_scroll),
             Screen::ConnectError | Screen::HostKeyChanged => Some(&mut self.error_scroll),
             Screen::SshOutput => Some(&mut self.output_scroll),
+            Screen::SshConfig => Some(&mut self.sshconfig_scroll),
             Screen::Form | Screen::Keys => None,
         }
     }
@@ -866,6 +986,7 @@ impl App {
             Screen::Notices => self.notices_scroll = 0,
             Screen::ConnectError | Screen::HostKeyChanged => self.error_scroll = 0,
             Screen::SshOutput => self.output_scroll = 0,
+            Screen::SshConfig => self.sshconfig_scroll = 0,
             Screen::List | Screen::Form | Screen::Keys => {}
         }
         // The limit belongs to the screen that was drawn; until the new one is
@@ -934,7 +1055,7 @@ impl App {
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
             KeyCode::Char('?') => self.open(Screen::Help),
-            KeyCode::Char('/' | 'a' | 'e' | 'd' | 'f' | 'c') => self.set_status(
+            KeyCode::Char('/' | 'a' | 'e' | 'd' | 'f' | 'c' | 's') => self.set_status(
                 StatusKind::Info,
                 "Hosts cannot be shown or changed until the problem above is fixed.",
             ),
@@ -1014,6 +1135,7 @@ impl App {
             KeyCode::Char('o') => self.show_output(Screen::List),
             // A capital: the lower case k moves the selection up.
             KeyCode::Char('K') => self.requests.push_back(Request::LoadKeys),
+            KeyCode::Char('s') => self.open_ssh_config(),
             KeyCode::Enter => self.request_connect(),
             _ => {}
         }
@@ -1394,6 +1516,202 @@ impl App {
         }
     }
 
+    // ---- the ssh config ------------------------------------------------------
+
+    fn open_ssh_config(&mut self) {
+        self.sshconfig = Some(SshConfigScreen::new());
+        self.open(Screen::SshConfig);
+    }
+
+    /// The footer of the ssh config screen, for the step the user is at.
+    fn ssh_config_hints(&self) -> Vec<KeyHint> {
+        let Some(screen) = self.sshconfig.as_ref() else {
+            return vec![hint("Esc", "back")];
+        };
+        match screen.stage() {
+            Stage::Menu => vec![
+                hint("i", "import"),
+                hint("e", "export"),
+                hint("?", "help"),
+                hint("Esc", "back"),
+                hint("q", "quit"),
+            ],
+            Stage::ImportPreview(_) if screen.importable() > 0 => vec![
+                hint("y", "import"),
+                hint("n/Esc", "cancel"),
+                hint("Up/Down j/k", "scroll"),
+            ],
+            Stage::ExportPlan { .. } if screen.exportable() => {
+                vec![hint("y", "write the file"), hint("n/Esc", "cancel")]
+            }
+            Stage::ImportPreview(_) | Stage::ExportPlan { .. } => {
+                vec![hint("Up/Down j/k", "scroll"), hint("Esc", "back")]
+            }
+            Stage::Imported(_) | Stage::Exported { .. } => vec![
+                hint("Up/Down j/k", "scroll"),
+                hint("Enter/Esc", "back"),
+                hint("q", "quit"),
+            ],
+        }
+    }
+
+    fn ssh_config_key(&mut self, key: KeyEvent) {
+        if !Self::is_plain(key) {
+            return;
+        }
+        let Some(screen) = self.sshconfig.as_ref() else {
+            self.open(Screen::List);
+            return;
+        };
+        match screen.stage() {
+            Stage::Menu => match key.code {
+                KeyCode::Char('i') => self.request_import_preview(),
+                KeyCode::Char('e') => self.request_export_plan(),
+                KeyCode::Char('?') => {
+                    self.help_return = Screen::SshConfig;
+                    self.open(Screen::Help);
+                }
+                KeyCode::Esc => {
+                    self.sshconfig = None;
+                    self.open(Screen::List);
+                }
+                KeyCode::Char('q') => self.quit = true,
+                _ => {}
+            },
+            Stage::ImportPreview(_) | Stage::ExportPlan { .. } => match key.code {
+                KeyCode::Char('y' | 'Y') => self.confirm_ssh_config(),
+                KeyCode::Char('n' | 'N') | KeyCode::Esc => self.back_to_ssh_config_menu(),
+                KeyCode::Char('q') => self.quit = true,
+                _ => {
+                    self.scroll_key(key);
+                }
+            },
+            Stage::Imported(_) | Stage::Exported { .. } => match key.code {
+                KeyCode::Enter | KeyCode::Esc => self.back_to_ssh_config_menu(),
+                KeyCode::Char('q') => self.quit = true,
+                _ => {
+                    self.scroll_key(key);
+                }
+            },
+        }
+    }
+
+    fn back_to_ssh_config_menu(&mut self) {
+        if let Some(screen) = self.sshconfig.as_mut() {
+            screen.menu();
+        }
+        self.sshconfig_scroll = 0;
+    }
+
+    /// Asks for the ssh config to be read. Nothing is saved by this.
+    fn request_import_preview(&mut self) {
+        let Some(hosts) = self.hosts() else {
+            return;
+        };
+        let existing = hosts.clone();
+        self.requests.push_back(Request::PreviewImport { existing });
+    }
+
+    fn request_export_plan(&mut self) {
+        let Some(hosts) = self.hosts() else {
+            return;
+        };
+        if hosts.as_slice().is_empty() {
+            self.set_status(
+                StatusKind::Info,
+                "There are no hosts to export. Add some first with a on the host list.",
+            );
+            return;
+        }
+        let hosts = hosts.clone();
+        self.requests.push_back(Request::PlanExport { hosts });
+    }
+
+    /// What reading the ssh config found. On success the preview is shown and the
+    /// question asked; on failure the reason is said and the two choices stay.
+    fn import_previewed(&mut self, result: Result<ImportPreview, String>) {
+        match result {
+            Ok(preview) => {
+                if let Some(screen) = self.sshconfig.as_mut() {
+                    screen.show(Stage::ImportPreview(preview));
+                }
+                self.sshconfig_scroll = 0;
+            }
+            Err(why) => self.set_status(StatusKind::Error, why),
+        }
+    }
+
+    fn export_planned(&mut self, result: Result<ExportPlan, String>) {
+        match result {
+            Ok(plan) => {
+                let hosts = self.hosts().map_or(0, |hosts| hosts.as_slice().len());
+                if let Some(screen) = self.sshconfig.as_mut() {
+                    screen.show(Stage::ExportPlan { plan, hosts });
+                }
+                self.sshconfig_scroll = 0;
+            }
+            Err(why) => self.set_status(StatusKind::Error, why),
+        }
+    }
+
+    /// The user said yes to the question that is showing.
+    fn confirm_ssh_config(&mut self) {
+        let Some(screen) = self.sshconfig.as_ref() else {
+            return;
+        };
+        match screen.stage() {
+            Stage::ImportPreview(preview) => {
+                if preview.report.imported.is_empty() {
+                    self.set_status(StatusKind::Info, "There is nothing to import.");
+                    return;
+                }
+                let candidate = preview.report.hosts.clone();
+                self.save_import(candidate);
+            }
+            Stage::ExportPlan { plan, .. } => {
+                if plan.state == TargetState::NotGenerated {
+                    return;
+                }
+                if let Some(hosts) = self.hosts() {
+                    let hosts = hosts.clone();
+                    self.requests.push_back(Request::Export { hosts });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Saves the hosts the preview promised, and only then shows what was done. If
+    /// saving fails nothing changed, the preview stays, and the reason is said.
+    fn save_import(&mut self, candidate: Hosts) {
+        if let Err(why) = self.commit(candidate) {
+            self.set_status(StatusKind::Error, why);
+            return;
+        }
+        // The new hosts are in the list whatever the search was.
+        self.list.query.clear();
+        self.mode = ListMode::Browse;
+        self.normalize_selection();
+        if let Some(screen) = self.sshconfig.as_mut() {
+            screen.mark_imported();
+        }
+        self.sshconfig_scroll = 0;
+    }
+
+    fn export_done(&mut self, result: Result<ExportDone, String>) {
+        match result {
+            Ok(done) => {
+                let hosts = self.hosts().map_or(0, |hosts| hosts.as_slice().len());
+                if let Some(screen) = self.sshconfig.as_mut() {
+                    screen.show(Stage::Exported { done, hosts });
+                }
+                self.sshconfig_scroll = 0;
+            }
+            // Stays at the question, so that it can be tried again or given up.
+            Err(why) => self.set_status(StatusKind::Error, why),
+        }
+    }
+
     // ---- the keys ------------------------------------------------------------
 
     /// Takes in the keys that were read. The first time this opens the screen;
@@ -1424,6 +1742,28 @@ impl App {
                         comment,
                     });
                 }
+            }
+            return;
+        }
+        if keys.deleting().is_some() {
+            // The name is typed here: every letter is text, and only Esc and Enter
+            // are anything else.
+            match keys.delete_key(key) {
+                Deletion::Delete { key } => {
+                    self.requests
+                        .push_back(Request::DeleteKey { file_name: key });
+                }
+                Deletion::Cancel => self.set_status(StatusKind::Info, "Nothing was deleted."),
+                Deletion::Stay => {}
+            }
+            return;
+        }
+        if keys.using().is_some() {
+            // A question with two answers: nothing else does anything.
+            match key.code {
+                KeyCode::Char('y' | 'Y') if Self::is_plain(key) => self.use_key_for_host(),
+                KeyCode::Char('n' | 'N') | KeyCode::Esc => self.leave_host_as_it_is(),
+                _ => {}
             }
             return;
         }
@@ -1486,6 +1826,8 @@ impl App {
             }
             KeyCode::Char('a') => self.add_selected_to_agent(),
             KeyCode::Char('c') => self.start_copy_key(),
+            // A capital, like K: deleting is never one plain keypress.
+            KeyCode::Char('D') => self.start_delete_key(),
             KeyCode::Char('r') => self.requests.push_back(Request::LoadKeys),
             KeyCode::Char('?') => {
                 self.help_return = Screen::Keys;
@@ -1497,6 +1839,86 @@ impl App {
             }
             KeyCode::Char('q') => self.quit = true,
             _ => {}
+        }
+    }
+
+    /// The saved hosts whose identity file is the key `file_name` of `dir`, by name.
+    fn hosts_using_key(&self, dir: &std::path::Path, file_name: &str) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .hosts()
+            .map(|hosts| {
+                hosts
+                    .as_slice()
+                    .iter()
+                    .filter(|host| {
+                        host.identity_file
+                            .as_deref()
+                            .is_some_and(|file| names_this_key(file, dir, file_name))
+                    })
+                    .map(|host| host.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort_by_key(|name| name.to_lowercase());
+        names
+    }
+
+    /// `D`: asks before deleting the selected key. Before asking it works out which
+    /// saved hosts use the key and says so: deleting is still allowed, but not
+    /// without the user having seen that.
+    fn start_delete_key(&mut self) {
+        let Some(keys) = self.keys.as_ref() else {
+            return;
+        };
+        let Some(entry) = keys.selected_entry() else {
+            self.set_status(StatusKind::Info, "There is no key to delete.");
+            return;
+        };
+        let question = DeleteQuestion {
+            key: entry.name.clone(),
+            private: entry.private.display().to_string(),
+            public: entry.public.display().to_string(),
+            symlink: entry.symlink,
+            used_by: self.hosts_using_key(&keys.snapshot().dir, &entry.name),
+            loaded: entry.loaded == Some(true),
+            input: TextInput::default(),
+            mismatch: false,
+        };
+        if let Some(keys) = self.keys.as_mut() {
+            keys.ask_delete(question);
+        }
+    }
+
+    /// Reports what deleting a key did, and reads the keys again so that the screen
+    /// shows what is left, whatever happened: a deletion that failed half way has
+    /// changed something. The saved hosts are not changed. Those that had the key
+    /// are named, since they no longer have a file to use.
+    fn key_deleted(&mut self, file_name: &str, result: Result<Deleted, String>) {
+        let still_named = self
+            .keys
+            .as_ref()
+            .map(|keys| self.hosts_using_key(&keys.snapshot().dir, file_name))
+            .unwrap_or_default();
+        self.requests.push_back(Request::LoadKeys);
+        match result {
+            Ok(done) => {
+                let mut text = format!(
+                    "Deleted the key '{file_name}': removed {} and {}.",
+                    done.private.display(),
+                    done.public.display()
+                );
+                if still_named.is_empty() {
+                    self.set_status(StatusKind::Info, text);
+                } else {
+                    text.push_str(&format!(
+                        " These saved hosts still name it as their key file: {}. Choose another \
+                         for them (e, then Identity file).",
+                        still_named.join(", ")
+                    ));
+                    self.set_status(StatusKind::Warning, text);
+                }
+            }
+            Err(why) => self.set_status(StatusKind::Error, why),
         }
     }
 
@@ -1571,6 +1993,87 @@ impl App {
         }
     }
 
+    /// After a key was sent, asks whether to use it for that host from now on,
+    /// unless the host already uses it. Only ever asks: nothing is changed until
+    /// the user says yes.
+    fn offer_use_key(&mut self, file_name: &str, host: &str) {
+        let Some(dir) = self.keys.as_ref().map(|keys| keys.snapshot().dir.clone()) else {
+            return;
+        };
+        if dir.as_os_str().is_empty() {
+            return;
+        }
+        let Some(saved) = self.hosts().and_then(|hosts| hosts.get(host)) else {
+            return;
+        };
+        if saved
+            .identity_file
+            .as_deref()
+            .is_some_and(|current| names_this_key(current, &dir, file_name))
+        {
+            return;
+        }
+        let value = identity_file_value(&dir, file_name);
+        // What would be stored has to be something the host may have.
+        if validate::validate_identity_file(&value).is_err() {
+            return;
+        }
+        let question = UseKeyQuestion {
+            key: file_name.to_string(),
+            host: saved.name.clone(),
+            value,
+            replaces: saved.identity_file.clone(),
+        };
+        if let Some(keys) = self.keys.as_mut() {
+            keys.ask_use_key(question);
+        }
+    }
+
+    /// The user said yes: the host's identity file becomes the key, and that is
+    /// saved the way every other change to a host is.
+    fn use_key_for_host(&mut self) {
+        let Some(question) = self.keys.as_mut().and_then(KeysScreen::close_use_key) else {
+            return;
+        };
+        let Some(hosts) = self.hosts() else {
+            return;
+        };
+        let Some(mut host) = hosts.get(&question.host).cloned() else {
+            self.set_status(
+                StatusKind::Error,
+                format!("The host '{}' is not saved any more.", question.host),
+            );
+            return;
+        };
+        host.identity_file = Some(question.value.clone());
+        let mut candidate = hosts.clone();
+        if let Err(err) = candidate.update(&question.host, host) {
+            self.set_status(StatusKind::Error, err.to_string());
+            return;
+        }
+        match self.commit(candidate) {
+            Ok(()) => self.set_status(
+                StatusKind::Info,
+                format!(
+                    "'{}' now uses the key '{}' ({}). ssh offers only that key to it.",
+                    question.host, question.key, question.value
+                ),
+            ),
+            Err(why) => self.set_status(StatusKind::Error, why),
+        }
+    }
+
+    /// The user said no: nothing is changed.
+    fn leave_host_as_it_is(&mut self) {
+        let Some(question) = self.keys.as_mut().and_then(KeysScreen::close_use_key) else {
+            return;
+        };
+        self.set_status(
+            StatusKind::Info,
+            format!("'{}' was left as it was.", question.host),
+        );
+    }
+
     /// Reports how sending a key ended, once the terminal is back.
     ///
     /// The same judgment as for a connection: ssh's own failures (255) are
@@ -1605,13 +2108,16 @@ impl App {
                 self.open(Screen::ConnectError);
                 return;
             }
-            Verdict::Ended => (
-                StatusKind::Info,
-                format!(
-                    "Sent the public key of '{file_name}' to '{host}'. The server added it to \
-                     ~/.ssh/authorized_keys, or it was already there."
-                ),
-            ),
+            Verdict::Ended => {
+                self.offer_use_key(file_name, host);
+                (
+                    StatusKind::Info,
+                    format!(
+                        "Sent the public key of '{file_name}' to '{host}'. The server added it \
+                         to ~/.ssh/authorized_keys, or it was already there."
+                    ),
+                )
+            }
             Verdict::RemoteStatus(code) => {
                 // The server ran the command and it failed, so this is not a
                 // connection problem: what it said last is the reason. Raw here,
@@ -1837,6 +2343,47 @@ impl App {
             Outcome::Stay => {}
             Outcome::Close => self.close_form(),
             Outcome::Save => self.save_form(),
+            Outcome::NeedKeys => self.requests.push_back(Request::ListKeys),
+        }
+    }
+
+    /// The keys that were read for choosing an identity file. They are given to
+    /// the form, which opens its list if it is still on that field.
+    fn key_list_loaded(&mut self, snapshot: KeysSnapshot) {
+        let choices = snapshot
+            .keys
+            .iter()
+            .map(|entry| KeyChoice {
+                name: entry.name.clone(),
+                value: identity_file_value(&snapshot.dir, &entry.name),
+                full_path: snapshot.dir.join(&entry.name).display().to_string(),
+                kind: entry.fingerprint.as_ref().ok().map(Fingerprint::type_label),
+            })
+            .collect();
+        let dir = snapshot.dir.display();
+        let note = if let Some(problem) = &snapshot.problem {
+            Some(problem.clone())
+        } else if snapshot.missing_dir {
+            Some(format!(
+                "The folder {dir} does not exist yet, so there are no keys. Make one from the \
+                 keys screen (K, then g)."
+            ))
+        } else if snapshot.keys.is_empty() {
+            Some(format!(
+                "There are no key pairs in {dir}. Make one from the keys screen (K, then g), \
+                 or choose Another file and type a path."
+            ))
+        } else if snapshot.truncated {
+            Some(format!(
+                "Only the first {} key pairs are listed. For another, choose Another file and \
+                 type its path.",
+                crate::ssh::keys::MAX_KEYS
+            ))
+        } else {
+            None
+        };
+        if let Some(form) = self.form.as_mut() {
+            form.open_key_picker(KeyList { choices, note });
         }
     }
 
@@ -2544,8 +3091,19 @@ mod tests {
         assert_eq!(
             labels(&app),
             [
-                "move", "connect", "search", "add", "edit", "delete", "favorite", "copy", "keys",
-                "warnings", "help", "quit"
+                "move",
+                "connect",
+                "search",
+                "add",
+                "edit",
+                "delete",
+                "favorite",
+                "copy",
+                "keys",
+                "ssh config",
+                "warnings",
+                "help",
+                "quit"
             ]
         );
 
@@ -2568,6 +3126,7 @@ mod tests {
                 "favorite",
                 "copy",
                 "keys",
+                "ssh config",
                 "warnings",
                 "help",
                 "clear search",
@@ -4305,6 +4864,7 @@ mod tests {
                 "new key",
                 "add to agent",
                 "send to host",
+                "delete",
                 "refresh",
                 "help",
                 "back",
@@ -5573,5 +6133,1297 @@ mod tests {
         assert!(documented.contains(&"c"), "{documented:?}");
         assert!(labels(&open_keys(vec![fine_key("a")])).contains(&"send to host"));
         assert!(!labels(&open_keys(Vec::new())).contains(&"send to host"));
+    }
+
+    // ---- the ssh config screen -------------------------------------------------
+
+    use crate::ssh::export::TargetState;
+    use crate::ssh::import::{ImportReport, SkippedHost};
+    use crate::ssh::scan::IncludeStatus;
+    use crate::tui::effects::{ExportDone, ExportPlan, ImportPreview};
+
+    fn open_ssh_config() -> (App, FakeStore) {
+        let (mut app, store) = app_with(sample(), Vec::new());
+        app.set_ssh_dir(Some(PathBuf::from("/home/dev/.ssh")));
+        app.handle_key(ch('s'));
+        (app, store)
+    }
+
+    fn stage_is(app: &App, wanted: &str) -> bool {
+        let name = match app.sshconfig().map(|screen| screen.stage()) {
+            Some(Stage::Menu) => "menu",
+            Some(Stage::ImportPreview(_)) => "preview",
+            Some(Stage::Imported(_)) => "imported",
+            Some(Stage::ExportPlan { .. }) => "plan",
+            Some(Stage::Exported { .. }) => "exported",
+            None => "none",
+        };
+        name == wanted
+    }
+
+    /// What reading an ssh config with `app` (from `app`'s hosts) found: `names`
+    /// would be imported.
+    fn preview_of(existing: &Hosts, names: &[&str]) -> ImportPreview {
+        let mut hosts = existing.clone();
+        for name in names {
+            hosts.add(host(name, false)).unwrap();
+        }
+        ImportPreview {
+            config: PathBuf::from("/home/dev/.ssh/config"),
+            config_exists: true,
+            report: ImportReport {
+                hosts,
+                imported: names.iter().map(|n| (*n).to_string()).collect(),
+                conflicts: vec!["web".to_string()],
+                skipped: vec![SkippedHost {
+                    name: "bad".to_string(),
+                    reason: "no".to_string(),
+                }],
+                warnings: Vec::new(),
+            },
+        }
+    }
+
+    fn import_previewed(app: &mut App, names: &[&str]) {
+        app.handle_key(ch('i'));
+        let Some(request @ Request::PreviewImport { .. }) = app.take_request() else {
+            panic!("the ssh config was asked for");
+        };
+        let Request::PreviewImport { existing } = &request else {
+            unreachable!();
+        };
+        let preview = preview_of(existing, names);
+        app.handle_response(&request, Response::ImportPreview(Ok(preview)));
+    }
+
+    fn export_planned(app: &mut App, state: TargetState) {
+        app.handle_key(ch('e'));
+        let Some(request @ Request::PlanExport { .. }) = app.take_request() else {
+            panic!("the export was asked to be planned");
+        };
+        let plan = ExportPlan {
+            target: PathBuf::from("/home/dev/.ssh/bifrost_config"),
+            state,
+        };
+        app.handle_response(&request, Response::ExportPlan(Ok(plan)));
+    }
+
+    #[test]
+    fn s_opens_the_ssh_config_screen_from_the_list_and_the_footer_offers_it() {
+        let (mut app, _) = app_with(sample(), Vec::new());
+        assert!(labels(&app).contains(&"ssh config"));
+        app.handle_key(ch('s'));
+        assert_eq!(app.screen(), Screen::SshConfig);
+        assert!(stage_is(&app, "menu"));
+        assert_eq!(labels(&app), ["import", "export", "help", "back", "quit"]);
+        assert!(app.take_request().is_none(), "opening asks for nothing");
+    }
+
+    #[test]
+    fn s_does_nothing_but_explain_when_the_hosts_could_not_be_loaded() {
+        let mut broken = unavailable();
+        broken.handle_key(ch('s'));
+        assert_eq!(broken.screen(), Screen::List);
+        assert!(
+            broken
+                .status()
+                .unwrap()
+                .text
+                .contains("cannot be shown or changed")
+        );
+    }
+
+    #[test]
+    fn the_menu_asks_for_the_import_preview_with_the_hosts_saved_now() {
+        let (mut app, store) = open_ssh_config();
+        app.handle_key(ch('i'));
+        assert_eq!(
+            app.take_request(),
+            Some(Request::PreviewImport { existing: sample() })
+        );
+        assert_eq!(store.save_count(), 0, "asking saves nothing");
+        assert!(app.take_request().is_none());
+    }
+
+    #[test]
+    fn the_menu_asks_for_the_export_plan_and_says_when_there_is_nothing_to_export() {
+        let (mut app, _) = open_ssh_config();
+        app.handle_key(ch('e'));
+        assert_eq!(
+            app.take_request(),
+            Some(Request::PlanExport { hosts: sample() })
+        );
+
+        let mut empty = app_with(hosts(Vec::new()), Vec::new()).0;
+        empty.handle_key(ch('s'));
+        empty.handle_key(ch('e'));
+        assert!(empty.take_request().is_none());
+        assert!(empty.status().unwrap().text.contains("no hosts to export"));
+    }
+
+    #[test]
+    fn the_menu_goes_back_asks_for_help_and_quits() {
+        let (mut app, _) = open_ssh_config();
+        app.handle_key(ch('?'));
+        assert_eq!(app.screen(), Screen::Help);
+        app.handle_key(press(KeyCode::Esc));
+        assert_eq!(app.screen(), Screen::SshConfig, "help comes back to it");
+
+        app.handle_key(press(KeyCode::Esc));
+        assert_eq!(app.screen(), Screen::List);
+        assert!(app.sshconfig().is_none());
+
+        let (mut quitting, _) = open_ssh_config();
+        quitting.handle_key(ch('q'));
+        assert!(quitting.should_quit());
+        let (mut ctrl_c, _) = open_ssh_config();
+        ctrl_c.handle_key(with(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(ctrl_c.should_quit());
+    }
+
+    #[test]
+    fn keys_with_ctrl_or_alt_do_nothing_on_the_menu() {
+        let (mut app, _) = open_ssh_config();
+        for key in [
+            with(KeyCode::Char('i'), KeyModifiers::CONTROL),
+            with(KeyCode::Char('e'), KeyModifiers::ALT),
+            with(KeyCode::Char('q'), KeyModifiers::CONTROL),
+        ] {
+            app.handle_key(key);
+        }
+        assert!(app.take_request().is_none());
+        assert!(!app.should_quit());
+    }
+
+    #[test]
+    fn a_preview_that_could_not_be_made_says_why_and_stays_on_the_menu() {
+        let (mut app, _) = open_ssh_config();
+        app.handle_key(ch('i'));
+        let request = app.take_request().unwrap();
+        app.handle_response(
+            &request,
+            Response::ImportPreview(Err("Could not run ssh: no".to_string())),
+        );
+        let status = app.status().unwrap();
+        assert_eq!(status.kind, StatusKind::Error);
+        assert_eq!(status.text, "Could not run ssh: no");
+        assert!(stage_is(&app, "menu"));
+    }
+
+    #[test]
+    fn a_preview_shows_the_question_and_saves_nothing() {
+        let (mut app, store) = open_ssh_config();
+        import_previewed(&mut app, &["app"]);
+        assert!(stage_is(&app, "preview"));
+        assert_eq!(app.sshconfig().unwrap().importable(), 1);
+        assert_eq!(labels(&app), ["import", "cancel", "scroll"]);
+        assert_eq!(store.save_count(), 0);
+        assert_eq!(
+            app.hosts().unwrap().len(),
+            3,
+            "the saved hosts are as they were"
+        );
+    }
+
+    #[test]
+    fn only_y_imports_and_it_saves_exactly_what_the_preview_promised() {
+        let (mut app, store) = open_ssh_config();
+        import_previewed(&mut app, &["app", "cache"]);
+        for key in [
+            press(KeyCode::Enter),
+            ch('j'),
+            ch('a'),
+            ch('i'),
+            ch('e'),
+            ch(' '),
+        ] {
+            app.handle_key(key);
+            assert_eq!(store.save_count(), 0, "{key:?} must not import");
+        }
+        for key in [
+            with(KeyCode::Char('y'), KeyModifiers::CONTROL),
+            with(KeyCode::Char('y'), KeyModifiers::ALT),
+        ] {
+            app.handle_key(key);
+            assert_eq!(store.save_count(), 0, "{key:?} must not import");
+        }
+        assert!(stage_is(&app, "preview"));
+
+        app.handle_key(ch('y'));
+        assert_eq!(store.save_count(), 1);
+        let saved = store.last_saved().unwrap();
+        assert!(saved.get("app").is_some() && saved.get("cache").is_some());
+        assert_eq!(saved.len(), 5, "the three there were and the two imported");
+        assert_eq!(
+            app.hosts().unwrap(),
+            &saved,
+            "what is shown is what was saved"
+        );
+        assert!(stage_is(&app, "imported"));
+        assert_eq!(labels(&app), ["scroll", "back", "quit"]);
+    }
+
+    #[test]
+    fn importing_makes_the_new_hosts_visible_whatever_the_search_was() {
+        let (mut app, _) = app_with(sample(), Vec::new());
+        app.set_ssh_dir(Some(PathBuf::from("/home/dev/.ssh")));
+        app.handle_key(ch('/'));
+        type_text(&mut app, "zzz");
+        app.handle_key(press(KeyCode::Enter));
+        app.handle_key(ch('s'));
+        import_previewed(&mut app, &["app"]);
+        app.handle_key(ch('y'));
+        app.handle_key(press(KeyCode::Esc)); // the menu
+        app.handle_key(press(KeyCode::Esc)); // the list
+        assert_eq!(app.screen(), Screen::List);
+        assert!(
+            app.rows().len() >= 4,
+            "the search was cleared: {}",
+            app.rows().len()
+        );
+    }
+
+    #[test]
+    fn a_save_that_fails_says_so_keeps_the_preview_and_changes_nothing() {
+        let (mut app, store) = open_ssh_config();
+        import_previewed(&mut app, &["app"]);
+        store.fail_saves(true);
+        app.handle_key(ch('y'));
+        let status = app.status().unwrap();
+        assert_eq!(status.kind, StatusKind::Error);
+        assert!(status.text.contains("Could not save"), "{}", status.text);
+        assert!(stage_is(&app, "preview"), "still asking");
+        assert_eq!(app.hosts().unwrap().len(), 3);
+
+        // Once it can be saved, the same question still works.
+        store.fail_saves(false);
+        app.handle_key(ch('y'));
+        assert!(stage_is(&app, "imported"));
+        assert_eq!(app.hosts().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn n_and_esc_cancel_the_import_and_nothing_is_saved() {
+        for answer in [ch('n'), ch('N'), press(KeyCode::Esc)] {
+            let (mut app, store) = open_ssh_config();
+            import_previewed(&mut app, &["app"]);
+            app.handle_key(answer);
+            assert!(stage_is(&app, "menu"), "{answer:?}");
+            assert_eq!(app.screen(), Screen::SshConfig);
+            assert_eq!(store.save_count(), 0);
+            assert_eq!(app.hosts().unwrap().len(), 3);
+        }
+    }
+
+    #[test]
+    fn a_preview_with_nothing_to_import_cannot_be_confirmed() {
+        let (mut app, store) = open_ssh_config();
+        import_previewed(&mut app, &[]);
+        assert_eq!(app.sshconfig().unwrap().importable(), 0);
+        assert_eq!(labels(&app), ["scroll", "back"]);
+        app.handle_key(ch('y'));
+        assert_eq!(store.save_count(), 0);
+        assert!(app.status().unwrap().text.contains("nothing to import"));
+        assert!(stage_is(&app, "preview"));
+    }
+
+    #[test]
+    fn after_an_import_enter_and_esc_go_back_to_the_menu_and_then_the_list() {
+        for back in [press(KeyCode::Enter), press(KeyCode::Esc)] {
+            let (mut app, _) = open_ssh_config();
+            import_previewed(&mut app, &["app"]);
+            app.handle_key(ch('y'));
+            app.handle_key(back);
+            assert!(stage_is(&app, "menu"), "{back:?}");
+            app.handle_key(press(KeyCode::Esc));
+            assert_eq!(app.screen(), Screen::List);
+            assert!(app.hosts().unwrap().get("app").is_some());
+        }
+    }
+
+    #[test]
+    fn a_plan_shows_the_question_and_writes_nothing() {
+        let (mut app, _) = open_ssh_config();
+        export_planned(&mut app, TargetState::Missing);
+        assert!(stage_is(&app, "plan"));
+        assert!(app.sshconfig().unwrap().exportable());
+        assert_eq!(labels(&app), ["write the file", "cancel"]);
+        assert!(app.take_request().is_none());
+    }
+
+    #[test]
+    fn only_y_writes_the_export_and_with_the_hosts_saved_now() {
+        let (mut app, _) = open_ssh_config();
+        export_planned(&mut app, TargetState::Generated);
+        for key in [press(KeyCode::Enter), ch('j'), ch('e'), ch('i'), ch(' ')] {
+            app.handle_key(key);
+            assert!(app.take_request().is_none(), "{key:?}");
+        }
+        app.handle_key(with(KeyCode::Char('y'), KeyModifiers::CONTROL));
+        assert!(app.take_request().is_none());
+
+        app.handle_key(ch('y'));
+        assert_eq!(
+            app.take_request(),
+            Some(Request::Export { hosts: sample() })
+        );
+        assert!(app.take_request().is_none());
+    }
+
+    #[test]
+    fn a_file_that_bifrost_did_not_make_is_never_offered_for_writing() {
+        let (mut app, _) = open_ssh_config();
+        export_planned(&mut app, TargetState::NotGenerated);
+        assert!(!app.sshconfig().unwrap().exportable());
+        assert_eq!(labels(&app), ["scroll", "back"]);
+        app.handle_key(ch('y'));
+        assert!(app.take_request().is_none(), "y must not write over it");
+        app.handle_key(press(KeyCode::Esc));
+        assert!(stage_is(&app, "menu"));
+    }
+
+    #[test]
+    fn n_and_esc_cancel_the_export() {
+        for answer in [ch('n'), press(KeyCode::Esc)] {
+            let (mut app, _) = open_ssh_config();
+            export_planned(&mut app, TargetState::Missing);
+            app.handle_key(answer);
+            assert!(stage_is(&app, "menu"), "{answer:?}");
+            assert!(app.take_request().is_none());
+        }
+    }
+
+    #[test]
+    fn a_plan_that_could_not_be_made_says_why_and_stays_on_the_menu() {
+        let (mut app, _) = open_ssh_config();
+        app.handle_key(ch('e'));
+        let request = app.take_request().unwrap();
+        app.handle_response(
+            &request,
+            Response::ExportPlan(Err("Cannot export: no".to_string())),
+        );
+        assert_eq!(app.status().unwrap().kind, StatusKind::Error);
+        assert!(stage_is(&app, "menu"));
+    }
+
+    fn exported(app: &mut App, include: Result<IncludeStatus, String>) {
+        app.handle_key(ch('y'));
+        let request = app.take_request().unwrap();
+        app.handle_response(
+            &request,
+            Response::Exported(Ok(ExportDone {
+                target: PathBuf::from("/home/dev/.ssh/bifrost_config"),
+                include,
+            })),
+        );
+    }
+
+    #[test]
+    fn a_written_export_is_reported_and_enter_and_esc_go_back() {
+        for back in [press(KeyCode::Enter), press(KeyCode::Esc)] {
+            let (mut app, _) = open_ssh_config();
+            export_planned(&mut app, TargetState::Missing);
+            exported(&mut app, Ok(IncludeStatus::Missing));
+            assert!(stage_is(&app, "exported"));
+            assert_eq!(labels(&app), ["scroll", "back", "quit"]);
+            app.handle_key(back);
+            assert!(stage_is(&app, "menu"), "{back:?}");
+        }
+    }
+
+    #[test]
+    fn a_failed_export_says_why_and_stays_at_the_question() {
+        let (mut app, _) = open_ssh_config();
+        export_planned(&mut app, TargetState::Generated);
+        app.handle_key(ch('y'));
+        let request = app.take_request().unwrap();
+        app.handle_response(
+            &request,
+            Response::Exported(Err("Could not write /x: denied".to_string())),
+        );
+        let status = app.status().unwrap();
+        assert_eq!(status.kind, StatusKind::Error);
+        assert_eq!(status.text, "Could not write /x: denied");
+        assert!(stage_is(&app, "plan"), "it can be tried again or given up");
+        assert!(app.sshconfig().unwrap().exportable());
+    }
+
+    #[test]
+    fn the_pages_scroll_and_start_at_the_top_when_the_step_changes() {
+        let (mut app, _) = open_ssh_config();
+        import_previewed(&mut app, &["app"]);
+        // As far as a page of this size goes: the limit is reported by drawing,
+        // which the app tests do not do, so give it one.
+        app.apply_metrics(Metrics {
+            max_scroll: 10,
+            ..Metrics::default()
+        });
+        for _ in 0..3 {
+            app.handle_key(ch('j'));
+        }
+        assert_eq!(app.scroll(), 3);
+        app.handle_key(press(KeyCode::Up));
+        assert_eq!(app.scroll(), 2);
+        app.handle_key(ch('y'));
+        assert_eq!(app.scroll(), 0, "the next page starts at its top");
+    }
+
+    #[test]
+    fn help_documents_the_ssh_config_screen_and_its_keys() {
+        let documented: Vec<&str> = HELP
+            .iter()
+            .flat_map(|section| section.rows)
+            .flat_map(|row| tokens(row.keys))
+            .collect();
+        for key in ["s", "i", "e", "y", "n", "Esc"] {
+            assert!(documented.contains(&key), "{key}");
+        }
+        // Every key the footer of every step names is in the help.
+        let (mut app, _) = open_ssh_config();
+        let mut seen = app.footer_hints();
+        import_previewed(&mut app, &["app"]);
+        seen.extend(app.footer_hints());
+        app.handle_key(ch('y'));
+        seen.extend(app.footer_hints());
+        app.handle_key(press(KeyCode::Esc));
+        export_planned(&mut app, TargetState::Missing);
+        seen.extend(app.footer_hints());
+        for hint in seen {
+            for key in tokens(hint.keys) {
+                assert!(documented.contains(&key), "{key:?} is not in the help");
+            }
+        }
+    }
+
+    #[test]
+    fn a_response_that_does_not_match_its_request_is_reported() {
+        let (mut app, _) = open_ssh_config();
+        app.handle_response(
+            &Request::PlanExport { hosts: sample() },
+            Response::Exported(Err("x".to_string())),
+        );
+        assert!(app.status().unwrap().text.contains("unexpected response"));
+        assert!(stage_is(&app, "menu"));
+    }
+
+    // ---- choosing the identity file from the keys --------------------------------
+
+    /// An app on the add form, with the name and host name typed, on the identity
+    /// file.
+    fn adding_on_the_identity_file() -> (App, FakeStore) {
+        let (mut app, store) = app_with(sample(), Vec::new());
+        app.handle_key(ch('a'));
+        type_text(&mut app, "app");
+        app.handle_key(press(KeyCode::Tab));
+        type_text(&mut app, "app.example.com");
+        for _ in 0..3 {
+            app.handle_key(press(KeyCode::Tab));
+        }
+        assert_eq!(app.form().unwrap().focus(), FormField::IdentityFile);
+        (app, store)
+    }
+
+    fn key_list_of(app: &mut App, keys: Vec<crate::ssh::keys::KeyEntry>) {
+        app.handle_key(press(KeyCode::Enter));
+        assert_eq!(app.take_request(), Some(Request::ListKeys));
+        app.handle_response(&Request::ListKeys, Response::KeyList(key_snapshot(keys)));
+    }
+
+    fn picker_of(app: &App) -> &crate::tui::form::KeyPicker {
+        match app.form().unwrap().mode() {
+            FormMode::PickKey(picker) => picker,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn enter_on_the_identity_file_reads_the_keys_and_opens_the_list_when_they_arrive() {
+        let (mut app, _) = adding_on_the_identity_file();
+        assert_eq!(labels(&app), ["move", "save", "choose a key", "cancel"]);
+        app.handle_key(press(KeyCode::Enter));
+        assert_eq!(app.take_request(), Some(Request::ListKeys));
+        assert_eq!(
+            app.form().unwrap().mode(),
+            &FormMode::Editing,
+            "nothing is shown until the keys are"
+        );
+        app.handle_response(
+            &Request::ListKeys,
+            Response::KeyList(key_snapshot(vec![
+                fine_key("id_ed25519"),
+                fine_key("deploy"),
+            ])),
+        );
+        let picker = picker_of(&app);
+        assert_eq!(picker.options.len(), 4, "none, two keys, another file");
+        assert_eq!(labels(&app), ["move", "choose", "close"]);
+    }
+
+    #[test]
+    fn a_chosen_key_is_saved_with_the_host_as_its_path() {
+        let (mut app, store) = adding_on_the_identity_file();
+        key_list_of(&mut app, vec![fine_key("id_ed25519"), fine_key("deploy")]);
+        app.handle_key(ch('j'));
+        app.handle_key(press(KeyCode::Enter));
+        assert_eq!(
+            app.form()
+                .unwrap()
+                .input(FormField::IdentityFile)
+                .unwrap()
+                .value(),
+            "~/.ssh/id_ed25519"
+        );
+        app.handle_key(with(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        let saved = store.last_saved().expect("saved");
+        assert_eq!(
+            saved.get("app").unwrap().identity_file.as_deref(),
+            Some("~/.ssh/id_ed25519")
+        );
+        assert_eq!(app.screen(), Screen::List);
+    }
+
+    #[test]
+    fn a_list_is_read_once_per_form_and_again_for_the_next_one() {
+        let (mut app, _) = adding_on_the_identity_file();
+        key_list_of(&mut app, vec![fine_key("a")]);
+        app.handle_key(press(KeyCode::Esc));
+        app.handle_key(press(KeyCode::Enter));
+        assert!(matches!(app.form().unwrap().mode(), FormMode::PickKey(_)));
+        assert!(app.take_request().is_none(), "the same form asks once");
+        app.handle_key(press(KeyCode::Esc));
+
+        // A new form starts without the list.
+        app.handle_key(press(KeyCode::Esc));
+        app.handle_key(ch('y'));
+        assert_eq!(app.screen(), Screen::List);
+        app.handle_key(ch('a'));
+        for _ in 0..4 {
+            app.handle_key(press(KeyCode::Tab));
+        }
+        app.handle_key(press(KeyCode::Enter));
+        assert_eq!(app.take_request(), Some(Request::ListKeys));
+    }
+
+    #[test]
+    fn keys_that_arrive_when_no_form_is_open_change_nothing() {
+        let (mut app, _) = app_with(sample(), Vec::new());
+        app.handle_response(
+            &Request::ListKeys,
+            Response::KeyList(key_snapshot(vec![fine_key("a")])),
+        );
+        assert_eq!(app.screen(), Screen::List);
+        assert!(app.status().is_none());
+    }
+
+    #[test]
+    fn editing_a_host_opens_the_list_on_the_key_it_already_has() {
+        let mut deploy = host("deploy", false);
+        deploy.identity_file = Some("/home/dev/.ssh/deploy".to_string());
+        let (mut app, _) = app_with(hosts(vec![deploy]), Vec::new());
+        app.handle_key(ch('e'));
+        for _ in 0..4 {
+            app.handle_key(press(KeyCode::Tab));
+        }
+        key_list_of(&mut app, vec![fine_key("id_ed25519"), fine_key("deploy")]);
+        let picker = picker_of(&app);
+        assert_eq!(
+            picker.selected, 2,
+            "the second key: the full path is recognized"
+        );
+        assert_eq!(picker.typed, None);
+    }
+
+    #[test]
+    fn the_list_says_why_when_there_are_no_keys_to_choose_from() {
+        let cases: Vec<(KeysSnapshot, &str)> = vec![
+            (
+                key_snapshot(Vec::new()),
+                "There are no key pairs in /home/dev/.ssh.",
+            ),
+            (
+                KeysSnapshot {
+                    missing_dir: true,
+                    ..key_snapshot(Vec::new())
+                },
+                "does not exist yet",
+            ),
+            (
+                KeysSnapshot {
+                    problem: Some("Could not read the folder /x: denied".to_string()),
+                    ..key_snapshot(Vec::new())
+                },
+                "Could not read the folder /x: denied",
+            ),
+            (
+                KeysSnapshot {
+                    truncated: true,
+                    ..key_snapshot(vec![fine_key("a")])
+                },
+                "Only the first",
+            ),
+            (KeysSnapshot::unavailable("no home"), "no home"),
+        ];
+        for (snapshot, said) in cases {
+            let (mut app, _) = adding_on_the_identity_file();
+            app.handle_key(press(KeyCode::Enter));
+            app.take_request();
+            app.handle_response(&Request::ListKeys, Response::KeyList(snapshot));
+            let note = picker_of(&app).note.clone().expect("a note");
+            assert!(note.contains(said), "{said}: {note}");
+        }
+        // Keys and no trouble: nothing to add.
+        let (mut app, _) = adding_on_the_identity_file();
+        key_list_of(&mut app, vec![fine_key("a")]);
+        assert_eq!(picker_of(&app).note, None);
+    }
+
+    #[test]
+    fn a_key_whose_type_could_not_be_read_is_still_offered() {
+        let mut broken = fine_key("odd");
+        broken.fingerprint = Err("ssh-keygen could not read it".to_string());
+        let (mut app, _) = adding_on_the_identity_file();
+        key_list_of(&mut app, vec![broken]);
+        let picker = picker_of(&app);
+        assert!(picker.options.iter().any(|option| matches!(
+            option,
+            crate::tui::form::KeyPick::Key(choice) if choice.name == "odd" && choice.kind.is_none()
+        )));
+    }
+
+    #[test]
+    fn the_form_footer_and_help_cover_choosing_a_key() {
+        let documented: Vec<&str> = HELP
+            .iter()
+            .flat_map(|section| section.rows)
+            .flat_map(|row| tokens(row.keys))
+            .collect();
+        let (mut app, _) = adding_on_the_identity_file();
+        let mut seen = app.footer_hints();
+        key_list_of(&mut app, vec![fine_key("a")]);
+        seen.extend(app.footer_hints());
+        for hint in seen {
+            for key in tokens(hint.keys) {
+                assert!(documented.contains(&key), "{key:?} is not in the help");
+            }
+        }
+        assert!(
+            HELP.iter()
+                .any(|section| section.title == "Choosing an identity file"),
+            "a section of its own"
+        );
+    }
+
+    // ---- using a key that was sent ------------------------------------------------
+
+    fn copied_to(app: &mut App, file: &str, host_name: &str, result: HandoverResult) {
+        let hosts = app.hosts().unwrap().clone();
+        let request = Request::CopyKey {
+            file_name: file.to_string(),
+            connect: ConnectRequest {
+                name: host_name.to_string(),
+                args: build_copy_args(hosts.get(host_name).unwrap(), &hosts).unwrap(),
+                known_hosts: Vec::new(),
+            },
+        };
+        app.handle_response(&request, Response::KeyCopied(result));
+    }
+
+    fn sent_ok(app: &mut App, file: &str, host_name: &str) {
+        copied_to(app, file, host_name, ran(Exit::Code(0), false));
+    }
+
+    fn question_of(app: &App) -> crate::tui::keys::UseKeyQuestion {
+        app.keys()
+            .unwrap()
+            .using()
+            .expect("the question is open")
+            .clone()
+    }
+
+    fn keys_app(hosts_list: Vec<Host>, keys: Vec<crate::ssh::keys::KeyEntry>) -> (App, FakeStore) {
+        let (app, store) = app_with(hosts(hosts_list), Vec::new());
+        (open_keys_in(app, keys), store)
+    }
+
+    #[test]
+    fn after_a_key_was_sent_it_asks_whether_to_use_it_for_that_host() {
+        let (mut app, store) = keys_app(vec![host("db", false)], vec![fine_key("a")]);
+        sent_ok(&mut app, "a", "db");
+        assert_eq!(
+            question_of(&app),
+            crate::tui::keys::UseKeyQuestion {
+                key: "a".to_string(),
+                host: "db".to_string(),
+                value: "~/.ssh/a".to_string(),
+                replaces: None,
+            }
+        );
+        assert_eq!(labels(&app), ["use it", "leave it"]);
+        assert_eq!(app.status().unwrap().kind, StatusKind::Info);
+        assert!(app.status().unwrap().text.contains("Sent the public key"));
+        assert_eq!(store.save_count(), 0, "asking changes nothing");
+        assert!(app.take_request().is_none());
+    }
+
+    #[test]
+    fn a_host_that_has_another_key_is_asked_with_what_it_would_replace() {
+        let mut db = host("db", false);
+        db.identity_file = Some("~/.ssh/old_key".to_string());
+        let (mut app, _) = keys_app(vec![db], vec![fine_key("a")]);
+        sent_ok(&mut app, "a", "db");
+        assert_eq!(
+            question_of(&app).replaces.as_deref(),
+            Some("~/.ssh/old_key")
+        );
+    }
+
+    #[test]
+    fn a_host_that_already_uses_the_key_is_not_asked_however_the_path_is_written() {
+        for spelled in ["~/.ssh/a", "/home/dev/.ssh/a", "/home/dev/.ssh/./a"] {
+            let mut db = host("db", false);
+            db.identity_file = Some(spelled.to_string());
+            let (mut app, _) = keys_app(vec![db], vec![fine_key("a")]);
+            sent_ok(&mut app, "a", "db");
+            assert!(app.keys().unwrap().using().is_none(), "{spelled:?}");
+            assert_eq!(
+                labels(&app).first(),
+                Some(&"move"),
+                "{spelled:?}: the list, not a question"
+            );
+        }
+    }
+
+    #[test]
+    fn a_key_that_was_not_sent_is_not_offered_for_use() {
+        let mut cases: Vec<HandoverResult> = vec![
+            ran(Exit::Code(1), true),
+            ran(Exit::Signal(9), false),
+            ran_with(3, "mkdir: no\n"),
+            HandoverResult::Failed("Could not read".to_string()),
+            ran_with(
+                255,
+                "ssh: connect to host db port 22: Connection refused\r\n",
+            ),
+            ran_with(255, "Connection to db closed.\r\n"),
+        ];
+        for result in cases.drain(..) {
+            let (mut app, _) = keys_app(vec![host("db", false)], vec![fine_key("a")]);
+            copied_to(&mut app, "a", "db", result);
+            assert!(app.keys().unwrap().using().is_none());
+        }
+    }
+
+    #[test]
+    fn nothing_is_offered_that_the_host_would_not_accept_or_without_a_folder() {
+        // A key that ends in .pub gives a path that hosts refuse.
+        let (mut app, _) = keys_app(vec![host("db", false)], vec![fine_key("odd.pub")]);
+        sent_ok(&mut app, "odd.pub", "db");
+        assert!(app.keys().unwrap().using().is_none());
+
+        let mut snapshot = key_snapshot(vec![fine_key("a")]);
+        snapshot.dir = PathBuf::new();
+        let (mut app, _) = app_with(hosts(vec![host("db", false)]), Vec::new());
+        app.handle_key(ch('K'));
+        let request = app.take_request().unwrap();
+        app.handle_response(&request, Response::Keys(snapshot));
+        sent_ok(&mut app, "a", "db");
+        assert!(app.keys().unwrap().using().is_none());
+    }
+
+    #[test]
+    fn only_y_sets_the_hosts_key_and_it_is_saved_like_any_other_change() {
+        let mut db = host("db", true);
+        db.user = Some("deploy".to_string());
+        db.port = Some(2222);
+        db.tags = vec!["prod".to_string()];
+        let (mut app, store) = keys_app(vec![db.clone(), host("web", false)], vec![fine_key("a")]);
+        sent_ok(&mut app, "a", "db");
+        for key in [
+            press(KeyCode::Enter),
+            ch('j'),
+            ch('q'),
+            ch(' '),
+            ch('a'),
+            ch('c'),
+            with(KeyCode::Char('y'), KeyModifiers::CONTROL),
+            with(KeyCode::Char('y'), KeyModifiers::ALT),
+        ] {
+            app.handle_key(key);
+            assert!(
+                app.keys().unwrap().using().is_some(),
+                "{key:?} must not answer"
+            );
+            assert_eq!(store.save_count(), 0, "{key:?}");
+            assert!(!app.should_quit(), "{key:?}");
+            assert!(app.take_request().is_none(), "{key:?}");
+        }
+
+        app.handle_key(ch('y'));
+        assert!(
+            app.keys().unwrap().using().is_none(),
+            "the question is over"
+        );
+        assert_eq!(store.save_count(), 1);
+        let saved = store.last_saved().unwrap();
+        let mut expected = db;
+        expected.identity_file = Some("~/.ssh/a".to_string());
+        assert_eq!(
+            saved.get("db"),
+            Some(&expected),
+            "only the key file changed"
+        );
+        assert_eq!(
+            saved.get("web").unwrap().identity_file,
+            None,
+            "no other host"
+        );
+        assert_eq!(app.hosts().unwrap(), &saved);
+        let status = app.status().unwrap();
+        assert_eq!(status.kind, StatusKind::Info);
+        assert!(
+            status.text.contains("'db' now uses the key 'a'") && status.text.contains("~/.ssh/a"),
+            "{}",
+            status.text
+        );
+        assert_eq!(app.screen(), Screen::Keys, "still on the keys screen");
+    }
+
+    #[test]
+    fn a_capital_y_says_yes_too_and_it_replaces_the_old_key() {
+        let mut db = host("db", false);
+        db.identity_file = Some("~/.ssh/old_key".to_string());
+        let (mut app, store) = keys_app(vec![db], vec![fine_key("a")]);
+        sent_ok(&mut app, "a", "db");
+        app.handle_key(ch('Y'));
+        assert_eq!(
+            store
+                .last_saved()
+                .unwrap()
+                .get("db")
+                .unwrap()
+                .identity_file
+                .as_deref(),
+            Some("~/.ssh/a")
+        );
+    }
+
+    #[test]
+    fn n_and_esc_change_nothing_and_say_so() {
+        for answer in [ch('n'), ch('N'), press(KeyCode::Esc)] {
+            let (mut app, store) = keys_app(vec![host("db", false)], vec![fine_key("a")]);
+            sent_ok(&mut app, "a", "db");
+            app.handle_key(answer);
+            assert!(app.keys().unwrap().using().is_none(), "{answer:?}");
+            assert_eq!(store.save_count(), 0, "{answer:?}");
+            assert_eq!(app.hosts().unwrap().get("db").unwrap().identity_file, None);
+            assert_eq!(app.status().unwrap().text, "'db' was left as it was.");
+            assert_eq!(app.screen(), Screen::Keys, "Esc answered the question only");
+        }
+    }
+
+    #[test]
+    fn a_save_that_fails_says_so_and_changes_nothing() {
+        let (mut app, store) = keys_app(vec![host("db", false)], vec![fine_key("a")]);
+        sent_ok(&mut app, "a", "db");
+        store.fail_saves(true);
+        app.handle_key(ch('y'));
+        let status = app.status().unwrap();
+        assert_eq!(status.kind, StatusKind::Error);
+        assert!(status.text.contains("Could not save"), "{}", status.text);
+        assert_eq!(app.hosts().unwrap().get("db").unwrap().identity_file, None);
+        assert!(app.keys().unwrap().using().is_none());
+    }
+
+    #[test]
+    fn a_host_that_is_gone_when_yes_is_said_is_reported_and_nothing_is_saved() {
+        let (mut app, store) = keys_app(vec![host("db", false)], vec![fine_key("a")]);
+        app.keys
+            .as_mut()
+            .unwrap()
+            .ask_use_key(crate::tui::keys::UseKeyQuestion {
+                key: "a".to_string(),
+                host: "gone".to_string(),
+                value: "~/.ssh/a".to_string(),
+                replaces: None,
+            });
+        app.handle_key(ch('y'));
+        assert!(
+            app.status()
+                .unwrap()
+                .text
+                .contains("'gone' is not saved any more")
+        );
+        assert_eq!(store.save_count(), 0);
+    }
+
+    #[test]
+    fn ctrl_c_quits_from_the_question() {
+        let (mut app, store) = keys_app(vec![host("db", false)], vec![fine_key("a")]);
+        sent_ok(&mut app, "a", "db");
+        app.handle_key(with(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.should_quit());
+        assert_eq!(store.save_count(), 0);
+    }
+
+    #[test]
+    fn a_key_sent_again_after_yes_is_not_asked_about_again() {
+        let (mut app, _) = keys_app(vec![host("db", false)], vec![fine_key("a")]);
+        sent_ok(&mut app, "a", "db");
+        app.handle_key(ch('y'));
+        sent_ok(&mut app, "a", "db");
+        assert!(app.keys().unwrap().using().is_none(), "the host has it now");
+    }
+
+    #[test]
+    fn the_help_says_the_question_comes_after_sending() {
+        let text: String = HELP
+            .iter()
+            .filter(|section| section.title == "Your ssh keys")
+            .flat_map(|section| section.rows)
+            .map(|row| row.description)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            text.contains("whether to use the key for that host"),
+            "{text}"
+        );
+    }
+
+    // ---- deleting a key ------------------------------------------------------------
+
+    fn deleting_question(app: &App) -> &DeleteQuestion {
+        app.keys()
+            .unwrap()
+            .deleting()
+            .expect("the question is open")
+    }
+
+    fn type_into(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.handle_key(ch(c));
+        }
+    }
+
+    fn using_key(name: &str, file: &str) -> Host {
+        let mut host = host(name, false);
+        host.identity_file = Some(file.to_string());
+        host
+    }
+
+    #[test]
+    fn only_a_capital_d_asks_and_asking_deletes_nothing() {
+        let (mut app, store) = keys_app(vec![host("db", false)], vec![fine_key("a")]);
+        for key in [
+            ch('d'),
+            with(KeyCode::Char('D'), KeyModifiers::CONTROL),
+            with(KeyCode::Char('D'), KeyModifiers::ALT),
+            with(
+                KeyCode::Char('d'),
+                KeyModifiers::SHIFT | KeyModifiers::CONTROL,
+            ),
+        ] {
+            app.handle_key(key);
+            assert!(
+                app.keys().unwrap().deleting().is_none(),
+                "{key:?} must not ask"
+            );
+            assert!(app.take_request().is_none(), "{key:?}");
+        }
+        // The capital, as a terminal sends it: with or without the shift flag.
+        for key in [ch('D'), with(KeyCode::Char('D'), KeyModifiers::SHIFT)] {
+            let (mut app, _) = keys_app(vec![host("db", false)], vec![fine_key("a")]);
+            app.handle_key(key);
+            assert!(app.keys().unwrap().deleting().is_some(), "{key:?}");
+            assert!(app.take_request().is_none(), "asking is not doing");
+        }
+        assert_eq!(store.save_count(), 0);
+        assert_eq!(
+            labels(&open_keys(vec![fine_key("a")])).last(),
+            Some(&"quit")
+        );
+    }
+
+    #[test]
+    fn with_no_key_there_is_nothing_to_delete_and_it_says_so() {
+        let mut app = open_keys(Vec::new());
+        app.handle_key(ch('D'));
+        assert!(app.keys().unwrap().deleting().is_none());
+        assert_eq!(app.status().unwrap().text, "There is no key to delete.");
+        assert!(
+            !labels(&app).contains(&"delete"),
+            "not offered without a key"
+        );
+        assert!(labels(&open_keys(vec![fine_key("a")])).contains(&"delete"));
+    }
+
+    #[test]
+    fn the_question_describes_the_selected_key_and_the_files_it_would_remove() {
+        let mut linked = key_entry("linked", Permissions::Fine, true);
+        linked.loaded = Some(true);
+        let (mut app, _) = keys_app(vec![host("db", false)], vec![fine_key("a"), linked]);
+        app.handle_key(ch('j'));
+        app.handle_key(ch('D'));
+        let question = deleting_question(&app);
+        assert_eq!(question.key, "linked");
+        assert_eq!(question.private, "/home/dev/.ssh/linked");
+        assert_eq!(question.public, "/home/dev/.ssh/linked.pub");
+        assert!(question.symlink && question.loaded);
+        assert_eq!(labels(&app), ["the key's name", "delete", "cancel"]);
+    }
+
+    #[test]
+    fn the_saved_hosts_that_use_the_key_are_listed_whichever_way_they_write_it() {
+        let hosts_list = vec![
+            using_key("db", "~/.ssh/a"),
+            using_key("Web", "/home/dev/.ssh/a"),
+            using_key("cache", "/home/dev/.ssh/./a"),
+            using_key("other", "~/.ssh/b"),
+            using_key("elsewhere", "/srv/keys/a"),
+            host("plain", false),
+        ];
+        let (mut app, _) = keys_app(hosts_list, vec![fine_key("a"), fine_key("b")]);
+        app.handle_key(ch('D'));
+        assert_eq!(
+            deleting_question(&app).used_by,
+            ["cache", "db", "Web"],
+            "by name, ignoring case, and only those that have this key"
+        );
+        // A key nobody uses says so with an empty list.
+        let (mut none, _) = keys_app(vec![host("db", false)], vec![fine_key("a")]);
+        none.handle_key(ch('D'));
+        assert!(deleting_question(&none).used_by.is_empty());
+    }
+
+    #[test]
+    fn only_the_exact_name_confirms_case_and_spaces_included() {
+        for typed in [
+            "",
+            "A",
+            "a ",
+            " a",
+            "aa",
+            "id_ed2551",
+            "ID_ED25519",
+            "id_ed25519 ",
+            "id_ed25519x",
+            "d_ed25519",
+        ] {
+            let (mut app, _) = keys_app(vec![host("db", false)], vec![fine_key("id_ed25519")]);
+            app.handle_key(ch('D'));
+            type_into(&mut app, typed);
+            app.handle_key(press(KeyCode::Enter));
+            assert!(app.take_request().is_none(), "{typed:?} must not confirm");
+            assert!(
+                app.keys().unwrap().deleting().unwrap().mismatch,
+                "{typed:?}"
+            );
+        }
+        let (mut app, _) = keys_app(vec![host("db", false)], vec![fine_key("My Key.v2")]);
+        app.handle_key(ch('D'));
+        type_into(&mut app, "My Key.v2");
+        app.handle_key(press(KeyCode::Enter));
+        assert_eq!(
+            app.take_request(),
+            Some(Request::DeleteKey {
+                file_name: "My Key.v2".to_string()
+            })
+        );
+        assert!(
+            app.keys().unwrap().deleting().is_none(),
+            "the question is over"
+        );
+    }
+
+    #[test]
+    fn typing_after_a_mismatch_clears_the_complaint_and_ctrl_or_alt_enter_never_confirms() {
+        let (mut app, _) = keys_app(vec![host("db", false)], vec![fine_key("a")]);
+        app.handle_key(ch('D'));
+        app.handle_key(press(KeyCode::Enter));
+        assert!(deleting_question(&app).mismatch);
+        app.handle_key(ch('a'));
+        assert!(!deleting_question(&app).mismatch);
+        for key in [
+            with(KeyCode::Enter, KeyModifiers::CONTROL),
+            with(KeyCode::Enter, KeyModifiers::ALT),
+            with(KeyCode::Esc, KeyModifiers::ALT),
+        ] {
+            app.handle_key(key);
+            assert!(app.take_request().is_none(), "{key:?}");
+            assert!(app.keys().unwrap().deleting().is_some(), "{key:?}");
+        }
+    }
+
+    #[test]
+    fn while_the_name_is_typed_every_letter_is_text_and_nothing_else_acts() {
+        let (mut app, _) = keys_app(vec![host("db", false)], vec![fine_key("a"), fine_key("b")]);
+        app.handle_key(ch('D'));
+        type_into(&mut app, "qjkDcgar?fK");
+        assert!(!app.should_quit());
+        assert_eq!(app.screen(), Screen::Keys);
+        assert_eq!(
+            app.keys().unwrap().selected(),
+            0,
+            "j did not move the selection"
+        );
+        assert_eq!(deleting_question(&app).input.value(), "qjkDcgar?fK");
+        assert!(app.take_request().is_none());
+    }
+
+    #[test]
+    fn esc_gives_up_and_says_nothing_was_deleted_and_ctrl_c_quits() {
+        let (mut app, store) = keys_app(vec![host("db", false)], vec![fine_key("a")]);
+        app.handle_key(ch('D'));
+        type_into(&mut app, "a");
+        app.handle_key(press(KeyCode::Esc));
+        assert!(app.keys().unwrap().deleting().is_none());
+        assert_eq!(app.status().unwrap().text, "Nothing was deleted.");
+        assert!(app.take_request().is_none());
+        assert_eq!(app.screen(), Screen::Keys, "Esc answered the question only");
+        assert_eq!(store.save_count(), 0);
+
+        let (mut quitting, _) = keys_app(vec![host("db", false)], vec![fine_key("a")]);
+        quitting.handle_key(ch('D'));
+        quitting.handle_key(with(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(quitting.should_quit());
+        assert!(quitting.take_request().is_none());
+    }
+
+    fn deleted_ok(app: &mut App, name: &str) {
+        let request = Request::DeleteKey {
+            file_name: name.to_string(),
+        };
+        let done = crate::ssh::keys::Deleted {
+            private: PathBuf::from(format!("/home/dev/.ssh/{name}")),
+            public: PathBuf::from(format!("/home/dev/.ssh/{name}.pub")),
+        };
+        app.handle_response(&request, Response::KeyDeleted(Ok(done)));
+    }
+
+    #[test]
+    fn a_deleted_key_is_reported_the_keys_are_read_again_and_no_host_is_changed() {
+        let (mut app, store) = keys_app(vec![host("db", false)], vec![fine_key("a")]);
+        deleted_ok(&mut app, "a");
+        let status = app.status().unwrap();
+        assert_eq!(status.kind, StatusKind::Info);
+        assert_eq!(
+            status.text,
+            "Deleted the key 'a': removed /home/dev/.ssh/a and /home/dev/.ssh/a.pub."
+        );
+        assert_eq!(app.take_request(), Some(Request::LoadKeys));
+        assert_eq!(store.save_count(), 0);
+    }
+
+    #[test]
+    fn the_hosts_that_had_the_key_are_named_as_still_using_it_and_are_not_changed() {
+        let (mut app, store) = keys_app(
+            vec![
+                using_key("db", "~/.ssh/a"),
+                using_key("web", "/home/dev/.ssh/a"),
+                host("plain", false),
+            ],
+            vec![fine_key("a")],
+        );
+        deleted_ok(&mut app, "a");
+        let status = app.status().unwrap();
+        assert_eq!(status.kind, StatusKind::Warning);
+        assert!(
+            status
+                .text
+                .contains("These saved hosts still name it as their key file: db, web."),
+            "{}",
+            status.text
+        );
+        assert_eq!(store.save_count(), 0, "the hosts are left as they are");
+        assert_eq!(
+            app.hosts()
+                .unwrap()
+                .get("db")
+                .unwrap()
+                .identity_file
+                .as_deref(),
+            Some("~/.ssh/a")
+        );
+        assert_eq!(app.take_request(), Some(Request::LoadKeys));
+    }
+
+    #[test]
+    fn a_deletion_that_failed_says_why_and_still_reads_the_keys_again() {
+        let (mut app, _) = keys_app(vec![host("db", false)], vec![fine_key("a")]);
+        app.handle_response(
+            &Request::DeleteKey {
+                file_name: "a".to_string(),
+            },
+            Response::KeyDeleted(Err(
+                "The private key was deleted, but /x could not be: no.".to_string()
+            )),
+        );
+        let status = app.status().unwrap();
+        assert_eq!(status.kind, StatusKind::Error);
+        assert!(
+            status.text.starts_with("The private key was deleted"),
+            "{}",
+            status.text
+        );
+        assert_eq!(
+            app.take_request(),
+            Some(Request::LoadKeys),
+            "half done changed something"
+        );
+    }
+
+    #[test]
+    fn after_the_keys_are_read_again_the_selection_stays_about_where_the_key_was() {
+        let (mut app, _) = keys_app(
+            vec![host("db", false)],
+            vec![fine_key("a"), fine_key("b"), fine_key("c")],
+        );
+        app.handle_key(ch('j'));
+        assert_eq!(app.keys().unwrap().selected(), 1);
+        app.handle_response(
+            &Request::LoadKeys,
+            Response::Keys(key_snapshot(vec![fine_key("a"), fine_key("c")])),
+        );
+        assert_eq!(
+            app.keys().unwrap().selected(),
+            1,
+            "on c, not back at the top"
+        );
+        // At the end of the list it moves up rather than past it.
+        app.handle_key(press(KeyCode::End));
+        assert_eq!(app.keys().unwrap().selected(), 1);
+        app.handle_response(
+            &Request::LoadKeys,
+            Response::Keys(key_snapshot(vec![fine_key("a")])),
+        );
+        assert_eq!(app.keys().unwrap().selected(), 0);
+    }
+
+    #[test]
+    fn the_help_documents_deleting_and_the_footer_of_the_question_is_in_it() {
+        let documented: Vec<&str> = HELP
+            .iter()
+            .flat_map(|section| section.rows)
+            .flat_map(|row| tokens(row.keys))
+            .collect();
+        let (mut app, _) = keys_app(vec![host("db", false)], vec![fine_key("a")]);
+        let mut seen = app.footer_hints();
+        app.handle_key(ch('D'));
+        seen.extend(app.footer_hints());
+        for hint in seen {
+            for key in tokens(hint.keys) {
+                assert!(documented.contains(&key), "{key:?} is not in the help");
+            }
+        }
+        let text: String = HELP
+            .iter()
+            .filter(|section| section.title == "Your ssh keys")
+            .flat_map(|section| section.rows)
+            .map(|row| row.description)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            text.contains("Bifrost cannot know which servers have the key"),
+            "{text}"
+        );
     }
 }

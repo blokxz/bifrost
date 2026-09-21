@@ -19,14 +19,12 @@
 //! is chosen by whoever added them. Keys are recognized by their fingerprints,
 //! never by their comments.
 
-use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::time::Duration;
 
 use super::keys::parse_fingerprint;
+use super::timed::{Timed, output_within};
 use crate::sanitize::is_unsafe_char;
 
 /// How long to wait for `ssh-add -l`. An agent that is forwarded over a dead
@@ -35,9 +33,6 @@ pub const AGENT_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// How much of ssh-add's output is read. Far more than any agent holds.
 const MAX_OUTPUT: u64 = 256 * 1024;
-
-/// How often to look at whether ssh-add has finished.
-const POLL: Duration = Duration::from_millis(10);
 
 /// Whether there is an agent, and what it holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,74 +116,21 @@ pub fn interpret(exit: Option<i32>, stdout: &str, stderr: &str) -> AgentState {
 /// finished within `timeout` it is killed and the answer is
 /// [`AgentState::Unavailable`].
 pub fn list(ssh_add: &Path, timeout: Duration) -> AgentState {
-    let mut child = match Command::new(ssh_add)
-        .arg("-l")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(err) => return AgentState::Unavailable(format!("Could not run ssh-add: {err}")),
-    };
-
-    let (sender, receiver) = mpsc::channel::<(bool, Vec<u8>)>();
-    if let Some(pipe) = child.stdout.take() {
-        read_in_background(pipe, true, sender.clone());
+    let mut command = Command::new(ssh_add);
+    command.arg("-l");
+    match output_within(&mut command, timeout, MAX_OUTPUT) {
+        Ok(Timed::Finished(done)) => interpret(
+            done.status.code(),
+            &String::from_utf8_lossy(&done.stdout),
+            &String::from_utf8_lossy(&done.stderr),
+        ),
+        Ok(Timed::TimedOut) => AgentState::Unavailable(format!(
+            "ssh-add did not answer within {} seconds, so Bifrost cannot tell what the \
+             agent holds.",
+            timeout.as_secs()
+        )),
+        Err(err) => AgentState::Unavailable(format!("Could not run ssh-add: {err}")),
     }
-    if let Some(pipe) = child.stderr.take() {
-        read_in_background(pipe, false, sender);
-    } else {
-        drop(sender);
-    }
-
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => thread::sleep(POLL),
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return AgentState::Unavailable(format!(
-                    "ssh-add did not answer within {} seconds, so Bifrost cannot tell what the \
-                     agent holds.",
-                    timeout.as_secs()
-                ));
-            }
-            Err(err) => {
-                let _ = child.kill();
-                return AgentState::Unavailable(format!("Could not wait for ssh-add: {err}"));
-            }
-        }
-    };
-
-    // The pipes close with the process; a moment is enough to collect them.
-    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
-    while let Ok((is_stdout, bytes)) = receiver.recv_timeout(Duration::from_millis(300)) {
-        if is_stdout {
-            stdout = bytes;
-        } else {
-            stderr = bytes;
-        }
-    }
-    interpret(
-        status.code(),
-        &String::from_utf8_lossy(&stdout),
-        &String::from_utf8_lossy(&stderr),
-    )
-}
-
-fn read_in_background(
-    pipe: impl Read + Send + 'static,
-    is_stdout: bool,
-    sender: mpsc::Sender<(bool, Vec<u8>)>,
-) {
-    thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = pipe.take(MAX_OUTPUT).read_to_end(&mut bytes);
-        let _ = sender.send((is_stdout, bytes));
-    });
 }
 
 #[cfg(test)]

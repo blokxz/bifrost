@@ -150,8 +150,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     opens or when connecting. When ssh is missing, the list still works and
     connecting explains what to install.
 
-- **Keys screen** (Block 6)
-  - `K` on the host list shows the key pairs in `~/.ssh` (a private key with a
+- **Keys and the ssh config** (Block 6): the keys screen (`K`), making, adding and
+  sending keys, choosing a host's key from a list, and the ssh config screen (`s`).
+  - **Keys screen.** `K` on the host list shows the key pairs in `~/.ssh` (a private key with a
     `.pub` next to it): name, type and size, whether the agent holds it, and
     whether its permissions are ones ssh accepts. The selected key's fingerprint,
     comment and paths are shown below the list.
@@ -164,7 +165,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     words, and `f` sets it to 0600 after a yes/no question. It is not offered for
     a symbolic link. Only the private file of a key pair in `~/.ssh` can be
     changed. On Windows permissions are not checked.
-  - Bifrost never deletes or overwrites a key.
+  - Bifrost never overwrites a key. It deletes one only when asked to, as described
+    under **Deleting a key** below.
   - `g` makes a new ed25519 key. A small form asks for the file name (one that is
     free is suggested) and an optional comment, and says beforehand that
     `ssh-keygen` will ask for a passphrase and that Bifrost never sees it. Then the
@@ -188,9 +190,97 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     the same screens, a changed host key stops on the blocking screen, and going
     back returns to the keys screen. A command that the server ran and that
     failed (any other status) is said to be that, with what the server said last.
+  - **Deleting a key.** `D` (a capital, like `K`; a plain `d` does nothing) on the
+    keys screen asks to delete the selected key. The question first lists the saved
+    hosts that have the key as their identity file, and says plainly that Bifrost
+    cannot know which servers have the key in their `authorized_keys`, and that
+    deleting it means losing access to them until another key is installed. The
+    key's exact name has to be typed and confirmed with Enter (case, spaces and
+    prefixes all count); Esc gives up. It is still allowed when hosts use the key:
+    the user sees them and decides. Only the private file and its `.pub` are
+    removed, the private one first, and only for a real key pair in the ssh
+    directory: never `config`, `known_hosts` or another file that ssh reads, a
+    lone `.pub`, a folder, or a name that is not one plain file name. A key that is
+    a symbolic link is removed as a link and the file it points to stays, which the
+    question says. The saved hosts are not changed; afterwards the message names those
+    that still point at the deleted key, and the keys are read again. If the agent
+    holds the key, the question says it keeps holding it (`ssh-add -d` removes it).
+    Nothing is overwritten or securely erased: the files are unlinked.
+  - **Using a key after sending it.** Once a key was sent, Bifrost asks: use this
+    key for that host from now on? `y` sets the host's identity file to
+    `~/.ssh/<name>` and saves it like any other change, and the message on the keys
+    screen says so; `n` or Esc changes nothing. Only plain `y` answers yes. It is
+    not asked when the host already uses that key (however the path is written), when
+    the send did not succeed, or when the path would not be one a host may have. If
+    the host has another key file, the question says which one it replaces.
+  - **Choosing the identity file.** In the add and edit form, Enter on the Identity
+    file field opens a list, chosen like the jump host is: "(none)" (ssh uses its
+    default keys), each key found in `~/.ssh` with its type, and "Another file"
+    for a key that is elsewhere, which goes back to the box to type the path. Typing a
+    path directly still works, and a path already typed is kept and shown on the
+    "Another file" line. What is stored is the path, `~/.ssh/<name>`, as before. The
+    list reads names and types only: it does not ask the agent, so it opens at once
+    even when a forwarded agent is stuck. With no keys it says how to make one
+    (`K`, then `g`).
+
+- **SSH config screen** (Block 6)
+  - `s` on the host list opens a screen with two things to do.
+  - **Import** (`i`) reads `~/.ssh/config` and the files it includes, and shows what
+    importing it would do before anything is saved: the hosts that would be added
+    (with user, address, port, jump host and key), the ones already in Bifrost
+    that are left as they are, the ones skipped and why, and every warning
+    (a dropped `ProxyCommand`, dropped forwards, a dropped `.pub` identity, a key
+    file that does not exist). Only `y` imports; `n` and Esc cancel. What is
+    saved is exactly the set that was shown, with the previous version kept as
+    `hosts.toml.bak`. If saving fails nothing changes and the preview stays. After
+    saving, the page says what was imported and what was left out.
+  - **Export** (`e`) says how many hosts will be written and where
+    (`~/.ssh/bifrost_config`), whether the file is new or is one Bifrost made and
+    will replace, and asks. A file that Bifrost did not make is never offered for
+    writing. After writing it shows what is left to do: the exact line to add to
+    your `~/.ssh/config` (`Include ~/.ssh/bifrost_config`) on a line of its own,
+    or that it is already there, or, if the line is there but after a `Host` or
+    `Match` line, where ssh would only use it for that block, that it has to move
+    to the top. Bifrost never edits or creates your `~/.ssh/config`.
+  - Problems are said in plain English on the screen, and everything from outside
+    (host names, what ssh said about a host, warnings, paths) is cleaned before it
+    is drawn.
+  - **A `Match exec` that hangs cannot freeze the import for good.** Each `ssh -G`
+    is given 5 seconds. A host that does not answer in time is skipped with the
+    reason and listed under Skipped in the preview, like any other host ssh could not
+    resolve, and the command that hung is killed with it (on Unix, its whole
+    process group).
+  - **The whole import has a budget of 60 seconds.** When it is spent, the hosts not
+    yet read are skipped without running ssh for them, with the reason "the import
+    was taking too long, so the remaining hosts were not read; check for a Match exec
+    command in your ssh config that does not finish, then try again." Healthy hosts
+    are never held back however many there are. In the preview, hosts skipped for the
+    same reason are shown as one entry.
 
 ### Security
 
+- The commands that Bifrost waits for without being able to interrupt them have a
+  deadline and are killed with what they started when they miss it: `ssh-add -l`
+  (3 seconds), each `ssh -G` of an import (5 seconds, which runs the user's
+  `Match exec` commands) and the import as a whole (60 seconds). A hung command
+  cannot pile up or hold the output open, and the interface cannot be kept waiting
+  for more than a minute by one.
+- Deleting a key is the one way Bifrost removes a key, and it is guarded three ways:
+  a capital `D`, the key's exact name typed, and a check, made again where the files
+  are removed and not only on the screen, that the name is one plain file name of
+  a key pair (both files present, not reserved, not a `.pub`) in the ssh directory.
+  The request carries a name, never a path. Links are unlinked, never followed.
+  Nothing else in the folder is touched.
+- Choosing a key for a host never offers a path that the form would refuse (one
+  that ends in `.pub`, has control characters and so on), and the question after
+  sending a key changes nothing until a plain `y`. Names from the ssh directory
+  are cleaned before they are drawn, and the footer says when something was hidden.
+- The ssh config screen writes nothing until a plain `y`, and never touches the
+  user's own `~/.ssh/config`: the check for the `Include` line is read-only and
+  reuses the scan that import already trusts. Importing shows exactly what it
+  will save and saves that set, through the same atomic, backed-up write as every
+  other change. Exporting refuses a file that Bifrost did not generate, and says
+  so before asking.
 - Removing a host key is an explicit action confirmed by typing the host's name,
   runs `ssh-keygen -R` with an argument vector and no shell, and only for a name
   that Bifrost itself asked ssh to connect through and only in the default

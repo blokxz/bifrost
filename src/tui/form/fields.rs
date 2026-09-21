@@ -115,7 +115,7 @@ impl FormField {
                 "2222",
             ),
             FormField::IdentityFile => (
-                "Path to your private key file. Leave empty to use ssh's default keys.",
+                "The private key to use. Press Enter to choose one of your keys, or type a path. Leave empty to use ssh's default keys.",
                 "~/.ssh/id_ed25519",
             ),
             FormField::Tags => (

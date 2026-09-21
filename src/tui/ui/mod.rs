@@ -8,6 +8,7 @@
 //!
 //! - [`list`]: the host list.
 //! - [`keys`]: the keys screen.
+//! - [`sshconfig`]: importing from and exporting to an ssh config.
 //! - [`form`]: the add/edit form.
 //! - [`modal`]: boxes drawn over a screen.
 //! - [`page`]: text pages: help, warnings, the explanation shown when the hosts
@@ -31,6 +32,7 @@ mod keys;
 mod list;
 mod modal;
 mod page;
+mod sshconfig;
 
 /// The smallest terminal the screens are laid out for.
 ///
@@ -61,6 +63,7 @@ pub fn render(app: &App, theme: &Theme, frame: &mut Frame) -> Metrics {
         Screen::SshOutput => page::render_ssh_output(app, theme, frame, area),
         Screen::HostKeyChanged => page::render_host_key_changed(app, theme, frame, area),
         Screen::Keys => keys::render(app, theme, frame, area),
+        Screen::SshConfig => sshconfig::render(app, theme, frame, area),
     }
 }
 

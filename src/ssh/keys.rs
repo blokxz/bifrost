@@ -4,7 +4,8 @@
 //! Bifrost never reads a private key. What a key is (its type, size,
 //! fingerprint and comment) comes from `ssh-keygen -l -f name.pub`, run on the
 //! **public** file, and the private file is only ever looked at for its
-//! permissions. Nothing here deletes or overwrites a key.
+//! permissions. Nothing here overwrites a key, and the only way one is removed is
+//! [`delete_key`], which removes a key pair and nothing else.
 //!
 //! What is a key: a file `name` with a file `name.pub` next to it. That leaves out
 //! `config`, `known_hosts`, `authorized_keys` and any public key whose private
@@ -25,6 +26,7 @@ use std::process::{Command, Stdio};
 
 use super::agent::{self, AGENT_TIMEOUT, AgentState};
 use super::diagnose::{is_key_type, is_sha256_fingerprint};
+use crate::domain::validate::expand_tilde;
 
 /// How many key pairs are read. Far more than anyone keeps; a bound so that a
 /// directory with thousands of files cannot make the screen slow.
@@ -148,6 +150,61 @@ pub fn is_plain_file_name(name: &str) -> bool {
         && !name.chars().any(|c| c.is_control())
 }
 
+/// What is stored as a host's identity file for the key `file_name` of
+/// `ssh_dir`: `~/.ssh/name` when the directory is a `.ssh`, as everyone writes it,
+/// and the full path when it is anywhere else. ssh expands the `~` itself.
+pub fn identity_file_value(ssh_dir: &Path, file_name: &str) -> String {
+    let is_dot_ssh =
+        ssh_dir.file_name().is_some_and(|name| name == ".ssh") && ssh_dir.parent().is_some();
+    if is_dot_ssh {
+        format!("~/.ssh/{file_name}")
+    } else {
+        ssh_dir.join(file_name).display().to_string()
+    }
+}
+
+/// Whether `identity_file`, as saved on a host, is the key `file_name` of
+/// `ssh_dir`: the same file whether it is spelled with `~`, with the full path or
+/// with `.` and `..` in it. Decided from the words, without looking at the disk, so
+/// a link is not followed and a file that is not there yet still matches.
+pub fn names_this_key(identity_file: &str, ssh_dir: &Path, file_name: &str) -> bool {
+    let Some(path) = expand_tilde(identity_file.trim(), ssh_dir.parent()) else {
+        return false;
+    };
+    same_path(&path, &ssh_dir.join(file_name))
+}
+
+/// `path` written out with `.` dropped and `..` applied, as text that two
+/// spellings of one path agree on: with `/` between the parts and, on Windows,
+/// in lower case.
+fn same_path(a: &Path, b: &Path) -> bool {
+    fn normal(path: &Path) -> String {
+        use std::path::Component;
+        let mut parts: Vec<String> = Vec::new();
+        for component in path.components() {
+            match component {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    if parts
+                        .last()
+                        .is_some_and(|last| last != "/" && !last.ends_with(':'))
+                    {
+                        parts.pop();
+                    }
+                }
+                other => parts.push(other.as_os_str().to_string_lossy().into_owned()),
+            }
+        }
+        let text = parts.join("/").replace("//", "/");
+        if cfg!(windows) {
+            text.to_lowercase()
+        } else {
+            text
+        }
+    }
+    normal(a) == normal(b)
+}
+
 /// Sets the private key `name` in `ssh_dir` to 0600, so that only its owner can
 /// read and write it.
 ///
@@ -195,6 +252,101 @@ pub fn fix_permissions(_ssh_dir: &Path, _name: &str) -> io::Result<()> {
         io::ErrorKind::Unsupported,
         "Bifrost does not change permissions on this system",
     ))
+}
+
+/// What deleting a key removed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Deleted {
+    pub private: PathBuf,
+    pub public: PathBuf,
+}
+
+/// Why a key was not (or not entirely) deleted.
+#[derive(Debug)]
+pub enum DeleteError {
+    /// What was asked for is not a key pair of the ssh folder, so nothing was
+    /// touched.
+    NotAKeyPair,
+    /// The first file could not be removed, so nothing was.
+    Failed { path: PathBuf, source: io::Error },
+    /// The private file was removed and the `.pub` could not be. The key is gone as
+    /// a key; the `.pub` is left over.
+    PublicLeft { path: PathBuf, source: io::Error },
+}
+
+impl std::fmt::Display for DeleteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DeleteError::NotAKeyPair => f.write_str(
+                "That is not a key pair in the ssh folder (a private file with its .pub next to \
+                 it), so nothing was deleted.",
+            ),
+            DeleteError::Failed { path, source } => write!(
+                f,
+                "Could not delete {}: {source}. Nothing was deleted.",
+                path.display()
+            ),
+            DeleteError::PublicLeft { path, source } => write!(
+                f,
+                "The private key was deleted, but {} could not be: {source}. It is left over \
+                 and can be removed by hand.",
+                path.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DeleteError {}
+
+/// Deletes the key pair `name` and `name.pub` of `ssh_dir`: those two files and
+/// nothing else.
+///
+/// Checked again here, at the moment of deleting, whatever the screen showed: `name`
+/// is one plain path component, not a file that ssh reads for something else
+/// (`config`, `known_hosts`, ...) and not ending in `.pub`; and both files are still
+/// there as files, which is what makes a pair (a directory of that name, or a `.pub`
+/// whose private half is missing, is not one). Files are removed with `remove_file`
+/// only, so nothing is ever removed recursively. A symbolic link is removed as the
+/// link it is and what it points to is left alone.
+///
+/// The private file goes first: it is the one that matters, and if the second
+/// removal fails what is left is a `.pub`, which is harmless.
+pub fn delete_key(ssh_dir: &Path, name: &str) -> Result<Deleted, DeleteError> {
+    delete_key_with(ssh_dir, name, &mut |path| fs::remove_file(path))
+}
+
+/// [`delete_key`] with the removal supplied, so that a failure of the second one
+/// can be tested.
+fn delete_key_with(
+    ssh_dir: &Path,
+    name: &str,
+    remove: &mut dyn FnMut(&Path) -> io::Result<()>,
+) -> Result<Deleted, DeleteError> {
+    let reserved = RESERVED_NAMES
+        .iter()
+        .any(|reserved| reserved.eq_ignore_ascii_case(name));
+    if !is_plain_file_name(name) || reserved || name.to_ascii_lowercase().ends_with(".pub") {
+        return Err(DeleteError::NotAKeyPair);
+    }
+    let (private, public) = (ssh_dir.join(name), ssh_dir.join(format!("{name}.pub")));
+    // What makes a pair, as the scan of the folder decides it: both are files
+    // (through a link if it is one), so a folder of either name is not a key.
+    let is_file = |path: &Path| fs::metadata(path).is_ok_and(|m| m.is_file());
+    if !is_file(&private) || !is_file(&public) {
+        return Err(DeleteError::NotAKeyPair);
+    }
+
+    remove(&private).map_err(|source| DeleteError::Failed {
+        path: private.clone(),
+        source,
+    })?;
+    if let Err(source) = remove(&public) {
+        return Err(DeleteError::PublicLeft {
+            path: public,
+            source,
+        });
+    }
+    Ok(Deleted { private, public })
 }
 
 /// The longest file name accepted for a new key.
@@ -550,6 +702,22 @@ pub fn load_keys(tools: &dyn KeyTools, dir: &Path) -> KeysSnapshot {
         missing_dir: scan.missing_dir,
         truncated: scan.truncated,
         problem,
+    }
+}
+
+/// Reads the keys but does not ask the agent, for a caller that only wants to
+/// list them (choosing a key file for a host). Asking the agent can take up to
+/// [`AGENT_TIMEOUT`], and nothing there needs it; every key is then "unknown" as to
+/// whether the agent holds it.
+pub struct WithoutAgent<'a>(pub &'a dyn KeyTools);
+
+impl KeyTools for WithoutAgent<'_> {
+    fn fingerprint(&self, public: &Path) -> Result<Fingerprint, String> {
+        self.0.fingerprint(public)
+    }
+
+    fn agent(&self) -> AgentState {
+        AgentState::Unavailable("The agent was not asked.".to_string())
     }
 }
 
@@ -1368,5 +1536,434 @@ mod tests {
                 .unwrap_err()
                 .contains("not an absolute path")
         );
+    }
+
+    // ---- the identity file of a key ---------------------------------------------
+
+    #[test]
+    fn the_stored_path_of_a_key_is_the_tilde_form_in_a_dot_ssh_and_the_full_path_elsewhere() {
+        assert_eq!(
+            identity_file_value(Path::new("/home/dev/.ssh"), "id_ed25519"),
+            "~/.ssh/id_ed25519"
+        );
+        assert_eq!(
+            identity_file_value(Path::new("/home/dev/.ssh"), "my.key-2"),
+            "~/.ssh/my.key-2"
+        );
+        assert_eq!(
+            identity_file_value(Path::new("/srv/keys"), "id_ed25519"),
+            Path::new("/srv/keys")
+                .join("id_ed25519")
+                .display()
+                .to_string()
+        );
+        // A folder that only has ".ssh" in its name is not the default one.
+        assert_eq!(
+            identity_file_value(Path::new("/home/dev/not.ssh"), "k"),
+            Path::new("/home/dev/not.ssh")
+                .join("k")
+                .display()
+                .to_string()
+        );
+    }
+
+    #[test]
+    fn every_way_of_writing_the_same_key_is_recognized() {
+        let dir = Path::new("/home/dev/.ssh");
+        for spelled in [
+            "~/.ssh/id_ed25519",
+            "/home/dev/.ssh/id_ed25519",
+            "  ~/.ssh/id_ed25519  ",
+            "/home/dev/.ssh/./id_ed25519",
+            "/home/dev/.ssh/../.ssh/id_ed25519",
+            "~/./.ssh//id_ed25519",
+        ] {
+            assert!(names_this_key(spelled, dir, "id_ed25519"), "{spelled:?}");
+        }
+    }
+
+    #[test]
+    fn other_files_and_near_misses_are_not_the_key() {
+        let dir = Path::new("/home/dev/.ssh");
+        for spelled in [
+            "",
+            "~/.ssh/id_ed25519_2",
+            "~/.ssh/id_ed2551",
+            "~/.ssh/ID_ED25519",
+            "~/.ssh/id_ed25519.pub",
+            "/home/other/.ssh/id_ed25519",
+            "/home/dev/.ssh/sub/id_ed25519",
+            "/elsewhere/id_ed25519",
+            "id_ed25519",
+            "~other/.ssh/id_ed25519",
+            "~/.ssh",
+        ] {
+            let same = names_this_key(spelled, dir, "id_ed25519");
+            // Case is the one thing that differs by system.
+            if spelled == "~/.ssh/ID_ED25519" && cfg!(windows) {
+                continue;
+            }
+            assert!(!same, "{spelled:?}");
+        }
+    }
+
+    #[test]
+    fn a_tilde_with_no_home_is_not_a_match_and_does_not_panic() {
+        // The root has no parent, so there is no home to expand `~` against.
+        assert!(!names_this_key("~/.ssh/k", Path::new("/"), "k"));
+        assert!(!names_this_key("~", Path::new("/home/dev/.ssh"), "k"));
+    }
+
+    // ---- listing without the agent ----------------------------------------------
+
+    /// Tools that fail the test if the agent is asked.
+    struct NeverAsksTheAgent;
+
+    impl KeyTools for NeverAsksTheAgent {
+        fn fingerprint(&self, _: &Path) -> Result<Fingerprint, String> {
+            Ok(Fingerprint {
+                bits: 256,
+                hash: "SHA256:Gch6wPWbVBGcUR0XuYOLVqoZ+L5m7d4yzsUg0dxJVTw".to_string(),
+                comment: None,
+                key_type: "ED25519".to_string(),
+            })
+        }
+
+        fn agent(&self) -> AgentState {
+            panic!("the agent was asked");
+        }
+    }
+
+    #[test]
+    fn listing_without_the_agent_never_asks_it_and_says_nothing_about_what_it_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a", "b"] {
+            fs::write(dir.path().join(name), "x").unwrap();
+            fs::write(dir.path().join(format!("{name}.pub")), "x").unwrap();
+        }
+        let snapshot = load_keys(&WithoutAgent(&NeverAsksTheAgent), dir.path());
+        assert_eq!(snapshot.keys.len(), 2);
+        assert!(snapshot.keys.iter().all(|key| key.loaded.is_none()));
+        assert!(matches!(snapshot.agent, AgentState::Unavailable(_)));
+        assert!(
+            snapshot.keys.iter().all(|key| key.fingerprint.is_ok()),
+            "still reads each key"
+        );
+    }
+
+    // ---- deleting a key -----------------------------------------------------------
+
+    /// A `.ssh` with these files (name, contents), and a few that must survive.
+    fn ssh_with(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, text) in files {
+            fs::write(dir.path().join(name), text).unwrap();
+        }
+        dir
+    }
+
+    fn what_is_left(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    const BYSTANDERS: [(&str, &str); 6] = [
+        ("other", "other private"),
+        ("other.pub", "other public"),
+        ("config", "Host x"),
+        ("known_hosts", "x"),
+        ("authorized_keys", "x"),
+        ("lonely.pub", "no private half"),
+    ];
+
+    fn with_bystanders(pair: &[(&str, &str)]) -> tempfile::TempDir {
+        let mut files: Vec<(&str, &str)> = BYSTANDERS.to_vec();
+        files.extend_from_slice(pair);
+        ssh_with(&files)
+    }
+
+    #[test]
+    fn a_key_pair_is_removed_and_nothing_else_is() {
+        let dir = with_bystanders(&[("id_ed25519", "secret"), ("id_ed25519.pub", "public")]);
+        let done = delete_key(dir.path(), "id_ed25519").unwrap();
+        assert_eq!(done.private, dir.path().join("id_ed25519"));
+        assert_eq!(done.public, dir.path().join("id_ed25519.pub"));
+        assert_eq!(
+            what_is_left(dir.path()),
+            [
+                "authorized_keys",
+                "config",
+                "known_hosts",
+                "lonely.pub",
+                "other",
+                "other.pub"
+            ]
+        );
+        for (name, text) in BYSTANDERS {
+            assert_eq!(
+                fs::read_to_string(dir.path().join(name)).unwrap(),
+                text,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_name_that_is_not_one_plain_file_name_is_refused_and_nothing_is_touched() {
+        let dir = with_bystanders(&[("k", "s"), ("k.pub", "p")]);
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("victim"), "x").unwrap();
+        fs::write(outside.path().join("victim.pub"), "x").unwrap();
+        let escape = format!(
+            "../{}/victim",
+            outside.path().file_name().unwrap().to_string_lossy()
+        );
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../k",
+            "a/../k",
+            "sub/k",
+            "/etc/passwd",
+            "k\\x",
+            "k\nx",
+            "k\u{7}",
+            escape.as_str(),
+        ] {
+            assert!(
+                matches!(delete_key(dir.path(), bad), Err(DeleteError::NotAKeyPair)),
+                "{bad:?}"
+            );
+        }
+        assert!(dir.path().join("k").exists() && dir.path().join("k.pub").exists());
+        assert!(
+            outside.path().join("victim").exists(),
+            "nothing outside the folder"
+        );
+    }
+
+    #[test]
+    fn the_files_ssh_reads_for_other_purposes_are_never_deleted_even_with_a_pub_next_to_them() {
+        for reserved in [
+            "config",
+            "known_hosts",
+            "authorized_keys",
+            "AUTHORIZED_KEYS",
+            "environment",
+            "rc",
+        ] {
+            let dir = ssh_with(&[(reserved, "precious"), (&format!("{reserved}.pub"), "x")]);
+            assert!(
+                matches!(
+                    delete_key(dir.path(), reserved),
+                    Err(DeleteError::NotAKeyPair)
+                ),
+                "{reserved}"
+            );
+            assert_eq!(
+                fs::read_to_string(dir.path().join(reserved)).unwrap(),
+                "precious"
+            );
+        }
+    }
+
+    #[test]
+    fn a_name_ending_in_pub_is_refused_so_that_a_public_key_is_never_taken_for_the_private_one() {
+        let dir = ssh_with(&[("k", "s"), ("k.pub", "p"), ("k.pub.pub", "pp")]);
+        for name in ["k.pub", "K.PUB", "k.pub.pub"] {
+            assert!(
+                matches!(delete_key(dir.path(), name), Err(DeleteError::NotAKeyPair)),
+                "{name}"
+            );
+        }
+        assert_eq!(what_is_left(dir.path()), ["k", "k.pub", "k.pub.pub"]);
+    }
+
+    #[test]
+    fn what_is_not_a_pair_is_refused_a_private_file_alone_a_pub_alone_and_a_folder() {
+        let dir = ssh_with(&[("alone", "s"), ("only.pub", "p")]);
+        fs::create_dir(dir.path().join("folder")).unwrap();
+        fs::write(dir.path().join("folder/inner"), "x").unwrap();
+        fs::create_dir(dir.path().join("folder.pub")).unwrap();
+        fs::write(dir.path().join("k"), "s").unwrap();
+        fs::create_dir(dir.path().join("k.pub")).unwrap();
+        for name in ["alone", "only", "folder", "k", "missing"] {
+            assert!(
+                matches!(delete_key(dir.path(), name), Err(DeleteError::NotAKeyPair)),
+                "{name}"
+            );
+        }
+        assert!(dir.path().join("alone").exists());
+        assert!(
+            dir.path().join("folder/inner").exists(),
+            "nothing inside a folder is touched"
+        );
+        assert!(dir.path().join("k").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_is_removed_as_a_link_and_what_it_points_to_is_left_alone() {
+        use std::os::unix::fs::symlink;
+        let dir = with_bystanders(&[]);
+        let elsewhere = tempfile::tempdir().unwrap();
+        fs::write(elsewhere.path().join("real"), "the real private key").unwrap();
+        fs::write(elsewhere.path().join("real.pub"), "the real public key").unwrap();
+        symlink(elsewhere.path().join("real"), dir.path().join("linked")).unwrap();
+        symlink(
+            elsewhere.path().join("real.pub"),
+            dir.path().join("linked.pub"),
+        )
+        .unwrap();
+
+        let done = delete_key(dir.path(), "linked").unwrap();
+        assert_eq!(done.private, dir.path().join("linked"));
+        assert!(
+            fs::symlink_metadata(dir.path().join("linked")).is_err(),
+            "the link is gone"
+        );
+        assert!(fs::symlink_metadata(dir.path().join("linked.pub")).is_err());
+        assert_eq!(
+            fs::read_to_string(elsewhere.path().join("real")).unwrap(),
+            "the real private key",
+            "the file it pointed to is untouched"
+        );
+        assert_eq!(
+            fs::read_to_string(elsewhere.path().join("real.pub")).unwrap(),
+            "the real public key"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_to_a_folder_or_to_nothing_is_not_a_key_and_is_not_followed() {
+        use std::os::unix::fs::symlink;
+        let dir = ssh_with(&[("k.pub", "p"), ("j.pub", "p")]);
+        let elsewhere = tempfile::tempdir().unwrap();
+        fs::write(elsewhere.path().join("inside"), "precious").unwrap();
+        symlink(elsewhere.path(), dir.path().join("k")).unwrap();
+        symlink(elsewhere.path().join("nothing"), dir.path().join("j")).unwrap();
+        for name in ["k", "j"] {
+            assert!(
+                matches!(delete_key(dir.path(), name), Err(DeleteError::NotAKeyPair)),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(elsewhere.path().join("inside")).unwrap(),
+            "precious"
+        );
+        assert!(dir.path().join("k.pub").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_that_is_itself_a_link_is_used_as_the_folder_it_is() {
+        use std::os::unix::fs::symlink;
+        // ~/.ssh is often a link into a dotfiles folder.
+        let real = ssh_with(&[("k", "s"), ("k.pub", "p"), ("keep", "x")]);
+        let holder = tempfile::tempdir().unwrap();
+        let ssh = holder.path().join(".ssh");
+        symlink(real.path(), &ssh).unwrap();
+        delete_key(&ssh, "k").unwrap();
+        assert_eq!(what_is_left(real.path()), ["keep"]);
+    }
+
+    #[test]
+    fn if_the_private_file_cannot_be_removed_nothing_is_and_it_is_said() {
+        let dir = ssh_with(&[("k", "s"), ("k.pub", "p")]);
+        let mut asked = Vec::new();
+        let result = delete_key_with(dir.path(), "k", &mut |path| {
+            asked.push(path.to_path_buf());
+            Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied"))
+        });
+        let Err(DeleteError::Failed { path, .. }) = &result else {
+            panic!("{result:?}");
+        };
+        assert_eq!(path, &dir.path().join("k"));
+        assert_eq!(asked, [dir.path().join("k")], "the .pub was not even tried");
+        let said = result.unwrap_err().to_string();
+        assert!(
+            said.contains("denied") && said.contains("Nothing was deleted."),
+            "{said}"
+        );
+        assert_eq!(what_is_left(dir.path()), ["k", "k.pub"]);
+    }
+
+    #[test]
+    fn if_only_the_public_file_cannot_be_removed_that_is_said_plainly() {
+        let dir = ssh_with(&[("k", "s"), ("k.pub", "p")]);
+        let result = delete_key_with(dir.path(), "k", &mut |path| {
+            if path.ends_with("k.pub") {
+                Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied"))
+            } else {
+                fs::remove_file(path)
+            }
+        });
+        let Err(DeleteError::PublicLeft { path, .. }) = &result else {
+            panic!("{result:?}");
+        };
+        assert_eq!(path, &dir.path().join("k.pub"));
+        let said = result.unwrap_err().to_string();
+        assert!(
+            said.starts_with("The private key was deleted, but"),
+            "{said}"
+        );
+        assert_eq!(what_is_left(dir.path()), ["k.pub"]);
+    }
+
+    #[test]
+    fn the_private_file_is_removed_before_the_public_one() {
+        let dir = ssh_with(&[("k", "s"), ("k.pub", "p")]);
+        let mut order = Vec::new();
+        delete_key_with(dir.path(), "k", &mut |path| {
+            order.push(path.file_name().unwrap().to_string_lossy().into_owned());
+            fs::remove_file(path)
+        })
+        .unwrap();
+        assert_eq!(order, ["k", "k.pub"]);
+    }
+
+    #[test]
+    fn a_missing_folder_or_a_key_that_is_gone_is_not_a_crash() {
+        let dir = ssh_with(&[("k", "s"), ("k.pub", "p")]);
+        delete_key(dir.path(), "k").unwrap();
+        assert!(matches!(
+            delete_key(dir.path(), "k"),
+            Err(DeleteError::NotAKeyPair)
+        ));
+        assert!(matches!(
+            delete_key(&dir.path().join("nowhere"), "k"),
+            Err(DeleteError::NotAKeyPair)
+        ));
+    }
+
+    #[test]
+    fn every_error_says_in_plain_english_what_happened_to_the_files() {
+        for (error, must_say) in [
+            (DeleteError::NotAKeyPair, "nothing was deleted"),
+            (
+                DeleteError::Failed {
+                    path: PathBuf::from("/x/k"),
+                    source: io::Error::other("no"),
+                },
+                "Nothing was deleted.",
+            ),
+            (
+                DeleteError::PublicLeft {
+                    path: PathBuf::from("/x/k.pub"),
+                    source: io::Error::other("no"),
+                },
+                "left over",
+            ),
+        ] {
+            let text = error.to_string();
+            assert!(text.contains(must_say) && !text.contains("::"), "{text}");
+        }
     }
 }

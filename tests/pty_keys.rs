@@ -12,10 +12,11 @@ mod support;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use bifrost_ssh::ssh::authorize::REMOTE_COMMAND;
+use bifrost_ssh::store::{HOSTS_FILE, Store};
 use support::{CTRL_C, FakeSsh, Session, assert_restored, contains_bytes, healthy_store};
 
 const HOME_SCREEN: &str = "Saved hosts: 2";
@@ -85,22 +86,38 @@ fn fakes(keygen: &str, ssh_add: &str) -> FakeSsh {
 }
 
 fn start(fake: &FakeSsh, home: &Home) -> (tempfile::TempDir, Session) {
-    let (dir, config) = healthy_store();
-    let session = Session::start(
-        &config,
-        30,
-        100,
-        &[("PATH", &fake.path_env()), ("HOME", home.path())],
-    );
+    let (dir, _config, session) = start_at(fake, home);
     (dir, session)
 }
 
+/// [`start`], and the folder of the saved hosts as well, for tests that look at
+/// what was saved.
+fn start_at(fake: &FakeSsh, home: &Home) -> (tempfile::TempDir, PathBuf, Session) {
+    let (dir, config) = healthy_store();
+    let session = start_with_config(fake, home, &config);
+    (dir, config, session)
+}
+
+fn start_with_config(fake: &FakeSsh, home: &Home, config: &Path) -> Session {
+    Session::start(
+        config,
+        30,
+        100,
+        &[("PATH", &fake.path_env()), ("HOME", home.path())],
+    )
+}
+
 /// Waits for the list, presses K and waits for the keys screen with `ready`.
+///
+/// It also waits for `r refresh`, which only the keys screen's footer has: the
+/// list's footer shares words with it (`Up/Down j/k move`), so waiting for those
+/// can be satisfied by the list's footer while the keys screen is still being
+/// drawn, and a test that then asserts a word is absent reads a half-drawn screen.
 fn open_keys(session: &mut Session, ready: impl Fn(&support::Screen) -> bool) {
     session.wait_until("the list", |s| s.alt_screen && s.contains(HOME_SCREEN));
     session.send(b"K");
     session.wait_until("the keys screen", |s| {
-        s.alt_screen && s.contains("Keys in ") && ready(s)
+        s.alt_screen && s.contains("Keys in ") && s.contains("r refresh") && ready(s)
     });
 }
 
@@ -782,6 +799,19 @@ cat > "$HOME/sent-stdin"
 touch "$HOME/ssh-ran"
 exit 0"#;
 
+/// Waits for the question that follows a successful send, and answers no: for
+/// the tests that are about the send and not about using the key.
+fn decline_the_key(session: &mut Session, host: &str) {
+    session.wait_until("the question about using the key", |s| {
+        said(s).contains(&format!("Use this key for '{host}' from now on?"))
+            && s.contains("y use it")
+    });
+    session.send(b"n");
+    session.wait_until("the question answered", |s| {
+        said(s).contains(&format!("'{host}' was left as it was.")) && !s.contains("Use this key?")
+    });
+}
+
 /// Presses c on the keys screen, picks `db` (the first host: they are listed by
 /// name) and waits for the question.
 fn ask_to_send(session: &mut Session) {
@@ -857,6 +887,7 @@ fn c_sends_the_key_on_stdin_and_ssh_asks_for_the_password_on_the_real_terminal()
             .any(|a| a.contains("AAAA") || a.contains("touch pwned")),
         "the key is not in the arguments: {args:?}"
     );
+    decline_the_key(&mut session, "db");
     quit(session);
 }
 
@@ -1050,6 +1081,7 @@ fn what_is_typed_while_the_key_is_being_sent_is_not_run_as_commands_afterwards()
     });
     assert!(session.is_running(), "a typed q must not quit");
     assert!(!session.screen().contains("New key"));
+    decline_the_key(&mut session, "db");
     quit(session);
 }
 
@@ -1094,6 +1126,611 @@ fn a_host_that_has_forwards_and_agent_forwarding_gets_neither_when_a_key_is_sent
             .iter()
             .any(|a| a == "-A" || a == "-L" || a.contains("8080")),
         "{args:?}"
+    );
+    decline_the_key(&mut session, "busy");
+    quit(session);
+}
+
+// ---- using a key that was sent, and choosing the identity file ---------------------------------
+
+const CTRL_S: &[u8] = b"\x13";
+
+/// The saved hosts of `config`, by name, with the identity file each has.
+fn identity_files(config: &Path) -> Vec<(String, Option<String>)> {
+    let mut hosts: Vec<(String, Option<String>)> = Store::at(config)
+        .load()
+        .unwrap()
+        .hosts
+        .as_slice()
+        .iter()
+        .map(|host| (host.name.clone(), host.identity_file.clone()))
+        .collect();
+    hosts.sort();
+    hosts
+}
+
+/// Sends the key of `id_ed25519` to `db` and waits for the question about using
+/// it, having typed a password on the fake ssh's prompt.
+fn send_and_wait_for_the_question(session: &mut Session, replaces: Option<&str>) {
+    ask_to_send(session);
+    session.send(b"y");
+    session.wait_until("ssh asking for the password", |s| {
+        s.normal_contains("FAKE-PASSWORD:")
+    });
+    session.send(b"secret\r");
+    // Each fragment is on one line of the popup: a phrase that wraps would be
+    // joined with whatever is drawn to the left of the popup on the next line.
+    session.wait_until("the question", |s| {
+        let text = said(s);
+        text.contains("Use this key for 'db' from now on?")
+            && text.contains("Press y to use it, or n to leave the host as it is.")
+            && replaces.is_none_or(|old| {
+                text.contains(&format!("This replaces {old}, which the host uses now."))
+            })
+            && s.contains("y use it")
+    });
+}
+
+#[test]
+fn y_after_a_send_sets_the_hosts_key_and_saves_it_and_only_then() {
+    let home = with_a_public_key();
+    let fake = fakes_with_ssh(ASKS_FOR_A_PASSWORD);
+    let (_dir, config, mut session) = start_at(&fake, &home);
+    let before = fs::read(config.join(HOSTS_FILE)).unwrap();
+    open_keys(&mut session, |s| s.contains("id_ed25519"));
+
+    send_and_wait_for_the_question(&mut session, None);
+    assert_eq!(
+        fs::read(config.join(HOSTS_FILE)).unwrap(),
+        before,
+        "asking saved nothing"
+    );
+    // Nothing but y answers it: Enter, letters and q do not.
+    session.send(b"\rjaq");
+    assert!(session.is_running(), "a q at the question does not quit");
+    assert_eq!(fs::read(config.join(HOSTS_FILE)).unwrap(), before);
+
+    session.send(b"y");
+    session.wait_until("the result", |s| {
+        s.alt_screen
+            && said(s).contains("'db' now uses the key 'id_ed25519' (~/.ssh/id_ed25519).")
+            && !s.contains("Use this key?")
+            && s.contains("Keys in ")
+    });
+    assert_eq!(
+        identity_files(&config),
+        [
+            ("db".to_string(), Some("~/.ssh/id_ed25519".to_string())),
+            ("web".to_string(), None)
+        ]
+    );
+    assert!(
+        Store::at(&config).backup_path().exists(),
+        "the previous version is kept"
+    );
+    assert_eq!(
+        fs::metadata(config.join(HOSTS_FILE))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    quit(session);
+}
+
+#[test]
+fn n_or_esc_after_a_send_leaves_the_saved_hosts_exactly_as_they_were() {
+    for answer in [&b"n"[..], &b"\x1b"[..]] {
+        let home = with_a_public_key();
+        let fake = fakes_with_ssh(ASKS_FOR_A_PASSWORD);
+        let (_dir, config, mut session) = start_at(&fake, &home);
+        let before = fs::read(config.join(HOSTS_FILE)).unwrap();
+        open_keys(&mut session, |s| s.contains("id_ed25519"));
+        send_and_wait_for_the_question(&mut session, None);
+        session.send(answer);
+        session.wait_until("the question answered", |s| {
+            said(s).contains("'db' was left as it was.")
+                && !s.contains("Use this key?")
+                && s.contains("Keys in ")
+        });
+        assert_eq!(
+            fs::read(config.join(HOSTS_FILE)).unwrap(),
+            before,
+            "{answer:?}"
+        );
+        quit(session);
+    }
+}
+
+/// A store with `db` and `web`, where `db` has `identity_file`.
+fn store_where_db_has(identity_file: &str) -> (tempfile::TempDir, PathBuf) {
+    use bifrost_ssh::domain::{Host, Hosts};
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("bifrost");
+    let mut hosts = Hosts::new();
+    hosts.add(Host::new("web", "192.0.2.1")).unwrap();
+    let mut db = Host::new("db", "192.0.2.2");
+    db.identity_file = Some(identity_file.to_string());
+    hosts.add(db).unwrap();
+    Store::at(&config).save(&hosts).unwrap();
+    (dir, config)
+}
+
+#[test]
+fn a_host_that_already_uses_the_key_is_not_asked_however_its_path_is_written() {
+    for spelled in ["~/.ssh/id_ed25519", "HOME/.ssh/id_ed25519"] {
+        let home = with_a_public_key();
+        let spelled = spelled.replace("HOME", home.path());
+        let (_store_dir, config) = store_where_db_has(&spelled);
+        let fake = fakes_with_ssh(ASKS_FOR_A_PASSWORD);
+        let mut session = start_with_config(&fake, &home, &config);
+        open_keys(&mut session, |s| s.contains("id_ed25519"));
+        ask_to_send(&mut session);
+        session.send(b"y");
+        session.wait_until("ssh asking for the password", |s| {
+            s.normal_contains("FAKE-PASSWORD:")
+        });
+        session.send(b"secret\r");
+        session.wait_until("the result and no question", |s| {
+            s.alt_screen
+                && said(s).contains("Sent the public key of 'id_ed25519' to 'db'.")
+                && !s.contains("Use this key?")
+        });
+        // The list's keys work: nothing is open, so q quits.
+        quit(session);
+        assert_eq!(
+            identity_files(&config)[0],
+            ("db".to_string(), Some(spelled.clone()))
+        );
+    }
+}
+
+#[test]
+fn a_host_with_another_key_is_told_what_would_be_replaced_and_yes_replaces_it() {
+    let home = with_a_public_key();
+    let (_store_dir, config) = store_where_db_has("~/.ssh/other_key");
+    let fake = fakes_with_ssh(ASKS_FOR_A_PASSWORD);
+    let mut session = start_with_config(&fake, &home, &config);
+    open_keys(&mut session, |s| s.contains("id_ed25519"));
+    send_and_wait_for_the_question(&mut session, Some("~/.ssh/other_key"));
+    session.send(b"y");
+    session.wait_until("the result", |s| {
+        said(s).contains("'db' now uses the key 'id_ed25519'")
+    });
+    assert_eq!(
+        identity_files(&config)[0],
+        ("db".to_string(), Some("~/.ssh/id_ed25519".to_string()))
+    );
+    quit(session);
+}
+
+#[test]
+fn a_send_that_failed_asks_nothing() {
+    let home = with_a_public_key();
+    let fake = fakes_with_ssh("cat > /dev/null\necho 'mkdir: no' >&2\nexit 3");
+    let (_dir, config, mut session) = start_at(&fake, &home);
+    let before = fs::read(config.join(HOSTS_FILE)).unwrap();
+    open_keys(&mut session, |s| s.contains("id_ed25519"));
+    ask_to_send(&mut session);
+    session.send(b"y");
+    session.wait_until("the failure", |s| said(s).contains("'db' ran the command"));
+    assert!(!session.screen().contains("Use this key?"));
+    assert_eq!(fs::read(config.join(HOSTS_FILE)).unwrap(), before);
+    quit(session);
+}
+
+/// Opens the add form on the identity file, with a name and a host name typed.
+fn add_form_on_the_identity_file(session: &mut Session) {
+    session.wait_until("the list", |s| s.alt_screen && s.contains(HOME_SCREEN));
+    session.send(b"a");
+    session.wait_until("the form", |s| s.contains("Add host"));
+    session.send(b"app\t");
+    session.send(b"app.example.com\t\t\t");
+    session.wait_until("the identity file", |s| said(s).contains("> Identity file"));
+}
+
+#[test]
+fn the_identity_file_is_chosen_from_the_keys_found_and_saved_as_a_path() {
+    let home = Home::new(&[("id_ed25519", 0o600), ("old", 0o600)]);
+    let fake = fakes(KEYGEN, AGENT_WITH_KEY);
+    let (_dir, config, mut session) = start_at(&fake, &home);
+    add_form_on_the_identity_file(&mut session);
+
+    session.send(b"\r");
+    session.wait_until("the list of keys", |s| {
+        let text = said(s);
+        text.contains("Key file")
+            && text.contains("> (none) ssh uses its default keys")
+            && text.contains("id_ed25519 ed25519")
+            && text.contains("old rsa 2048")
+            && text.contains("Another file type a path yourself")
+            && s.contains("Enter choose")
+    });
+    // The list is names and types, and needed no agent: ssh-add was never run.
+    assert!(
+        fake.program_arguments("ssh-add").is_none(),
+        "the agent was asked: {:?}",
+        fake.program_arguments("ssh-add")
+    );
+    let keygen = fake.program_arguments("ssh-keygen").unwrap();
+    assert_eq!(
+        keygen[..2],
+        ["-l", "-f"],
+        "only reading, never making: {keygen:?}"
+    );
+
+    session.send(b"j\r");
+    session.wait_until("the key in the field", |s| {
+        said(s).contains("Identity file ~/.ssh/id_ed25519") && !s.contains("Key file")
+    });
+    session.send(CTRL_S);
+    session.wait_until("saved", |s| {
+        s.alt_screen
+            && said(s).contains("Added host 'app'.")
+            && s.contains(HOME_SCREEN.replace('2', "3").as_str())
+    });
+    assert!(
+        identity_files(&config)
+            .contains(&("app".to_string(), Some("~/.ssh/id_ed25519".to_string()))),
+        "{:?}",
+        identity_files(&config)
+    );
+    quit(session);
+}
+
+#[test]
+fn none_clears_the_key_and_another_file_keeps_a_path_typed_by_hand() {
+    let home = Home::new(&[("id_ed25519", 0o600)]);
+    let fake = fakes(KEYGEN, AGENT_WITH_KEY);
+    let (_dir, config, mut session) = start_at(&fake, &home);
+    add_form_on_the_identity_file(&mut session);
+
+    // A path that is somewhere else, typed: the list keeps it under "Another file".
+    session.send(b"/elsewhere/key\r");
+    session.wait_until("the list with the path kept", |s| {
+        said(s).contains("> Another file keeps /elsewhere/key")
+    });
+    session.send(b"\r");
+    session.wait_until("back to typing, the path there", |s| {
+        said(s).contains("Identity file /elsewhere/key") && !s.contains("Key file")
+    });
+    // Typing goes on where it was.
+    session.send(b"2");
+    session.wait_until("the path grew", |s| {
+        said(s).contains("Identity file /elsewhere/key2")
+    });
+    // None empties it.
+    session.send(b"\r");
+    session.wait_until("the list", |s| s.contains("Key file"));
+    session.send(b"\x1b[H"); // Home
+    session.send(b"\r");
+    session.wait_until("the field is empty", |s| {
+        !s.contains("Key file") && !said(s).contains("/elsewhere/key2")
+    });
+    session.send(CTRL_S);
+    session.wait_until("saved", |s| said(s).contains("Added host 'app'."));
+    assert!(
+        identity_files(&config).contains(&("app".to_string(), None)),
+        "{:?}",
+        identity_files(&config)
+    );
+    quit(session);
+}
+
+#[test]
+fn a_path_typed_by_hand_is_saved_as_typed_and_esc_closes_the_list_without_changing_it() {
+    let home = Home::new(&[("id_ed25519", 0o600)]);
+    let fake = fakes(KEYGEN, AGENT_WITH_KEY);
+    let (_dir, config, mut session) = start_at(&fake, &home);
+    add_form_on_the_identity_file(&mut session);
+    session.send(b"/elsewhere/key");
+    session.send(b"\r");
+    session.wait_until("the list", |s| s.contains("Key file"));
+    session.send(b"j\x1b");
+    session.wait_until("the list closed, the path there", |s| {
+        !s.contains("Key file") && said(s).contains("Identity file /elsewhere/key")
+    });
+    session.send(CTRL_S);
+    session.wait_until("saved", |s| said(s).contains("Added host 'app'."));
+    assert!(
+        identity_files(&config).contains(&("app".to_string(), Some("/elsewhere/key".to_string()))),
+        "{:?}",
+        identity_files(&config)
+    );
+    quit(session);
+}
+
+#[test]
+fn with_no_keys_the_list_says_what_to_do_and_typing_still_works() {
+    let home = Home::new(&[]);
+    let fake = fakes(KEYGEN, NO_AGENT);
+    let (_dir, _config, mut session) = start_at(&fake, &home);
+    add_form_on_the_identity_file(&mut session);
+    session.send(b"\r");
+    session.wait_until("the list and its note", |s| {
+        let text = said(s);
+        text.contains("(none)")
+            && text.contains("Another file")
+            && text.contains("There are no key pairs in")
+            && text.contains("then g)")
+    });
+    session.send(b"\x1b");
+    session.wait_until("the form again", |s| !s.contains("Key file"));
+    quit_from_the_form(session);
+}
+
+/// Leaves the form (Esc, then y to discard) and quits from the list.
+fn quit_from_the_form(mut session: Session) {
+    session.send(b"\x1b");
+    session.wait_until("the question", |s| s.contains("Discard changes?"));
+    session.send(b"y");
+    session.wait_until("the list", |s| {
+        s.contains(HOME_SCREEN) && !s.contains("Add host")
+    });
+    quit(session);
+}
+
+#[test]
+fn a_key_file_with_control_characters_in_its_name_is_never_offered_or_drawn() {
+    let home = Home::new(&[("fine", 0o600)]);
+    let evil = "evil\x1b]0;pwned\x07";
+    fs::write(home.file(evil), "x").unwrap();
+    fs::set_permissions(home.file(evil), fs::Permissions::from_mode(0o600)).unwrap();
+    fs::write(home.file(&format!("{evil}.pub")), "x").unwrap();
+    let fake = fakes(
+        "echo '256 SHA256:Gch6wPWbVBGcUR0XuYOLVqoZ+L5m7d4yzsUg0dxJVTw c (ED25519)'",
+        NO_AGENT,
+    );
+    let (_dir, _config, mut session) = start_at(&fake, &home);
+    add_form_on_the_identity_file(&mut session);
+    session.send(b"\r");
+    session.wait_until("the list", |s| {
+        s.contains("Key file") && said(s).contains("fine ed25519")
+    });
+    assert!(
+        !session.screen().contains("pwned"),
+        "{}",
+        session.screen().text()
+    );
+    // One Esc at a time: two together are read as an Alt+Esc chord.
+    session.send(b"\x1b");
+    session.wait_until("the list closed", |s| !s.contains("Key file"));
+    session.send(b"\x1b");
+    session.wait_until("the question", |s| s.contains("Discard changes?"));
+    session.send(b"y");
+    session.wait_until("the list", |s| {
+        s.contains(HOME_SCREEN) && !s.contains("Add host")
+    });
+    session.send(b"q");
+    let (status, output) = session.finish();
+    assert!(status.success(), "{status:?}");
+    assert_restored(&output);
+    assert!(!contains_bytes(&output, b"\x1b]0;pwned"), "a title was set");
+}
+
+// ---- deleting a key --------------------------------------------------------------------------
+
+/// Whether some row of the screen has `fragment` in it. For text that wraps in a
+/// popup, where the flattened screen would join it with what is drawn beside it.
+fn row_has(screen: &support::Screen, fragment: &str) -> bool {
+    screen.lines().iter().any(|line| line.contains(fragment))
+}
+
+/// A home with the keys `id_ed25519` and `old`, and files that are not keys next
+/// to them: everything a deletion of one key must leave alone.
+fn home_with_bystanders() -> Home {
+    let home = Home::new(&[("id_ed25519", 0o600), ("old", 0o600)]);
+    fs::write(
+        home.file("lonely.pub"),
+        "a public key with no private half\n",
+    )
+    .unwrap();
+    home
+}
+
+const BYSTANDERS: [(&str, &str); 6] = [
+    ("old", "not a real private key\n"),
+    ("old.pub", "not a real public key\n"),
+    ("config", "x\n"),
+    ("known_hosts", "x\n"),
+    ("authorized_keys", "x\n"),
+    ("lonely.pub", "a public key with no private half\n"),
+];
+
+fn assert_bystanders_untouched(home: &Home) {
+    for (name, text) in BYSTANDERS {
+        assert_eq!(
+            fs::read_to_string(home.file(name)).ok().as_deref(),
+            Some(text),
+            "{name} must be exactly as it was"
+        );
+    }
+}
+
+fn wait_for_the_delete_question(session: &mut Session, key: &str) {
+    session.wait_until("the delete question", |s| {
+        said(s).contains(&format!("Delete the key '{key}'?"))
+            && row_has(s, "Type the key's name to confirm:")
+            && s.contains("Enter delete")
+    });
+}
+
+#[test]
+fn d_deletes_the_pair_after_the_name_is_typed_and_nothing_else_and_no_host_is_changed() {
+    let home = home_with_bystanders();
+    let (_store_dir, config) = store_where_db_has("~/.ssh/id_ed25519");
+    let hosts_before = fs::read(config.join(HOSTS_FILE)).unwrap();
+    let fake = fakes(KEYGEN, AGENT_WITH_KEY);
+    let mut session = start_with_config(&fake, &home, &config);
+    open_keys(&mut session, |s| {
+        s.contains("id_ed25519") && s.contains("D delete")
+    });
+
+    session.send(b"D");
+    wait_for_the_delete_question(&mut session, "id_ed25519");
+    // What the question must say, before anything is typed.
+    let screen = session.screen();
+    assert!(row_has(&screen, "Used by: db."), "{}", screen.text());
+    assert!(
+        row_has(
+            &screen,
+            "Bifrost cannot know which servers have this key in"
+        ),
+        "{}",
+        screen.text()
+    );
+    assert!(
+        row_has(&screen, "authorized_keys. Deleting it means losing"),
+        "{}",
+        screen.text()
+    );
+    assert!(
+        row_has(&screen, "access to those servers until another key is"),
+        "{}",
+        screen.text()
+    );
+    assert!(
+        row_has(&screen, "The agent holds this key"),
+        "it is loaded in the agent: {}",
+        screen.text()
+    );
+    assert!(home.file("id_ed25519").exists(), "asking deleted nothing");
+
+    // A wrong name deletes nothing and says so.
+    session.send(b"nope\r");
+    session.wait_until("the complaint", |s| {
+        row_has(s, "That is not the key's name.")
+    });
+    assert!(home.file("id_ed25519").exists() && home.file("id_ed25519.pub").exists());
+    // Erase it, and type the name.
+    session.send(&[0x7f; 4]);
+    session.send(b"id_ed25519\r");
+    session.wait_until("the result", |s| {
+        let text = said(s);
+        text.contains("Deleted the key 'id_ed25519': removed")
+            && text.contains("These saved hosts still name it as their key file: db.")
+            && !s.contains("Delete key")
+    });
+    session.wait_until("the keys read again", |s| {
+        row_has(s, "> old") && !row_has(s, "id_ed25519  ")
+    });
+
+    // On disk: the pair is gone, and every other file is exactly as it was.
+    assert!(!home.file("id_ed25519").exists(), "the private key is gone");
+    assert!(!home.file("id_ed25519.pub").exists(), "and its .pub");
+    assert_bystanders_untouched(&home);
+    // The saved hosts were not touched: db still names the key it no longer has.
+    assert_eq!(fs::read(config.join(HOSTS_FILE)).unwrap(), hosts_before);
+    assert_eq!(
+        identity_files(&config)[0],
+        ("db".to_string(), Some("~/.ssh/id_ed25519".to_string()))
+    );
+    quit(session);
+}
+
+#[test]
+fn nothing_is_deleted_by_a_lowercase_d_esc_a_wrong_name_or_ctrl_c() {
+    let home = home_with_bystanders();
+    let fake = fakes(KEYGEN, AGENT_WITH_KEY);
+    let (_dir, mut session) = start(&fake, &home);
+    open_keys(&mut session, |s| {
+        s.contains("id_ed25519") && s.contains("D delete")
+    });
+    let untouched = |home: &Home| {
+        assert!(home.file("id_ed25519").exists() && home.file("id_ed25519.pub").exists());
+        assert_bystanders_untouched(home);
+    };
+
+    // A plain d does nothing: the help that comes after it is what opens.
+    session.send(b"d?");
+    session.wait_until("the help, and no question", |s| {
+        s.contains("These keys work in Bifrost:") && !s.contains("Delete key")
+    });
+    session.send(b"\x1b");
+    session.wait_until("the keys again", |s| {
+        s.contains("Keys in ") && !s.contains("These keys work")
+    });
+    untouched(&home);
+
+    // Esc gives up.
+    session.send(b"D");
+    wait_for_the_delete_question(&mut session, "id_ed25519");
+    session.send(b"id_ed25519");
+    session.send(b"\x1b");
+    session.wait_until("given up", |s| {
+        said(s).contains("Nothing was deleted.") && !s.contains("Delete key")
+    });
+    untouched(&home);
+
+    // Names that are nearly right are wrong: case, a space, a prefix, a suffix.
+    for typed in ["ID_ED25519", "id_ed25519 ", "id_ed2551", "id_ed25519x"] {
+        session.send(b"D");
+        wait_for_the_delete_question(&mut session, "id_ed25519");
+        session.send(typed.as_bytes());
+        session.send(b"\r");
+        session.wait_until("the complaint", |s| {
+            row_has(s, "That is not the key's name.")
+        });
+        untouched(&home);
+        session.send(b"\x1b");
+        session.wait_until("given up", |s| !s.contains("Delete key"));
+    }
+
+    // Ctrl-C at the question quits, with everything where it was.
+    session.send(b"D");
+    wait_for_the_delete_question(&mut session, "id_ed25519");
+    session.send(b"id_ed25519");
+    session.send(CTRL_C);
+    let (status, output) = session.finish();
+    assert!(status.success(), "{status:?}");
+    assert_restored(&output);
+    untouched(&home);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_key_that_is_a_link_is_removed_as_a_link_and_the_file_it_points_to_stays() {
+    let home = Home::new(&[]);
+    let elsewhere = tempfile::tempdir().unwrap();
+    let real = elsewhere.path().join("real_private");
+    fs::write(&real, "THE REAL PRIVATE KEY\n").unwrap();
+    fs::set_permissions(&real, fs::Permissions::from_mode(0o600)).unwrap();
+    std::os::unix::fs::symlink(&real, home.file("linked")).unwrap();
+    fs::write(home.file("linked.pub"), "a public key\n").unwrap();
+    let fake = fakes(
+        "echo '256 SHA256:Gch6wPWbVBGcUR0XuYOLVqoZ+L5m7d4yzsUg0dxJVTw c (ED25519)'",
+        NO_AGENT,
+    );
+    let (_dir, mut session) = start(&fake, &home);
+    open_keys(&mut session, |s| {
+        s.contains("linked") && s.contains("D delete")
+    });
+
+    session.send(b"D");
+    wait_for_the_delete_question(&mut session, "linked");
+    assert!(
+        row_has(
+            &session.screen(),
+            "It is a symbolic link: only the link is removed"
+        ),
+        "{}",
+        session.screen().text()
+    );
+    session.send(b"linked\r");
+    session.wait_until("deleted", |s| {
+        said(s).contains("Deleted the key 'linked': removed")
+    });
+
+    assert!(
+        fs::symlink_metadata(home.file("linked")).is_err(),
+        "the link is gone"
+    );
+    assert!(!home.file("linked.pub").exists());
+    assert_eq!(
+        fs::read_to_string(&real).unwrap(),
+        "THE REAL PRIVATE KEY\n",
+        "the file the link pointed to is untouched"
     );
     quit(session);
 }

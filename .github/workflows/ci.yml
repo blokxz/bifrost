@@ -51,12 +51,12 @@ jobs:
           persist-credentials: false
 
       - name: Build the tests once
-        run: cargo test --locked --test pty --test pty_connect --test pty_keys --test connect --test cli_connect --no-run
+        run: cargo test --locked --test pty --test pty_connect --test pty_keys --test pty_sshconfig --test import_timeout --test connect --test cli_connect --no-run
 
       - name: Run them 20 times
         run: |
           for run in $(seq 1 20); do
             echo "::group::run $run of 20"
-            cargo test --locked --test pty --test pty_connect --test pty_keys --test connect --test cli_connect
+            cargo test --locked --test pty --test pty_connect --test pty_keys --test pty_sshconfig --test import_timeout --test connect --test cli_connect
             echo "::endgroup::"
           done

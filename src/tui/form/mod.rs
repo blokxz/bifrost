@@ -9,6 +9,10 @@
 //!   them, and a field is checked when the focus leaves it.
 //! - The last four fields sit in a collapsed "Advanced" section.
 //! - The jump host is picked from a list of saved hosts that would be valid.
+//! - The identity file is picked from a list of the keys found in the ssh
+//!   directory, with "none" and "another file" (typing a path) alongside. The form
+//!   does no I/O, so it asks for the list ([`Outcome::NeedKeys`]) the first time it
+//!   is wanted and keeps it.
 //! - Saving is blocked while any field is invalid.
 
 use std::collections::HashMap;
@@ -43,6 +47,9 @@ pub enum Outcome {
     Stay,
     /// The user asked to save.
     Save,
+    /// The user asked to choose a key file and the form has no list of keys yet.
+    /// The app reads them and gives them back with [`Form::open_key_picker`].
+    NeedKeys,
     /// The form is finished without saving.
     Close,
 }
@@ -55,11 +62,57 @@ pub struct Picker {
     pub selected: usize,
 }
 
+/// A key that can be chosen as a host's identity file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyChoice {
+    /// The private key's file name. Raw: sanitize before showing.
+    pub name: String,
+    /// What is stored as the identity file (`~/.ssh/name`).
+    pub value: String,
+    /// The same file spelled in full, so that a host that has it written that way
+    /// is shown as having this key.
+    pub full_path: String,
+    /// The type as a person reads it (`ed25519`, `rsa 3072`), when `ssh-keygen`
+    /// could tell.
+    pub kind: Option<String>,
+}
+
+/// The keys the identity file can be chosen from.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct KeyList {
+    pub choices: Vec<KeyChoice>,
+    /// What to tell the user when the list is not what they would expect: no keys,
+    /// or a folder that could not be read. Raw: sanitize before showing.
+    pub note: Option<String>,
+}
+
+/// One line of the list of key files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyPick {
+    /// No identity file: ssh uses its default keys.
+    None,
+    Key(KeyChoice),
+    /// A file that is not in the list: the user types its path.
+    Typed,
+}
+
+/// The list of key files an identity file is chosen from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyPicker {
+    pub options: Vec<KeyPick>,
+    pub selected: usize,
+    pub note: Option<String>,
+    /// The path already typed, when it is not one of the keys: shown on the
+    /// "another file" line so that it is clear it is kept.
+    pub typed: Option<String>,
+}
+
 /// What the keys do right now.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FormMode {
     Editing,
     PickJump(Picker),
+    PickKey(KeyPicker),
     /// Asking whether to throw away unsaved changes.
     ConfirmDiscard,
 }
@@ -83,6 +136,8 @@ pub struct Form {
     focus: FormField,
     errors: HashMap<FormField, String>,
     initial: Snapshot,
+    /// The keys the identity file can be chosen from, once they have been read.
+    keys: Option<KeyList>,
     /// A message about the form as a whole (for example why saving failed).
     notice: Option<String>,
     mode: FormMode,
@@ -138,6 +193,7 @@ impl Form {
                 jump: None,
                 forward_agent: false,
             },
+            keys: None,
             notice: None,
             mode: FormMode::Editing,
             scroll: 0,
@@ -379,6 +435,10 @@ impl Form {
                 self.pick_key(key);
                 return Outcome::Stay;
             }
+            FormMode::PickKey(_) => {
+                self.pick_key_file(key);
+                return Outcome::Stay;
+            }
             FormMode::Editing => {}
         }
 
@@ -405,8 +465,8 @@ impl Form {
                 self.move_focus(-1, hosts);
             }
             KeyCode::Tab | KeyCode::Down => self.move_focus(1, hosts),
-            KeyCode::Enter => self.activate(hosts),
-            KeyCode::Char(' ') if !self.focus.is_text() => self.activate(hosts),
+            KeyCode::Enter => return self.activate(hosts),
+            KeyCode::Char(' ') if !self.focus.is_text() => return self.activate(hosts),
             _ => {
                 let changed = self
                     .inputs
@@ -431,8 +491,16 @@ impl Form {
     }
 
     /// Enter (or Space on a row that is not a text box).
-    fn activate(&mut self, hosts: &Hosts) {
+    fn activate(&mut self, hosts: &Hosts) -> Outcome {
         match self.focus {
+            FormField::IdentityFile => {
+                return if self.keys.is_some() {
+                    self.open_key_list();
+                    Outcome::Stay
+                } else {
+                    Outcome::NeedKeys
+                };
+            }
             FormField::Advanced => self.advanced_open = !self.advanced_open,
             FormField::ForwardAgent => self.forward_agent = !self.forward_agent,
             FormField::ProxyJump => {
@@ -450,6 +518,85 @@ impl Form {
                 self.mode = FormMode::PickJump(Picker { options, selected });
             }
             _ => self.move_focus(1, hosts),
+        }
+        Outcome::Stay
+    }
+
+    /// Gives the form the keys that were read, and opens the list of them. Only
+    /// while the identity file is what the form is on: a list that arrives after
+    /// the user moved on is kept for next time and not shown.
+    ///
+    /// A key whose path the form would refuse (for example one that starts with
+    /// `-`) is left out, so the list never offers what saving would then reject.
+    pub fn open_key_picker(&mut self, mut list: KeyList) {
+        list.choices
+            .retain(|choice| fields::parse_identity_file(&choice.value).is_ok());
+        self.keys = Some(list);
+        if self.mode == FormMode::Editing && self.focus == FormField::IdentityFile {
+            self.open_key_list();
+        }
+    }
+
+    /// Opens the list of keys, with what is typed now selected.
+    fn open_key_list(&mut self) {
+        let list = self.keys.clone().unwrap_or_default();
+        let text = self.text(FormField::IdentityFile).trim().to_string();
+        let mut options = vec![KeyPick::None];
+        options.extend(list.choices.iter().cloned().map(KeyPick::Key));
+        options.push(KeyPick::Typed);
+        let another = options.len() - 1;
+        let selected = if text.is_empty() {
+            0
+        } else {
+            list.choices
+                .iter()
+                .position(|choice| choice.value == text || choice.full_path == text)
+                .map_or(another, |at| at + 1)
+        };
+        self.mode = FormMode::PickKey(KeyPicker {
+            typed: (selected == another && !text.is_empty()).then_some(text),
+            options,
+            selected,
+            note: list.note,
+        });
+    }
+
+    fn pick_key_file(&mut self, key: KeyEvent) {
+        let FormMode::PickKey(picker) = &mut self.mode else {
+            return;
+        };
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return;
+        }
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => picker.selected = picker.selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => {
+                picker.selected = (picker.selected + 1).min(picker.options.len() - 1);
+            }
+            KeyCode::Home => picker.selected = 0,
+            KeyCode::End => picker.selected = picker.options.len() - 1,
+            KeyCode::Enter => {
+                let chosen = picker.options[picker.selected].clone();
+                self.mode = FormMode::Editing;
+                match chosen {
+                    KeyPick::None => {
+                        self.inputs
+                            .insert(FormField::IdentityFile, TextInput::new(""));
+                    }
+                    KeyPick::Key(choice) => {
+                        self.inputs
+                            .insert(FormField::IdentityFile, TextInput::new(choice.value));
+                    }
+                    // Back to the text box as it was, to type in.
+                    KeyPick::Typed => {}
+                }
+                self.errors.remove(&FormField::IdentityFile);
+            }
+            KeyCode::Esc => self.mode = FormMode::Editing,
+            _ => {}
         }
     }
 
@@ -1367,5 +1514,386 @@ mod tests {
         assert_eq!(form.notice(), Some("Could not save."));
         form.handle_key(ch('a'), &hosts);
         assert_eq!(form.notice(), None);
+    }
+
+    // ---- the list of key files -------------------------------------------------
+
+    fn key(name: &str, kind: Option<&str>) -> KeyChoice {
+        KeyChoice {
+            name: name.to_string(),
+            value: format!("~/.ssh/{name}"),
+            full_path: format!("/home/dev/.ssh/{name}"),
+            kind: kind.map(str::to_string),
+        }
+    }
+
+    fn two_keys() -> KeyList {
+        KeyList {
+            choices: vec![
+                key("id_ed25519", Some("ed25519")),
+                key("id_rsa_old", Some("rsa 3072")),
+            ],
+            note: None,
+        }
+    }
+
+    /// A form on the identity file, with the keys given and the list open.
+    fn with_key_list(list: KeyList) -> (Form, Hosts) {
+        let hosts = sample();
+        let mut form = Form::add();
+        focus_on(&mut form, &hosts, FormField::IdentityFile);
+        assert_eq!(
+            form.handle_key(press(KeyCode::Enter), &hosts),
+            Outcome::NeedKeys
+        );
+        form.open_key_picker(list);
+        (form, hosts)
+    }
+
+    fn key_picker(form: &Form) -> &KeyPicker {
+        match form.mode() {
+            FormMode::PickKey(picker) => picker,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn type_identity(form: &mut Form, hosts: &Hosts, text: &str) {
+        focus_on(form, hosts, FormField::IdentityFile);
+        for c in text.chars() {
+            form.handle_key(ch(c), hosts);
+        }
+    }
+
+    #[test]
+    fn enter_on_the_identity_file_asks_for_the_keys_and_on_other_fields_still_moves_on() {
+        let hosts = sample();
+        let mut form = Form::add();
+        // Enter on the other text fields is what it was: to the next field.
+        for field in [
+            FormField::Name,
+            FormField::Hostname,
+            FormField::User,
+            FormField::Port,
+        ] {
+            focus_on(&mut form, &hosts, field);
+            assert_eq!(
+                form.handle_key(press(KeyCode::Enter), &hosts),
+                Outcome::Stay
+            );
+            assert_ne!(form.focus(), field, "{field:?} moved on");
+        }
+        assert_eq!(form.focus(), FormField::IdentityFile);
+        // Here it asks for the keys, and stays put.
+        assert_eq!(
+            form.handle_key(press(KeyCode::Enter), &hosts),
+            Outcome::NeedKeys
+        );
+        assert_eq!(form.focus(), FormField::IdentityFile);
+        assert_eq!(form.mode(), &FormMode::Editing);
+        // Tab still moves on, as always.
+        form.handle_key(press(KeyCode::Tab), &hosts);
+        assert_eq!(form.focus(), FormField::Tags);
+    }
+
+    #[test]
+    fn the_list_offers_none_each_key_and_another_file_in_that_order() {
+        let (form, _) = with_key_list(two_keys());
+        let picker = key_picker(&form);
+        assert_eq!(
+            picker.options,
+            [
+                KeyPick::None,
+                KeyPick::Key(key("id_ed25519", Some("ed25519"))),
+                KeyPick::Key(key("id_rsa_old", Some("rsa 3072"))),
+                KeyPick::Typed,
+            ]
+        );
+        assert_eq!(picker.selected, 0, "none is selected when nothing is set");
+        assert_eq!(picker.typed, None);
+    }
+
+    #[test]
+    fn the_list_opens_on_the_key_the_field_already_has_however_it_is_spelled() {
+        for text in [
+            "~/.ssh/id_rsa_old",
+            "/home/dev/.ssh/id_rsa_old",
+            "  ~/.ssh/id_rsa_old  ",
+        ] {
+            let hosts = sample();
+            let mut form = Form::add();
+            type_identity(&mut form, &hosts, text);
+            assert_eq!(
+                form.handle_key(press(KeyCode::Enter), &hosts),
+                Outcome::NeedKeys
+            );
+            form.open_key_picker(two_keys());
+            assert_eq!(key_picker(&form).selected, 2, "{text:?}");
+            assert_eq!(key_picker(&form).typed, None);
+        }
+    }
+
+    #[test]
+    fn a_path_that_is_not_one_of_the_keys_is_kept_on_the_another_file_line() {
+        let hosts = sample();
+        let mut form = Form::add();
+        type_identity(&mut form, &hosts, "/elsewhere/key");
+        form.handle_key(press(KeyCode::Enter), &hosts);
+        form.open_key_picker(two_keys());
+        let picker = key_picker(&form);
+        assert_eq!(picker.selected, 3);
+        assert_eq!(picker.typed.as_deref(), Some("/elsewhere/key"));
+    }
+
+    #[test]
+    fn the_keys_are_asked_for_once_and_kept_for_the_rest_of_the_form() {
+        let (mut form, hosts) = with_key_list(two_keys());
+        form.handle_key(press(KeyCode::Esc), &hosts);
+        assert_eq!(form.mode(), &FormMode::Editing);
+        // No second question: the list opens at once.
+        assert_eq!(
+            form.handle_key(press(KeyCode::Enter), &hosts),
+            Outcome::Stay
+        );
+        assert!(matches!(form.mode(), FormMode::PickKey(_)));
+    }
+
+    #[test]
+    fn choosing_a_key_puts_its_path_in_the_field_and_the_host_gets_it() {
+        let (mut form, hosts) = with_key_list(two_keys());
+        form.handle_key(ch('j'), &hosts);
+        form.handle_key(press(KeyCode::Enter), &hosts);
+        assert_eq!(form.mode(), &FormMode::Editing);
+        assert_eq!(
+            form.input(FormField::IdentityFile).unwrap().value(),
+            "~/.ssh/id_ed25519"
+        );
+        assert_eq!(form.focus(), FormField::IdentityFile);
+        assert!(form.is_dirty());
+
+        let mut named = form;
+        type_into_name(&mut named, &hosts);
+        assert_eq!(
+            named.build(&hosts).unwrap().identity_file.as_deref(),
+            Some("~/.ssh/id_ed25519")
+        );
+    }
+
+    /// Fills the name and hostname so that the form can be built.
+    fn type_into_name(form: &mut Form, hosts: &Hosts) {
+        focus_on(form, hosts, FormField::Name);
+        for c in "app".chars() {
+            form.handle_key(ch(c), hosts);
+        }
+        focus_on(form, hosts, FormField::Hostname);
+        for c in "app.example.com".chars() {
+            form.handle_key(ch(c), hosts);
+        }
+    }
+
+    #[test]
+    fn choosing_none_clears_the_identity_file() {
+        let hosts = sample();
+        let mut form = Form::add();
+        type_identity(&mut form, &hosts, "~/.ssh/id_ed25519");
+        form.handle_key(press(KeyCode::Enter), &hosts);
+        form.open_key_picker(two_keys());
+        assert_eq!(key_picker(&form).selected, 1, "the key it has is selected");
+        form.handle_key(press(KeyCode::Home), &hosts);
+        form.handle_key(press(KeyCode::Enter), &hosts);
+        assert_eq!(form.input(FormField::IdentityFile).unwrap().value(), "");
+        type_into_name(&mut form, &hosts);
+        assert_eq!(form.build(&hosts).unwrap().identity_file, None);
+    }
+
+    #[test]
+    fn choosing_another_file_leaves_the_box_as_it_was_for_typing() {
+        let hosts = sample();
+        let mut form = Form::add();
+        type_identity(&mut form, &hosts, "/elsewhere/key");
+        form.handle_key(press(KeyCode::Enter), &hosts);
+        form.open_key_picker(two_keys());
+        form.handle_key(press(KeyCode::Enter), &hosts);
+        assert_eq!(form.mode(), &FormMode::Editing);
+        assert_eq!(
+            form.input(FormField::IdentityFile).unwrap().value(),
+            "/elsewhere/key"
+        );
+        // And typing goes on where it was.
+        form.handle_key(ch('2'), &hosts);
+        assert_eq!(
+            form.input(FormField::IdentityFile).unwrap().value(),
+            "/elsewhere/key2"
+        );
+    }
+
+    #[test]
+    fn esc_closes_the_list_and_changes_nothing() {
+        let hosts = sample();
+        let mut form = Form::add();
+        type_identity(&mut form, &hosts, "~/.ssh/mine");
+        let dirty = form.is_dirty();
+        form.handle_key(press(KeyCode::Enter), &hosts);
+        form.open_key_picker(two_keys());
+        form.handle_key(press(KeyCode::Down), &hosts);
+        form.handle_key(press(KeyCode::Esc), &hosts);
+        assert_eq!(form.mode(), &FormMode::Editing);
+        assert_eq!(
+            form.input(FormField::IdentityFile).unwrap().value(),
+            "~/.ssh/mine"
+        );
+        assert_eq!(form.is_dirty(), dirty);
+    }
+
+    #[test]
+    fn choosing_clears_a_complaint_about_the_field() {
+        let hosts = sample();
+        let mut form = Form::add();
+        type_identity(&mut form, &hosts, "/x/key.pub");
+        form.handle_key(press(KeyCode::Tab), &hosts);
+        assert!(form.error(FormField::IdentityFile).is_some());
+        focus_on(&mut form, &hosts, FormField::IdentityFile);
+        form.handle_key(press(KeyCode::Enter), &hosts);
+        form.open_key_picker(two_keys());
+        form.handle_key(press(KeyCode::Home), &hosts);
+        form.handle_key(press(KeyCode::Enter), &hosts);
+        assert!(form.error(FormField::IdentityFile).is_none());
+    }
+
+    #[test]
+    fn a_key_whose_path_the_form_would_refuse_is_not_offered() {
+        let list = KeyList {
+            choices: vec![
+                key("fine", Some("ed25519")),
+                KeyChoice {
+                    name: "odd.pub".to_string(),
+                    value: "~/.ssh/odd.pub".to_string(),
+                    full_path: "/home/dev/.ssh/odd.pub".to_string(),
+                    kind: None,
+                },
+                KeyChoice {
+                    name: "ctl".to_string(),
+                    value: "~/.ssh/ctl\u{7}".to_string(),
+                    full_path: String::new(),
+                    kind: None,
+                },
+            ],
+            note: None,
+        };
+        let (form, _) = with_key_list(list);
+        let names: Vec<&str> = key_picker(&form)
+            .options
+            .iter()
+            .filter_map(|option| match option {
+                KeyPick::Key(choice) => Some(choice.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, ["fine"]);
+    }
+
+    #[test]
+    fn with_no_keys_the_list_still_has_none_and_another_file_and_carries_the_note() {
+        let (form, _) = with_key_list(KeyList {
+            choices: Vec::new(),
+            note: Some("There are no key pairs in /home/dev/.ssh.".to_string()),
+        });
+        let picker = key_picker(&form);
+        assert_eq!(picker.options, [KeyPick::None, KeyPick::Typed]);
+        assert_eq!(
+            picker.note.as_deref(),
+            Some("There are no key pairs in /home/dev/.ssh.")
+        );
+    }
+
+    #[test]
+    fn the_list_moves_stays_inside_and_ignores_typing_and_modifiers() {
+        let (mut form, hosts) = with_key_list(two_keys());
+        let at = |form: &Form| key_picker(form).selected;
+        form.handle_key(press(KeyCode::Up), &hosts);
+        assert_eq!(at(&form), 0);
+        for _ in 0..10 {
+            form.handle_key(ch('j'), &hosts);
+        }
+        assert_eq!(at(&form), 3);
+        form.handle_key(ch('k'), &hosts);
+        assert_eq!(at(&form), 2);
+        form.handle_key(press(KeyCode::Home), &hosts);
+        assert_eq!(at(&form), 0);
+        form.handle_key(press(KeyCode::End), &hosts);
+        assert_eq!(at(&form), 3);
+        // Letters do not go into the box behind the list, and Ctrl/Alt do nothing.
+        for key in [
+            ch('x'),
+            ch(' '),
+            press(KeyCode::Tab),
+            with(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            with(KeyCode::Enter, KeyModifiers::ALT),
+            with(KeyCode::Char('j'), KeyModifiers::CONTROL),
+        ] {
+            assert_eq!(form.handle_key(key, &hosts), Outcome::Stay, "{key:?}");
+            assert!(matches!(form.mode(), FormMode::PickKey(_)), "{key:?}");
+            assert_eq!(form.input(FormField::IdentityFile).unwrap().value(), "");
+        }
+        assert_eq!(at(&form), 3, "none of those moved it");
+    }
+
+    #[test]
+    fn keys_that_arrive_after_the_user_moved_on_are_kept_and_not_shown() {
+        let hosts = sample();
+        let mut form = Form::add();
+        focus_on(&mut form, &hosts, FormField::IdentityFile);
+        assert_eq!(
+            form.handle_key(press(KeyCode::Enter), &hosts),
+            Outcome::NeedKeys
+        );
+        // The user went on before the answer came.
+        form.handle_key(press(KeyCode::Tab), &hosts);
+        form.open_key_picker(two_keys());
+        assert_eq!(form.mode(), &FormMode::Editing);
+        // They are there for next time.
+        focus_on(&mut form, &hosts, FormField::IdentityFile);
+        assert_eq!(
+            form.handle_key(press(KeyCode::Enter), &hosts),
+            Outcome::Stay
+        );
+        assert!(matches!(form.mode(), FormMode::PickKey(_)));
+    }
+
+    #[test]
+    fn a_question_about_discarding_is_not_covered_by_a_list_that_arrives_late() {
+        let hosts = sample();
+        let mut form = Form::add();
+        type_identity(&mut form, &hosts, "x");
+        form.handle_key(press(KeyCode::Enter), &hosts);
+        form.handle_key(press(KeyCode::Esc), &hosts);
+        assert_eq!(form.mode(), &FormMode::ConfirmDiscard);
+        form.open_key_picker(two_keys());
+        assert_eq!(form.mode(), &FormMode::ConfirmDiscard);
+    }
+
+    #[test]
+    fn ctrl_c_with_the_list_open_still_asks_before_throwing_changes_away() {
+        let (mut form, hosts) = with_key_list(two_keys());
+        form.handle_key(press(KeyCode::Down), &hosts);
+        form.handle_key(press(KeyCode::Enter), &hosts);
+        form.handle_key(press(KeyCode::Enter), &hosts);
+        assert!(matches!(form.mode(), FormMode::PickKey(_)));
+        assert!(form.is_dirty());
+        assert!(!form.ctrl_c(), "unsaved changes: it asks first");
+        assert_eq!(form.mode(), &FormMode::ConfirmDiscard);
+    }
+
+    #[test]
+    fn the_other_fields_do_not_open_the_list_of_keys() {
+        let hosts = sample();
+        for field in [FormField::Name, FormField::Tags, FormField::Notes] {
+            let mut form = Form::add();
+            focus_on(&mut form, &hosts, field);
+            assert_ne!(
+                form.handle_key(press(KeyCode::Enter), &hosts),
+                Outcome::NeedKeys
+            );
+            assert!(!matches!(form.mode(), FormMode::PickKey(_)));
+        }
     }
 }

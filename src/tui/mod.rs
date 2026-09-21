@@ -35,6 +35,7 @@ pub mod input;
 pub mod keys;
 pub mod list;
 pub mod persist;
+pub mod sshconfig;
 pub mod startup;
 pub mod terminal;
 pub mod theme;
@@ -76,6 +77,7 @@ pub fn run(loaded: std::result::Result<(Store, Loaded), StoreError>, env: Env<'_
         home.as_ref()
             .map(|home| home.join(".ssh").join("known_hosts")),
     );
+    app.set_ssh_dir(home.as_ref().map(|home| home.join(".ssh")));
     // From here a SIGINT (which raw mode keeps the keyboard from producing, but
     // `kill -INT` and Ctrl-C during a connection do) no longer kills Bifrost.
     interrupt::arm()?;

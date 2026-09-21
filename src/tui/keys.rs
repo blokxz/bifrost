@@ -302,6 +302,79 @@ impl CopyDialog {
     }
 }
 
+/// The question asked before a key is deleted, answered by typing its name.
+#[derive(Debug)]
+pub struct DeleteQuestion {
+    /// The private key's file name, which is what has to be typed.
+    pub key: String,
+    /// The two files that would be removed, as they are written for the user.
+    pub private: String,
+    pub public: String,
+    /// The private file is a symbolic link: only the link is removed.
+    pub symlink: bool,
+    /// The saved hosts that have this key as their identity file.
+    pub used_by: Vec<String>,
+    /// The agent holds the key, and goes on holding it.
+    pub loaded: bool,
+    pub input: TextInput,
+    /// What was typed was not the name.
+    pub mismatch: bool,
+}
+
+/// What a key pressed in the delete question led to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Deletion {
+    Stay,
+    /// The user gave up.
+    Cancel,
+    /// The name was typed: delete this key.
+    Delete {
+        key: String,
+    },
+}
+
+impl DeleteQuestion {
+    /// Applies a key. Only the exact name confirms, case included, as for a host.
+    pub fn handle_key(&mut self, key: KeyEvent) -> Deletion {
+        let plain = !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        match key.code {
+            KeyCode::Esc if plain => Deletion::Cancel,
+            KeyCode::Enter if plain => {
+                if self.input.value() == self.key {
+                    Deletion::Delete {
+                        key: self.key.clone(),
+                    }
+                } else {
+                    self.mismatch = true;
+                    Deletion::Stay
+                }
+            }
+            _ => {
+                if self.input.handle_key(key) {
+                    self.mismatch = false;
+                }
+                Deletion::Stay
+            }
+        }
+    }
+}
+
+/// The question asked once a key was sent to a host: use it for that host from
+/// now on? Answering yes sets the host's identity file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UseKeyQuestion {
+    /// The private key's file name.
+    pub key: String,
+    /// The saved host the key was sent to.
+    pub host: String,
+    /// What would be stored as the host's identity file (`~/.ssh/name`).
+    pub value: String,
+    /// What the host has as its identity file now, when it has one: yes replaces it.
+    pub replaces: Option<String>,
+}
+
 #[derive(Debug)]
 pub struct KeysScreen {
     snapshot: KeysSnapshot,
@@ -315,6 +388,10 @@ pub struct KeysScreen {
     generate: Option<GenerateForm>,
     /// The dialog that sends a public key to a host, while it is open.
     copy: Option<CopyDialog>,
+    /// The question about using a key that was just sent, while it is open.
+    use_key: Option<UseKeyQuestion>,
+    /// The question before deleting a key, while it is open.
+    delete: Option<DeleteQuestion>,
 }
 
 impl KeysScreen {
@@ -330,11 +407,19 @@ impl KeysScreen {
             confirm_fix: None,
             generate: None,
             copy: None,
+            use_key: None,
+            delete: None,
         };
         if let Some(name) = previous.and_then(|p| p.selected_entry()).map(|e| &e.name)
             && let Some(position) = screen.snapshot.keys.iter().position(|k| &k.name == name)
         {
             screen.selected = position;
+        } else if let Some(previous) = previous {
+            // The key that was selected is gone (deleted): stay about where it was,
+            // rather than jump to the top.
+            screen.selected = previous
+                .selected
+                .min(screen.snapshot.keys.len().saturating_sub(1));
         }
         screen.keep_selection_visible();
         screen
@@ -360,6 +445,44 @@ impl KeysScreen {
     /// The form for a new key, while it is open.
     pub fn generating(&self) -> Option<&GenerateForm> {
         self.generate.as_ref()
+    }
+
+    /// The question before deleting a key, while it is open.
+    pub fn deleting(&self) -> Option<&DeleteQuestion> {
+        self.delete.as_ref()
+    }
+
+    /// Opens the question.
+    pub fn ask_delete(&mut self, question: DeleteQuestion) {
+        self.delete = Some(question);
+    }
+
+    /// Gives a key to the question. It closes when the user gives up and when they
+    /// have typed the name.
+    pub fn delete_key(&mut self, key: KeyEvent) -> Deletion {
+        let Some(question) = self.delete.as_mut() else {
+            return Deletion::Stay;
+        };
+        let outcome = question.handle_key(key);
+        if outcome != Deletion::Stay {
+            self.delete = None;
+        }
+        outcome
+    }
+
+    /// The question about using a key that was just sent, while it is open.
+    pub fn using(&self) -> Option<&UseKeyQuestion> {
+        self.use_key.as_ref()
+    }
+
+    /// Opens the question.
+    pub fn ask_use_key(&mut self, question: UseKeyQuestion) {
+        self.use_key = Some(question);
+    }
+
+    /// The question is over, whatever the answer: gives it back to be acted on.
+    pub fn close_use_key(&mut self) -> Option<UseKeyQuestion> {
+        self.use_key.take()
     }
 
     /// The dialog that sends a public key to a host, while it is open.

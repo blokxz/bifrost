@@ -15,6 +15,11 @@ that reads this file must not treat it as a description of the program.
 - One add/edit form, not a wizard.
 - A screen for a failed connection, and a blocking screen for a changed host key.
 - A keys screen (Block 6), opened with a capital `K` from the host list.
+- The identity file of a host is chosen from a list of the keys in `~/.ssh` (Enter on
+  the field), with "(none)" and "Another file" for a path typed by hand. After a
+  key is sent to a host, a question offers to use it for that host.
+- An ssh config screen (Block 6), opened with `s`: import from your ssh config
+  (with a preview and a question) and export to `~/.ssh/bifrost_config`.
 - Colors come from the terminal's 16 ANSI colors, and `NO_COLOR` removes them.
   The theme is `src/tui/theme.rs`.
 
