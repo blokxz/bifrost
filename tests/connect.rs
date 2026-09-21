@@ -46,8 +46,20 @@ fn run_locked(
     args: &SshArgs,
     tee: impl Write + Send + 'static,
 ) -> io::Result<bifrost_ssh::ssh::connect::Outcome> {
+    run_locked_timed(program, args, tee).map(|(outcome, _)| outcome)
+}
+
+/// [`run_locked`], and how long `run` itself took. The clock starts once the lock
+/// is held: waiting for another test's turn is not the run's time.
+fn run_locked_timed(
+    program: &std::path::Path,
+    args: &SshArgs,
+    tee: impl Write + Send + 'static,
+) -> io::Result<(bifrost_ssh::ssh::connect::Outcome, Duration)> {
     let _serialized = support::serialize_spawns();
-    run(program, args, tee)
+    let started = Instant::now();
+    let outcome = run(program, args, tee)?;
+    Ok((outcome, started.elapsed()))
 }
 
 fn args() -> SshArgs {
@@ -63,11 +75,19 @@ fn fake(dir: &tempfile::TempDir, body: &str) -> PathBuf {
 }
 
 fn run_fake(body: &str) -> (bifrost_ssh::ssh::connect::Outcome, Vec<u8>) {
+    let (outcome, tee, _) = run_fake_timed(body);
+    (outcome, tee)
+}
+
+/// [`run_fake`], and how long the run took, not counting writing the fake or
+/// waiting for the spawn lock.
+fn run_fake_timed(body: &str) -> (bifrost_ssh::ssh::connect::Outcome, Vec<u8>, Duration) {
     let dir = tempfile::tempdir().unwrap();
     let program = fake(&dir, body);
     let tee = Capture::default();
-    let outcome = run_locked(&program, &args(), tee.clone()).expect("the fake should run");
-    (outcome, tee.bytes())
+    let (outcome, took) =
+        run_locked_timed(&program, &args(), tee.clone()).expect("the fake should run");
+    (outcome, tee.bytes(), took)
 }
 
 #[test]
@@ -135,15 +155,11 @@ fn stderr_that_is_not_utf8_is_kept_as_bytes() {
 
 #[test]
 fn a_process_that_outlives_ssh_with_the_pipe_open_does_not_hold_run_up() {
-    let started = Instant::now();
-    let (outcome, _) = run_fake("sleep 5 >/dev/null </dev/null &\nprintf 'done\\n' >&2\nexit 0");
+    let (outcome, _, took) =
+        run_fake_timed("sleep 5 >/dev/null </dev/null &\nprintf 'done\\n' >&2\nexit 0");
     assert_eq!(outcome.exit, Exit::Code(0));
     assert_eq!(outcome.stderr, b"done\n");
-    assert!(
-        started.elapsed() < Duration::from_secs(3),
-        "took {:?}",
-        started.elapsed()
-    );
+    assert!(took < Duration::from_secs(3), "took {took:?}");
 }
 
 #[test]

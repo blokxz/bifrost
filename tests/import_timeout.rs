@@ -106,12 +106,16 @@ esac
         self.run(&resolver)
     }
 
+    /// The report, and how long the import itself took.
+    ///
+    /// The clock starts once the spawn lock is held. An import holds the lock for
+    /// its whole run, and the tests of this file take several seconds together, so
+    /// a test that has to wait for its turn would otherwise report the others'
+    /// time as its own.
     fn run(&self, resolver: &SystemSshResolver) -> (ImportReport, Duration) {
+        let _serialized = support::serialize_spawns();
         let started = Instant::now();
-        let report = {
-            let _serialized = support::serialize_spawns();
-            import_hosts(&Hosts::new(), &self.source(), resolver).unwrap()
-        };
+        let report = import_hosts(&Hosts::new(), &self.source(), resolver).unwrap();
         (report, started.elapsed())
     }
 }
@@ -212,16 +216,21 @@ fn a_hang_is_not_confused_with_ssh_being_unavailable() {
 
 #[test]
 fn when_the_budget_runs_out_the_remaining_hosts_are_skipped_without_asking_ssh() {
-    let names: Vec<String> = (0..8).map(|n| format!("h{n}")).collect();
+    // Two hosts miss their own deadline, the third is cut by the budget, and the
+    // other seventeen are not asked. The budget is two and a half deadlines, so
+    // that the first two end by their own with half a deadline to spare, however
+    // slow starting and ending a process is.
+    let timeout = Duration::from_millis(600);
+    let budget = Duration::from_millis(1500);
+    let names: Vec<String> = (0..20).map(|n| format!("h{n}")).collect();
     let hosts: Vec<&str> = names.iter().map(String::as_str).collect();
     let fixture = Fixture::new(&hosts, &hosts, None);
-    let (report, took) =
-        fixture.import_within(Duration::from_millis(300), Duration::from_millis(700));
+    let (report, took) = fixture.import_within(timeout, budget);
 
     assert!(report.imported.is_empty());
     assert_eq!(
         report.skipped.len(),
-        8,
+        names.len(),
         "every host is listed: {:?}",
         report.skipped
     );
@@ -230,7 +239,7 @@ fn when_the_budget_runs_out_the_remaining_hosts_are_skipped_without_asking_ssh()
         assert!(
             skipped
                 .reason
-                .starts_with("ssh did not answer within 300 milliseconds"),
+                .starts_with("ssh did not answer within 600 milliseconds"),
             "{skipped:?}"
         );
     }
@@ -245,18 +254,18 @@ fn when_the_budget_runs_out_the_remaining_hosts_are_skipped_without_asking_ssh()
             "ssh was asked about {late} after the budget was spent"
         );
     }
-    assert!(
-        took < Duration::from_secs(3),
-        "the budget was not kept: {took:?}"
-    );
+    // Kept: it took about the budget (1.5 s), and not a deadline for each of the
+    // twenty hosts (12 s). The bound is half of that, far from both.
+    assert!(took < timeout * 20 / 2, "the budget was not kept: {took:?}");
 }
 
 #[test]
 fn a_host_cut_short_by_the_budget_is_told_that_and_not_that_it_did_not_answer() {
     // Its own deadline is far off, the budget is near: what ended the wait is the
     // budget, and the host may have been fine.
+    let far_off = Duration::from_secs(30);
     let fixture = Fixture::new(&["slow", "fine"], &["slow"], None);
-    let (report, took) = fixture.import_within(Duration::from_secs(30), Duration::from_millis(500));
+    let (report, took) = fixture.import_within(far_off, Duration::from_millis(500));
     assert!(report.imported.is_empty(), "{:?}", report.imported);
     assert_eq!(report.skipped.len(), 2);
     assert_eq!(report.skipped[0].name, "slow");
@@ -265,7 +274,10 @@ fn a_host_cut_short_by_the_budget_is_told_that_and_not_that_it_did_not_answer() 
         report.skipped[1].reason, OUT_OF_TIME,
         "a healthy host after it too"
     );
-    assert!(took < Duration::from_secs(3), "{took:?}");
+    // The wait ended at the budget (half a second) and not at the host's own
+    // deadline (thirty seconds). The bound is half of the deadline: about thirty
+    // times what it should take, and half of what waiting for the deadline would.
+    assert!(took < far_off / 2, "{took:?}");
     let pid = fixture.started_for("slow").expect("it was started");
     assert!(
         gone_soon(&pid),
