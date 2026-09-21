@@ -182,8 +182,8 @@ screen with a server that asks for a password:
 ## Windows
 
 `cargo test --locked` runs the command line tests (`cli_connect`) with a fake ssh,
-and CI runs them on Windows. The pseudo-terminal tests are Unix only. By hand, in
-the Windows VM, with the real `ssh.exe` (OpenSSH Client installed):
+and CI runs them on Windows. The pseudo-terminal tests are Unix only. By hand, on
+a Windows machine, with the real `ssh.exe` (OpenSSH Client installed):
 
 1. **Handover.** Open `bifrost`, connect to a host, log out. Look for: the
    interface comes back drawn correctly, the cursor is hidden in the list and

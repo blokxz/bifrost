@@ -31,8 +31,9 @@ settled: reopen one only with a clear new reason.
   matters.
 - **Package `bifrost-ssh`, binary `bifrost`.** The plain name is taken; the
   command users type stays short.
-- **Linux, macOS and Windows for 0.1.0.** Windows is tested in CI and in a
-  separate VM.
+- **Linux, macOS and Windows for 0.1.0.** Windows is built and tested in CI;
+  testing it by hand on a Windows machine (`docs/manual-tests.md`) is a gate
+  before the release (`docs/RELEASING.md`).
 - **Paths are compared as text, by explicit rules, in one place** (`src/pathtext.rs`).
   `std::path` splits a path by the rules of the system that runs it, so a comparison
   built on it cannot be tested for the other system, and one built on plain strings
@@ -827,6 +828,55 @@ stays refused (see above).
   follow wildcards in directory names, and stops at 8 levels, as the import scan
   does. When in doubt it says the line is missing, which costs a redundant line and
   nothing else.
+
+## Continuous integration and dependencies (Block 7)
+
+- **CI runs on Linux, Windows and macOS**, each with format, clippy (warnings are
+  errors) and the whole test suite. Three more jobs on Ubuntu: the minimum
+  supported Rust version, the static musl target that the Linux release is built
+  for, and the pseudo-terminal tests repeated twenty times. macOS is in the matrix
+  but no one has used Bifrost on a Mac by hand: the README says "covered by CI only".
+- **The minimum supported Rust version is 1.88, and CI reads it from `Cargo.toml`.**
+  A number that only lives in a document drifts; this job fails the day the code
+  needs something newer than the manifest says.
+- **Every action is pinned to a full commit hash, with the version in a comment on
+  the same line.** A tag can be moved to different code after it was reviewed; a hash
+  cannot. `.github/scripts/check-pins.sh` fails CI on any `uses:` that is not
+  pinned that way, and Dependabot (weekly, for actions only) proposes the updates,
+  changing the hash and the comment together. It is the same-line comment because
+  that is the form Dependabot keeps up to date.
+- **Workflows start with no permissions**, and each job asks for `contents: read`.
+  Checkouts do not keep the token (`persist-credentials: false`). The release
+  workflow will add write permissions to the one job that needs them.
+- **`cargo deny check` is the dependency policy** (`deny.toml`, run by
+  `.github/workflows/deny.yml` on every push and pull request, and every Monday):
+  - Licenses: only permissive ones (MIT, Apache-2.0, Apache-2.0 with the LLVM
+    exception, Unicode-3.0, Zlib, BSL-1.0), because Bifrost is MIT OR Apache-2.0 and
+    a copyleft dependency would change what can be done with the binary. An `OR`
+    expression passes if one alternative is allowed. Every entry is in use: an entry
+    nothing needs is a warning, and so is a crate with two versions.
+  - Advisories: RustSec, and yanked releases, are errors. Nothing is ignored; an
+    ignore would go in the file with the reason and a date to look at it again. The
+    weekly run is there because advisories are published after a release is made.
+  - Sources: crates.io only. No git dependencies and no other registry.
+  - Bans: a `*` version requirement is an error.
+  - Only the systems that are built (Linux gnu and musl, macOS on both
+    architectures, Windows msvc) are looked at, so a crate that exists only for wasm
+    or redox cannot fail the build.
+- **A known weakness of the cargo-deny action, accepted.** `EmbarkStudios/cargo-deny-action`
+  is pinned by hash, but it builds a container image on every run that downloads the
+  `cargo-deny` binary over HTTPS without checking a checksum. The job has no secrets
+  and only `contents: read`, so the worst outcome is a wrong pass or fail in a check.
+  The alternative, `cargo install cargo-deny --version <v> --locked` in CI, checks
+  what it installs against the hashes crates.io publishes and needs no container, but
+  compiles the tool on every run; it can replace the action if that trade is judged
+  worth it.
+- **The Linux release is a static musl binary**, so that it runs on any distribution
+  and does not depend on the glibc it was built with. The whole test suite, the
+  pseudo-terminal tests included, passes on that target, and a job keeps it so.
+- **Release binaries are not stripped.** It would save about 22% (3.2 MB to 2.5 MB)
+  and remove the function names from a panic's backtrace, which is what a bug
+  report needs.
 
 ## Known limitations in 0.1.0
 

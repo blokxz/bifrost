@@ -2,8 +2,31 @@
 name = "bifrost-ssh"
 version = "0.1.0"
 edition = "2024"
+# The oldest compiler that builds and passes the whole test suite: ratatui 0.30
+# needs 1.88, and so do the `if let ... && let` chains in the code. CI builds with
+# exactly this version, so the number cannot drift without a failing job.
+rust-version = "1.88"
 description = "Beginner-friendly SSH TUI: connections, keys, jump hosts and port forwards"
-publish = false
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/blokxz/bifrost"
+readme = "README.md"
+keywords = ["ssh", "tui", "terminal", "ssh-config", "ssh-keys"]
+categories = ["command-line-utilities", "network-programming"]
+# What is published: the source (whose unit tests are in the files themselves),
+# the lock file so that `cargo install --locked` builds what was tested, and the
+# documents. The integration tests, their fixtures, the interface mockups and the
+# CI files stay in the repository.
+include = [
+    "/src/**",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/SECURITY.md",
+    "/LICENSE-MIT",
+    "/LICENSE-APACHE",
+    "/docs/DECISIONS.md",
+]
 
 [[bin]]
 name = "bifrost"

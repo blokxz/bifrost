@@ -4,8 +4,9 @@ on:
   push:
   pull_request:
 
-permissions:
-  contents: read
+# Nothing is granted by default: every job asks for what it needs, which is only
+# to read the repository.
+permissions: {}
 
 env:
   CARGO_TERM_COLOR: always
@@ -14,14 +15,15 @@ jobs:
   check:
     name: ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
-      # actions/checkout v6.1.0
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
 
@@ -37,16 +39,72 @@ jobs:
       - name: Test
         run: cargo test --locked
 
+  # The oldest Rust that Bifrost says it supports (`rust-version` in Cargo.toml),
+  # built and tested with exactly that compiler. The number is read from the
+  # manifest, so it cannot be changed there without this job following it.
+  msrv:
+    name: minimum Rust version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Read the minimum version from Cargo.toml
+        id: msrv
+        run: |
+          version=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
+          if [ -z "$version" ]; then
+            echo "Cargo.toml has no rust-version" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install it
+        env:
+          MSRV: ${{ steps.msrv.outputs.version }}
+        run: rustup toolchain install "$MSRV" --profile minimal
+
+      - name: Test with it
+        env:
+          MSRV: ${{ steps.msrv.outputs.version }}
+        run: |
+          cargo "+$MSRV" --version
+          cargo "+$MSRV" test --locked
+
+  # The Linux release is a static musl binary, so that is what is tested here too:
+  # a test suite that passes with glibc says nothing about a different libc.
+  linux-musl:
+    name: linux musl
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Add the target
+        run: rustup target add x86_64-unknown-linux-musl
+
+      - name: Test
+        run: cargo test --locked --target x86_64-unknown-linux-musl
+
   # The pseudo-terminal tests race real processes and signals, so one green run
   # proves little. This repeats them to catch flakiness. A separate job, so the
   # normal run stays fast; Ubuntu only, because pseudo-terminals are Unix only.
   pty-stability:
     name: pty tests x20
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     timeout-minutes: 20
     steps:
-      # actions/checkout v6.1.0
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
 
@@ -60,3 +118,19 @@ jobs:
             cargo test --locked --test pty --test pty_connect --test pty_keys --test pty_sshconfig --test import_timeout --test connect --test cli_connect
             echo "::endgroup::"
           done
+
+  # Every action is pinned to a full commit hash, with the version in a comment.
+  # See the script for why.
+  pins:
+    name: actions are pinned
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Check the workflows
+        run: sh .github/scripts/check-pins.sh

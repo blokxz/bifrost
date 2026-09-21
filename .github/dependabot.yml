@@ -1,0 +1,10 @@
+# Keeps the actions in .github/workflows up to date. They are pinned to full commit
+# hashes, which nothing else would ever move; each update is a pull request that
+# changes the hash and its version comment together. Crates are not listed here:
+# `cargo deny` (deny.yml) watches them for advisories and licenses.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

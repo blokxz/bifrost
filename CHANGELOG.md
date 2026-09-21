@@ -256,6 +256,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     command in your ssh config that does not finish, then try again." Healthy hosts
     are never held back however many there are. In the preview, hosts skipped for the
     same reason are shown as one entry.
+- **Release preparation** (Block 7)
+  - Licensed under MIT OR Apache-2.0 (`LICENSE-MIT`, `LICENSE-APACHE`).
+  - `README.md` for beginners: install, first steps, the keys of every screen, the
+    command line and its exit status, where files live, what Bifrost never does,
+    the known limitations and the status of each platform.
+  - `SECURITY.md`: how to report a vulnerability privately, what is in scope, and
+    the security model in short.
+  - Package metadata for crates.io, and the files that are published: the source,
+    the lock file and the documents, and neither the integration tests, their
+    fixtures nor anything from the repository's tooling.
+  - The minimum supported Rust version is 1.88, checked by building and running the
+    whole test suite with exactly that compiler.
+  - CI: macOS joins Linux and Windows; the minimum Rust version, the static musl
+    target and the pseudo-terminal repeats have jobs of their own; and every
+    workflow starts with no permissions and gives each job only `contents: read`.
+  - `cargo deny` (`deny.toml`, `.github/workflows/deny.yml`) checks advisories,
+    yanked releases, licenses, bans and sources on every push and pull request, and
+    every week. Only permissive licenses are allowed.
+  - Every action is pinned to a full commit hash with its version in a comment, a
+    script fails CI on any that is not, and Dependabot proposes updates weekly.
 
 ### Changed
 

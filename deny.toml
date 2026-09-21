@@ -1,0 +1,48 @@
+# cargo-deny: what the dependencies are allowed to be. CI runs `cargo deny check`
+# (see .github/workflows/deny.yml); run it locally the same way.
+
+[graph]
+# Only what is shipped or built in CI. A crate that exists only for a system that
+# Bifrost is not built for (wasm, redox, ...) is not looked at.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+
+[advisories]
+# A yanked release is a version its author asked people not to use.
+yanked = "deny"
+# Nothing is ignored. If an advisory has to be ignored one day, add it here with the
+# reason and a date to look at it again:
+#   ignore = [{ id = "RUSTSEC-0000-0000", reason = "..." }]
+ignore = []
+
+[licenses]
+# Bifrost is MIT OR Apache-2.0, so every dependency has to be usable under those
+# terms: only permissive licenses are allowed. A dependency with an OR expression
+# passes if any one of its alternatives is in this list.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "Unicode-3.0",
+    "Zlib",
+    "BSL-1.0",
+]
+confidence-threshold = 0.93
+
+[bans]
+# Two versions of one crate are a size and audit cost, not an error.
+multiple-versions = "warn"
+# A dependency with a `*` version would take whatever is newest.
+wildcards = "deny"
+
+[sources]
+# Only crates.io: no git dependencies, no other registries.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
