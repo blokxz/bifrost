@@ -54,6 +54,36 @@ pub fn resolve_ssh() -> Result<PathBuf, SshNotFound> {
     )
 }
 
+/// `ssh-add` could not be found in a trustworthy location.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshAddNotFound;
+
+impl fmt::Display for SshAddNotFound {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(
+            "Could not find the 'ssh-add' program, which comes with OpenSSH. Install it: \
+             on Debian/Ubuntu run 'sudo apt install openssh-client'; on Windows enable the \
+             'OpenSSH Client' optional feature.",
+        )
+    }
+}
+
+impl std::error::Error for SshAddNotFound {}
+
+/// Resolves `ssh-add` for the running process, the way [`resolve_ssh`] resolves
+/// `ssh`.
+pub fn resolve_ssh_add() -> Result<PathBuf, SshAddNotFound> {
+    let cwd = std::env::current_dir().ok();
+    find_program(
+        "ssh-add",
+        Platform::current(),
+        &sysenv::process_env,
+        cwd.as_deref(),
+        &is_executable_file,
+    )
+    .ok_or(SshAddNotFound)
+}
+
 /// Resolves `ssh-keygen` for the running process, the way [`resolve_ssh`]
 /// resolves `ssh`.
 pub fn resolve_keygen() -> Result<PathBuf, KeygenNotFound> {

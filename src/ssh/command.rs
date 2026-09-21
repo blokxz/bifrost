@@ -18,6 +18,7 @@
 
 use std::fmt;
 
+use super::authorize::REMOTE_COMMAND;
 use super::export::{endpoint, jump_spec};
 use crate::domain::jump::{ChainError, jump_chain};
 use crate::domain::validate::validate_host_fields;
@@ -90,6 +91,28 @@ impl SshArgs {
     pub fn as_slice(&self) -> &[String] {
         &self.0
     }
+
+    /// Whether these are the arguments of [`build_copy_args`]: no terminal on the
+    /// server, and the fixed command as the last argument, right after `--` and the
+    /// destination.
+    ///
+    /// A public key is written to ssh's stdin only for arguments like these. With
+    /// any others, ssh could start a login shell on the server and read the key
+    /// as commands, and a key's comment can hold anything a shell would run. So
+    /// this is checked where the key is attached, not only where the arguments
+    /// are built.
+    pub fn is_key_copy(&self) -> bool {
+        let args = &self.0;
+        let structure = match args.len().checked_sub(3) {
+            Some(at) => {
+                args[at] == "--" && args[at + 2] == REMOTE_COMMAND && args[at + 1] != REMOTE_COMMAND
+            }
+            None => false,
+        };
+        structure
+            && args.iter().any(|arg| arg == "-T")
+            && args.iter().filter(|arg| *arg == REMOTE_COMMAND).count() == 1
+    }
 }
 
 /// The command as text for a person: quoted, on one line, starting with `ssh`.
@@ -134,6 +157,31 @@ fn checked(
 /// holds, it cannot be taken for an option. When an identity file is set,
 /// `IdentitiesOnly=yes` is passed with it, so ssh offers only that key.
 pub fn build_args(host: &Host, hosts: &Hosts) -> Result<SshArgs, CommandError> {
+    assemble(host, hosts, Purpose::Session)
+}
+
+/// The arguments that send a public key to `host`: how to reach it as for a
+/// session, then [`REMOTE_COMMAND`] as the one command to run there.
+///
+/// This is not a session, so what only a session wants is left out: the host's
+/// port forwards and agent forwarding are not requested, and are switched off
+/// even if the user's own ssh config asks for them (`ClearAllForwardings`,
+/// `ForwardAgent=no`). No terminal is requested on the server (`-T`): the key
+/// arrives on stdin, and a terminal there would echo it and mangle it. The
+/// command is the last argument, after `--` and the destination, and it is a
+/// constant: the key is never part of it.
+pub fn build_copy_args(host: &Host, hosts: &Hosts) -> Result<SshArgs, CommandError> {
+    assemble(host, hosts, Purpose::CopyKey)
+}
+
+/// What the arguments are for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Purpose {
+    Session,
+    CopyKey,
+}
+
+fn assemble(host: &Host, hosts: &Hosts, purpose: Purpose) -> Result<SshArgs, CommandError> {
     validate_host_fields(host).map_err(CommandError::Invalid)?;
     let chain = jump_chain(hosts.as_slice(), host).map_err(CommandError::Chain)?;
     for hop in &chain {
@@ -160,26 +208,44 @@ pub fn build_args(host: &Host, hosts: &Hosts) -> Result<SshArgs, CommandError> {
         let hops: Vec<String> = chain.iter().map(|hop| jump_spec(hop)).collect();
         flag("-J", checked("jump host", &hops.join(","), false)?);
     }
-    if host.forward_agent {
-        args.push("-A".to_string());
-    }
-    for (option, field, forwards) in [
-        ("-L", "local forward", &host.local_forwards),
-        ("-R", "remote forward", &host.remote_forwards),
-    ] {
-        for forward in forwards {
-            let spec = format!(
-                "{}:{}",
-                endpoint("127.0.0.1", forward.listen_port),
-                endpoint(&forward.dest_host, forward.dest_port)
-            );
-            args.push(option.to_string());
-            args.push(checked(field, &spec, false)?);
+    match purpose {
+        Purpose::Session => {
+            if host.forward_agent {
+                args.push("-A".to_string());
+            }
+            for (option, field, forwards) in [
+                ("-L", "local forward", &host.local_forwards),
+                ("-R", "remote forward", &host.remote_forwards),
+            ] {
+                for forward in forwards {
+                    let spec = format!(
+                        "{}:{}",
+                        endpoint("127.0.0.1", forward.listen_port),
+                        endpoint(&forward.dest_host, forward.dest_port)
+                    );
+                    args.push(option.to_string());
+                    args.push(checked(field, &spec, false)?);
+                }
+            }
+        }
+        Purpose::CopyKey => {
+            for arg in [
+                "-T",
+                "-o",
+                "ClearAllForwardings=yes",
+                "-o",
+                "ForwardAgent=no",
+            ] {
+                args.push(arg.to_string());
+            }
         }
     }
 
     args.push("--".to_string());
     args.push(checked("hostname", &host.hostname, false)?);
+    if purpose == Purpose::CopyKey {
+        args.push(REMOTE_COMMAND.to_string());
+    }
     Ok(SshArgs(args))
 }
 
@@ -921,5 +987,180 @@ mod tests {
             value: "a\x1b[31m%".to_string(),
         };
         assert!(!err.to_string().contains('\x1b'), "{err}");
+    }
+
+    // ---- sending a public key ------------------------------------------------
+
+    fn copy_args_of(host: &Host, hosts: &Hosts) -> Vec<String> {
+        build_copy_args(host, hosts).unwrap().as_slice().to_vec()
+    }
+
+    #[test]
+    fn the_copy_command_reaches_the_host_and_then_runs_the_fixed_command() {
+        let mut web = host("web");
+        web.user = Some("deploy".to_string());
+        web.port = Some(2222);
+        let all = hosts(vec![web.clone()]);
+        assert_eq!(
+            copy_args_of(&web, &all),
+            [
+                "-l",
+                "deploy",
+                "-p",
+                "2222",
+                "-T",
+                "-o",
+                "ClearAllForwardings=yes",
+                "-o",
+                "ForwardAgent=no",
+                "--",
+                "web.example.com",
+                REMOTE_COMMAND,
+            ]
+        );
+    }
+
+    #[test]
+    fn the_command_is_one_argument_after_the_destination_and_nothing_follows_it() {
+        let web = host("web");
+        let all = hosts(vec![web.clone()]);
+        let args = copy_args_of(&web, &all);
+        let dashes = args.iter().position(|a| a == "--").unwrap();
+        assert_eq!(args.len(), dashes + 3, "`--`, the destination, the command");
+        assert_eq!(args[dashes + 1], "web.example.com");
+        assert_eq!(args.last().unwrap(), REMOTE_COMMAND);
+        assert_eq!(
+            args.iter().filter(|a| a.as_str() == REMOTE_COMMAND).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_copy_asks_for_no_forwards_and_no_agent_even_if_the_host_has_them() {
+        let mut web = host("web");
+        web.forward_agent = true;
+        web.local_forwards.push(Forward {
+            listen_port: 8080,
+            dest_host: "localhost".to_string(),
+            dest_port: 80,
+        });
+        web.remote_forwards.push(Forward {
+            listen_port: 9090,
+            dest_host: "localhost".to_string(),
+            dest_port: 90,
+        });
+        let all = hosts(vec![web.clone()]);
+
+        let session = args_of(&web, &all);
+        assert!(session.contains(&"-A".to_string()) && session.contains(&"-L".to_string()));
+
+        let copy = copy_args_of(&web, &all);
+        for option in ["-A", "-L", "-R"] {
+            assert!(!copy.contains(&option.to_string()), "{option}: {copy:?}");
+        }
+        assert!(
+            !copy
+                .iter()
+                .any(|a| a.contains("8080") || a.contains("9090"))
+        );
+        // What the user's own ssh config might ask for is switched off as well.
+        assert!(copy.contains(&"ClearAllForwardings=yes".to_string()));
+        assert!(copy.contains(&"ForwardAgent=no".to_string()));
+        assert!(
+            copy.contains(&"-T".to_string()),
+            "no terminal on the server"
+        );
+    }
+
+    #[test]
+    fn a_copy_keeps_the_identity_and_the_jump_chain_of_the_host() {
+        let mut bastion = host("bastion");
+        bastion.user = Some("jump".to_string());
+        let mut web = host("web");
+        web.identity_file = Some("/home/me/.ssh/web_key".to_string());
+        web.proxy_jump = Some("bastion".to_string());
+        let all = hosts(vec![bastion, web.clone()]);
+        let copy = copy_args_of(&web, &all);
+        let at = |flag: &str| copy.iter().position(|a| a == flag).unwrap();
+        assert_eq!(copy[at("-i") + 1], "/home/me/.ssh/web_key");
+        assert!(copy.contains(&"IdentitiesOnly=yes".to_string()));
+        // The same chain as for a session, expanded the same way.
+        assert_eq!(copy[at("-J") + 1], "jump@bastion.example.com:22");
+        assert_eq!(
+            copy[at("-J") + 1],
+            args_of(&web, &all)[at("-J") + 1],
+            "the jump chain is the session's, not a second version of it"
+        );
+    }
+
+    #[test]
+    fn a_copy_never_puts_anything_of_the_key_in_the_arguments() {
+        // Whatever the host holds, the key is not among the arguments: it is on
+        // stdin. The only thing after the destination is the constant.
+        let mut web = host("web");
+        web.notes = Some("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5 me@laptop".to_string());
+        web.tags = vec!["ssh-ed25519".to_string()];
+        let all = hosts(vec![web.clone()]);
+        let copy = copy_args_of(&web, &all);
+        assert!(
+            !copy
+                .iter()
+                .any(|a| a.contains("AAAA") || a.contains("me@laptop"))
+        );
+    }
+
+    #[test]
+    fn a_host_that_is_not_valid_gets_no_copy_command() {
+        let mut bad = host("web");
+        bad.hostname = "-oProxyCommand=id".to_string();
+        let all = hosts(vec![host("other")]);
+        assert!(build_copy_args(&bad, &all).is_err());
+        let mut bad_user = host("web");
+        bad_user.user = Some("-x".to_string());
+        assert!(build_copy_args(&bad_user, &all).is_err());
+    }
+
+    #[test]
+    fn a_session_is_unchanged_by_the_copy_variant() {
+        let web = host("web");
+        let all = hosts(vec![web.clone()]);
+        let session = args_of(&web, &all);
+        assert_eq!(session, strs(&["--", "web.example.com"]));
+        assert!(!session.iter().any(|a| a == REMOTE_COMMAND || a == "-T"));
+    }
+
+    #[test]
+    fn only_the_copy_arguments_are_recognized_as_the_ones_a_key_may_be_sent_with() {
+        let web = host("web");
+        let all = hosts(vec![web.clone()]);
+        assert!(build_copy_args(&web, &all).unwrap().is_key_copy());
+        assert!(!build_args(&web, &all).unwrap().is_key_copy());
+
+        let good = copy_args_of(&web, &all);
+        let with = |edit: &dyn Fn(&mut Vec<String>)| {
+            let mut args = good.clone();
+            edit(&mut args);
+            SshArgs(args).is_key_copy()
+        };
+        assert!(with(&|_| {}), "the unedited arguments are accepted");
+        // No terminal must be requested on the server.
+        assert!(!with(&|a| a.retain(|x| x != "-T")));
+        // The command must be last, after `--` and the destination.
+        assert!(!with(&|a| a.push("extra".to_string())));
+        assert!(!with(&|a| {
+            a.pop();
+        }));
+        assert!(!with(&|a| {
+            let n = a.len();
+            a.swap(n - 1, n - 2);
+        }));
+        assert!(!with(&|a| a.retain(|x| x != "--")));
+        // And there is exactly one of it, whichever place the other is in.
+        assert!(!with(&|a| {
+            let n = a.len();
+            a[n - 2] = REMOTE_COMMAND.to_string();
+        }));
+        assert!(!SshArgs(Vec::new()).is_key_copy());
+        assert!(!SshArgs(vec!["--".to_string(), REMOTE_COMMAND.to_string()]).is_key_copy());
     }
 }

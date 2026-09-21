@@ -36,6 +36,11 @@
  ⏎ abort   d details   t trust new key…
 
 ==================== notes (not part of the render) ====================
+Status: BUILT, DIFFERENTLY. 0.1.0 has a blocking screen for a changed host key, but:
+it is a page and not a modal over a full view; it shows the fingerprint that was
+received, not the saved one; and the action is "remove the old key" (r), which runs
+`ssh-keygen -R` after the host's name is typed, not "trust new key". Enter or Esc
+abort, d shows what ssh printed, and no other key does anything.
 Screen: Host key changed. Modal over the full view.
 - Background screen: every cell rendered in `ghost` (very dim) color.
 - Dialog: double border in `red`, title bold `red`. Body text `bright`, explanation in `muted`.

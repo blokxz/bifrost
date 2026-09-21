@@ -1,31 +1,39 @@
 # UI reference layouts
 
-These files are the source of truth for how each Bifrost screen looks. Each one is an exact render at **120 columns × 36 rows**, followed by a `notes` section with colors and behavior. The notes are not part of the render.
+These files are **visual reference mockups, not a specification**. Each one is a
+render at 120 columns by 36 rows, followed by a `notes` section with colors and
+behavior. The notes are not part of the render, and each one begins with a
+**Status** line saying whether the screen is built in 0.1.0.
 
-| File | Screen |
-|------|--------|
-| `01-main.txt` | Full view (start view `"full"`) |
-| `02-launcher.txt` | Launcher: the existing host list screen (start view `"launcher"`, `bifrost --launcher`) |
-| `03-new-host.txt` | New host wizard, step 2 |
-| `04-keys.txt` | Keys tab with health checks |
-| `05-host-key-changed.txt` | Host key changed dialog (modal over the full view) |
-| `06-settings.txt` | Settings tab |
+| File | Screen | In 0.1.0 |
+|------|--------|----------|
+| `01-main.txt` | Full view | Proposal for 0.2. Not built. |
+| `02-launcher.txt` | Launcher | Proposal for 0.2. Hand-drawn; the host list is the only start view in 0.1.0. |
+| `03-new-host.txt` | New host wizard, step 2 | Proposal for 0.2. Not built. |
+| `04-keys.txt` | Keys tab with health checks | Built in part (Block 6). |
+| `05-host-key-changed.txt` | Host key changed dialog | Built, differently. |
+| `06-settings.txt` | Settings tab | Proposal for 0.2. Not built. |
 
-The design rationale is in `../ui-design.md`.
+The rationale and the list of proposals are in `../ui-design.md`. What is decided
+is in `CLAUDE.md` and `../DECISIONS.md`; what is built is the code.
 
 ## How to use them
 
-- Treat the layout, text, borders and keybindings as the spec. If an implementation needs to deviate, ask first.
-- Every screen gets a snapshot test. Render it with `ratatui::backend::TestBackend::new(120, 36)` using fixture data that matches the reference (same hosts, keys and fingerprints), and snapshot the buffer with `insta`. The snapshot is approved only when it matches the reference.
-- Only the 120×36 size is specified. Larger terminals: the right-hand panels grow and the lists get more rows. Smaller than 80×24: show a "terminal too small" message instead of a broken layout.
-- Selection highlight and colors cannot be shown in plain text. The `›` marker is where the selected row is; the notes say how it is styled.
+- They show a direction. They are not expected output: no test compares a screen
+  to one of them, and the built screens differ where the notes say so.
+- Only the 120x36 size is drawn. Bifrost's real minimum is 60x15, below which it
+  shows a "terminal too small" message instead of a broken layout.
+- Selection highlight and colors cannot be shown in plain text. The `›` marker is
+  where the selected row is; the notes say how it would be styled. The built
+  screens use ASCII markers (`>`, `*`).
 
-## Palette (src/tui/theme.rs)
+## Palette (a proposal for 0.2; not implemented)
 
-Decided 2026-09-20: this palette replaces the ANSI-only theme (see `docs/DECISIONS.md`, Terminal interface).
-All colors come from `src/tui/theme.rs`. Never hardcode a color in a widget. `src/tui/ui/theme.rs` was a draft of this palette; merge it into `src/tui/theme.rs` and delete it.
+Bifrost today uses the terminal's 16 ANSI colors and removes them under
+`NO_COLOR`. The theme is `src/tui/theme.rs`, and it is the only place colors are
+defined. What follows is a truecolor palette proposed for a later release.
 
-The existing theme roles map to the palette like this:
+If it is adopted, the existing theme roles would map to it like this:
 
 | Role in `Theme` | Style |
 |-----------------|-------|
@@ -57,9 +65,14 @@ The existing theme roles map to the palette like this:
 | `red` | `#ff7a93` | Errors, danger, security alerts |
 | `green` | `#8bd67a` | OK states, success |
 
-Use `Color::Rgb` when the terminal supports truecolor (`COLORTERM=truecolor|24bit`). Windows Terminal (`WT_SESSION` set) also counts as truecolor. Otherwise fall back to the nearest ANSI 16 colors (accent → Cyan, violet → Magenta, amber → Yellow, red → LightRed, green → Green, muted → DarkGray). With `NO_COLOR` set, keep the current plain theme (bold, dim, reverse video).
+Proposed rules: use `Color::Rgb` when the terminal reports truecolor
+(`COLORTERM=truecolor` or `24bit`), and treat Windows Terminal (`WT_SESSION` set)
+as truecolor. Otherwise fall back to the nearest ANSI 16 colors (accent to Cyan,
+violet to Magenta, amber to Yellow, red to LightRed, green to Green, muted to
+DarkGray). With `NO_COLOR` set, keep the plain theme (bold, dim, reverse video).
+Meaning must never depend on color alone.
 
 ## Glyphs
 
-All glyphs used are single-width: `─ │ ┌ ┐ └ ┘ ├ ┤ ═ ║ ╔ ╗ ╚ ╝ ━ › ▾ ▸ ★ • ● ○ ✓ ✗ ▲ ■ ⇢ ❯ █ ⏎ … ·`.
-If a terminal renders one of them badly (common with `⏎` and `★` on old Windows consoles), provide an ASCII fallback (`enter`, `*`) behind a setting rather than changing the layout.
+The mockups use these single-width glyphs: `─ │ ┌ ┐ └ ┘ ├ ┤ ═ ║ ╔ ╗ ╚ ╝ ━ › ▾ ▸ ★ • ● ○ ✓ ✗ ▲ ■ ⇢ ❯ █ ⏎ … ·`.
+Some terminals render a few of them badly (common with `⏎` and `★` on old Windows consoles); the built screens avoid the problem by using ASCII markers. A later release could offer the glyphs behind a setting.

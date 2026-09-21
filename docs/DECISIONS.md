@@ -155,20 +155,11 @@ settled: reopen one only with a clear new reason.
   explanation most.
 - **Minimum terminal size is 60x15, with a message below it.** It fits the host
   list, header and footer planned for the next block, and avoids a broken layout.
-- **The Bifrost palette in truecolor, with a 16-color fallback; `NO_COLOR`
-  removes color.** (Changed 2026-09-20; it replaces "one theme from the
-  terminal's 16 ANSI colors".) The palette is listed in `docs/ui/README.md` and
-  defined only in `src/tui/theme.rs`. It is used when the terminal reports
-  truecolor (`COLORTERM=truecolor` or `24bit`) or is Windows Terminal
-  (`WT_SESSION` set); any other terminal gets the nearest of the 16 ANSI colors.
-  Meaning is still never carried by color alone: errors and warnings have text
-  labels, the selected row keeps its `>` marker, favorites keep their `*`, and
-  the `NO_COLOR` theme stays as it is (bold, dim and reverse video only).
-- **Two start views: the full view and the launcher.** The launcher is the
-  existing host list screen, kept with all its actions; the full view is the
-  split-panel screen in `docs/ui/01-main.txt`. `ui.start_view` picks the one
-  that opens, `bifrost --launcher` overrides it for one run, and `Tab` switches
-  between them keeping the selected host. See `docs/ui-design.md`.
+- **One theme from the terminal's 16 ANSI colors; `NO_COLOR` removes color.** It
+  follows the user's palette and accessibility settings. Meaning is never
+  carried by color alone: errors and warnings have text labels. crossterm also
+  strips color when `NO_COLOR` is set, so the plain theme goes further and
+  replaces gray text with dim text, which stays distinguishable without color.
 - **`bifrost list` writes host names to stdout and everything else to stderr.**
   The output can be piped and parsed. The TUI needs an interactive terminal and
   says so when it does not have one.
@@ -414,6 +405,171 @@ settled: reopen one only with a clear new reason.
   Bifrost looks for it: the system OpenSSH directory under `SystemRoot` on
   Windows, a `PATH` entry elsewhere. The real ssh is never found.
 
+## Effects
+
+- **The app asks for outside work with one queue of requests, and the event loop
+  carries each out with one `execute` function.** `App` still does no I/O. A key
+  that means "copy this", "connect to that" or "remove this key" queues a
+  `Request`; the loop gives each to `execute` and hands the `Response` back to
+  the app. This replaced one hook per action: the loop was at clippy's limit of
+  seven parameters, and Block 6 adds about six more actions (keys, generating,
+  the agent, copying a key to a host, importing, exporting). Now the loop stays
+  the same size, and a test scripts the whole outside world with one closure.
+  It was done as a change of its own, with no change in behavior, and the
+  existing tests are what showed that.
+- **`System` is the real `execute`.** It owns the terminal guard and the programs
+  found at startup. A program that is missing is answered with what to install,
+  not with an error that would end the loop: an error from `execute` means the
+  terminal could not be recovered.
+- **Requests that take the terminal are known by the request.** A connection is
+  followed by a full repaint at the size the terminal has then; a copy is not.
+- **A response of the wrong kind is shown to the user as an internal error**
+  instead of being ignored, so a mistake in whoever carries requests out cannot
+  leave the app waiting for a result that will not come.
+
+## Keys (Block 6)
+
+- **The generate form warns before, and Bifrost does not try to find out
+  afterwards whether a passphrase was set.** `ssh-keygen` asks for the passphrase
+  itself, on the real terminal, so Bifrost never sees it. The form says that
+  `ssh-keygen` will ask for one and that leaving it empty means anyone who has
+  the file can use the key: the moment the user can act on it. Three ways of
+  detecting it afterwards were considered and refused. Probing with
+  `ssh-keygen -y -P ''` puts a passphrase on the command line, and that rule has
+  no exceptions. Reading the cipher name from the private key's header is parsing
+  a private key file, which was decided against. And warning every time whatever
+  happened would teach people to ignore the warning. For the same reason the keys
+  list has no "passphrase" column: it is information Bifrost cannot get without
+  breaking one of these.
+- **Only ed25519 is generated.** Someone who needs RSA for an old server
+  generates it with `ssh-keygen` and Bifrost lists it.
+
+### The keys screen
+
+- **It is opened with a capital `K`.** The lower case `k` already moves the
+  selection up on the host list (`j`/`k`), and taking it would have removed half of
+  a pair of navigation keys everywhere else. On the keys screen itself `k` and `j`
+  move as usual.
+- **Making a key and adding one hand the terminal over, like a connection.**
+  `ssh-keygen` and `ssh-add` ask for a passphrase on the terminal, so they run
+  the way ssh does: the interface steps aside, the tool has the terminal in its
+  normal mode, Ctrl-C is caught by Bifrost and reaches the tool, and the terminal
+  modes are saved before and restored after. It is the same code as for a
+  connection, with the program and its arguments as parameters, so there is one
+  place where Ctrl-C, the modes and the child process are handled. What the tool
+  printed last is kept (its stderr, at most 64 KiB) to say why it failed.
+- **The arguments are built and checked in one place, and checked again where
+  they become an argument list.** For a new key: `-t ed25519 -f <absolute path>`
+  and `-C <comment>` only when there is one, never `-N`. The name is one path
+  component of letters, digits, `.`, `_` and `-`, not starting with `-` or `.`,
+  not ending in `.pub`, not a file ssh reads for something else (`config`,
+  `known_hosts`, `authorized_keys` and the like, compared ignoring case), at most
+  64 characters. The comment has no control or bidirectional characters, no
+  surrounding space and at most 100 characters. A value that fails is an error in
+  release builds too, not a debug assertion. For adding: the absolute path of a
+  listed key, and nothing else.
+- **Bifrost never overwrites a key.** The form refuses a name that is listed, and
+  a check just before running refuses a name or `name.pub` that exists as
+  anything (file, directory, link, even one pointing nowhere). Between that check
+  and `ssh-keygen` writing there is a moment in which a file could appear; if it
+  does, `ssh-keygen` asks its own overwrite question on the terminal, which the
+  user answers knowing what it is. Bifrost does not answer it for them.
+- **Adding to the agent is not tried when it is bound to fail.** A key already in
+  the agent, a private key that ssh would refuse for its permissions (with the fix
+  pointed to, or, for a link, what to change) and an agent that is not running each
+  get an explanation and no handover. If the agent could not be told about (it
+  timed out, or said something unknown) the attempt is made: `ssh-add` may know
+  better.
+- **After either action the keys are read again**, so the screen shows what is
+  true, and after making a key the new one is selected. A cancelled or failed run
+  reads them again too, since a run that failed part-way could have left something
+  behind. A run that never started reads nothing.
+- **A tool's own words are shown, cleaned.** On failure the last non-empty line
+  it wrote to stderr, cut to 200 characters, follows the status; like everything
+  external it is cleaned when drawn.
+- **Sending a public key runs one fixed command on the server, and the key goes
+  on stdin.** Without `ssh-copy-id`, which is not on Windows and not on every
+  system. The arguments are the host's own (`-l`, `-p`, `-i` with
+  `IdentitiesOnly=yes`, and the jump chain, expanded as for a session), then `-T`,
+  `--`, the destination and the command. The command is `sh -c '...'`, so it
+  also works when the login shell there is fish or csh, and its script is one
+  line with no single quote, backslash or `!`, which are what those shells read
+  inside quotes. It goes to the home directory (and stops if there is none),
+  makes `~/.ssh` with `umask 077`, reads one line from stdin, appends it to
+  `authorized_keys` unless the same line is there (mending a missing final
+  newline), and runs `restorecon` where it exists, as `ssh-copy-id` does. It never
+  changes the mode of anything that exists and never rewrites the file. The key is
+  read with `read -r` and used only inside double quotes, so a comment full of
+  `$(...)`, backticks or backslashes is stored as text. This is the one place a
+  shell is involved, and it is the server's; locally ssh is started with an
+  argument vector.
+- **What may be sent is checked in three places.** When the file is read: exactly
+  one line, starting with a key type from a fixed list (ed25519, RSA, the ECDSA
+  curves and the two `sk-` types; not `ssh-dss`, which is off by default, and not
+  certificates), then a key that starts with `AAAA` (which every OpenSSH key blob
+  does) and is base64, no control or bidirectional characters, no surrounding
+  space, at most 8 KiB. Where the bytes are made for ssh's stdin: the same check
+  again. And where the key is attached to ssh: the arguments must be the ones built
+  for sending a key (no terminal on the server, the fixed command last, once).
+  A line with options in front of the key is refused because its first word is not
+  a key type. The reason for the last check is that with session arguments ssh
+  would start a login shell and read the key as commands.
+- **It is a request, not a session.** The host's port forwards and agent
+  forwarding are not requested, and `ClearAllForwardings=yes` and
+  `ForwardAgent=no` switch off what the user's own ssh config asks for. `-T`: no
+  terminal on the server, which would echo and mangle the key.
+- **The password is asked for by ssh, on the terminal, and the key is never in
+  its way.** ssh reads passwords and new host keys from the terminal (`/dev/tty`),
+  not from stdin, which is how `ssh-copy-id` pipes a key while ssh asks for a
+  password. So the terminal is handed over exactly as for a connection, and the
+  password never passes through Bifrost.
+- **A question comes before anything is sent.** The list of hosts, then a question
+  with the key's type, fingerprint and comment and the host's user and address:
+  sending a public key lets whoever has the private key log in as that user.
+  Only a plain `y` sends. `n` and Esc go back to the list of hosts, `Esc` on the
+  list closes the dialog.
+- **How it ended is judged by the connection classifier.** 0 is sent. ssh's own
+  failures (255) get the same explanations as a connection, on the same screens,
+  and a changed host key stops on the same blocking screen with removal only
+  after typing the host's name; leaving those screens goes back to where the key
+  was sent from. Any other status means the server ran the command and it failed,
+  which is not a connection problem: it says so, with the last line the server
+  wrote, cut and cleaned, and that the key was probably not added.
+- **What is not promised.** Status 0 means the server ran the command and it
+  reported no error. A server that ignores the command (`ForceCommand`, a
+  restricted shell) can answer 0 without adding anything, as with `ssh-copy-id`.
+  Bifrost does not log in again to check.
+- **A key is what `ssh-keygen -l -f name.pub` says, and a private key is never
+  read.** The tool is run on the public file, so it cannot ask for a passphrase,
+  and the private file is only looked at for its permissions. A key pair is a file
+  with a `.pub` of the same name next to it, which leaves out `config`,
+  `known_hosts`, `authorized_keys` and public keys whose private half is elsewhere.
+- **A key is loaded when its fingerprint is in the agent's list.** Never by
+  comment: whoever added a key chose the comment.
+- **The agent not running is a state, not an error.** `ssh-add -l` says it in two
+  ways (no `SSH_AUTH_SOCK`, or a socket nobody answers on) and both are explained
+  in plain words with how to start one. With no answer from the agent nothing is
+  claimed about any key: they are "unknown", not "not loaded". A `ssh-add` that
+  does not answer within 3 seconds is killed, because an agent forwarded over a
+  dead connection can leave it waiting for good, and the interface must not wait
+  with it. Only exact lines are believed, and one with a control or bidirectional
+  character never is.
+- **Permissions follow ssh's own rule.** A private key is too open when its group
+  or other bits are set (`mode & 0o077`), which is when ssh refuses to use it: so
+  0600 and 0400 are fine and 0640 and 0644 are not. Numerically broader than 0600
+  is not the test, since 0700 is accepted. On Windows nothing is checked: access is
+  decided by ACLs, which ssh.exe verifies itself, and a key whose permissions
+  cannot be examined is shown as "not checked", never as fine.
+- **The fix asks first, and can only reach a key pair's private file.** The
+  request carries a file name and not a path. The name must be one plain path
+  component, the file a regular file (not a symbolic link, since changing a link
+  changes what it points to, which was not what was found as a key) with its `.pub`
+  next to it, in the ssh directory the app started with. The mode set is exactly
+  0600, and the public key and every other file are left alone.
+- **The screen's data is one snapshot behind a trait.** Reading the keys and
+  asking the agent go through `KeyTools`, so everything else is tested with a fake
+  and the real tools are checked by ignored tests against OpenSSH itself.
+
 ## Known limitations in 0.1.0
 
 - **Jump host keys.** Bifrost expands a jump host to `user@host:port` from its
@@ -427,7 +583,8 @@ settled: reopen one only with a clear new reason.
   cannot be shown.** Those characters are still interpreted inside double quotes,
   and showing them unquoted would be unsafe. Such values are rare (a key path
   with a `%` in it, for example).
-- **On Windows, Ctrl-C while ssh has the terminal ends Bifrost too.** The console
+- **On Windows, Ctrl-C while ssh, ssh-keygen or ssh-add has the terminal ends
+  Bifrost too.** The console
   sends Ctrl-C to every process attached to it, and catching it needs `unsafe`
   code or another dependency. The terminal itself is not left broken, because it
   was already handed to ssh in its normal mode. Other platforms return to the
@@ -441,6 +598,27 @@ settled: reopen one only with a clear new reason.
   comparison, and what path ssh.exe prints, have not been verified there.
 - **`bifrost <host>` cannot tell its own status 2 from a remote status 2** by the
   status alone. The message on stderr can.
+- **The keys screen cannot check or fix permissions on Windows.** ssh.exe checks
+  the ACLs of a private key itself and says so when it refuses one; that shows in
+  its output, not on the keys screen.
+- **The keys screen's agent wording is confirmed only for OpenSSH on Unix.** The
+  messages of the Windows ssh-agent service (stopped or disabled) have not been
+  checked. Anything not recognized is shown, cleaned, as "could not be told".
+- **Sending a public key needs a POSIX `sh` on the server.** A server whose
+  login shell is `cmd.exe` or PowerShell answers that the command failed, and the
+  screen says so with what it said.
+- **Sending a public key has not been run on Windows, and the shells of other
+  servers have been tried only in part.** Not checked: that `ssh.exe` reads the
+  password from the console while its stdin is a pipe, and that the command's
+  double quotes survive how Windows passes an argument. The remote script was run
+  under `sh`, bash, zsh, dash, fish and busybox here; csh was not available, and
+  is judged from its quoting rules only. Against a real server it is checked by
+  the ignored test in `tests/copy_real.rs`, which has not been run yet.
+- **Making a key and adding one to the agent have not been run on Windows.** They
+  use the same handover as a connection, so the limits above hold, and how
+  `ssh-keygen.exe` prompts on the legacy console host and in Windows Terminal, and
+  whether the ssh-agent service is running, have not been checked. See
+  `docs/manual-tests.md`.
 - **Notes are edited on one line.** Line breaks and tabs are typed as `\n` and
   `\t`.
 

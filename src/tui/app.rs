@@ -10,16 +10,20 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use super::effects::{Request, Response};
 use super::form::{Form, FormField, FormMode, Outcome};
 use super::input::TextInput;
+use super::keys::{Copying, FixOutcome, Generation, HostChoice, KeysScreen};
 use super::list::{self, ListState, Row};
 use super::startup::{Library, Notice, Startup};
 use crate::domain::validate::{self, Field};
 use crate::domain::{Hosts, HostsError, ValidationError};
+use crate::ssh::agent::AgentState;
 use crate::ssh::command::{
-    KnownHostsTarget, Shell, SshArgs, build_args, display_command, known_hosts_targets,
+    KnownHostsTarget, Shell, SshArgs, build_args, build_copy_args, display_command,
+    known_hosts_targets,
 };
-use crate::ssh::connect::Outcome as SshOutcome;
+use crate::ssh::connect::{Exit, Outcome as SshOutcome};
 use crate::ssh::diagnose::{FailureKind, Verdict, classify, host_key_change};
 use crate::ssh::keygen::Removal;
+use crate::ssh::keys::{KeysSnapshot, Permissions};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 
@@ -41,6 +45,8 @@ pub enum Screen {
     HostKeyChanged,
     /// Everything ssh printed during the last connection.
     SshOutput,
+    /// The user's ssh keys, and whether the agent holds them.
+    Keys,
 }
 
 /// What the keys do on the list screen.
@@ -83,14 +89,61 @@ pub struct ConnectRequest {
     pub known_hosts: Vec<KnownHostsTarget>,
 }
 
-/// What came of a [`ConnectRequest`].
+/// What came of handing the terminal to a program: ssh for a connection,
+/// `ssh-keygen` to make a key, `ssh-add` to load one.
 #[derive(Debug)]
-pub enum ConnectResult {
-    /// ssh ran and ended.
+pub enum HandoverResult {
+    /// The program ran and ended.
     Ran(SshOutcome),
-    /// ssh could not be started, or the terminal could not be handed over. The
-    /// text says why, in plain English.
+    /// It could not be started, or the terminal could not be handed over, or it
+    /// was refused before anything ran. The text says why, in plain English.
     Failed(String),
+}
+
+/// How a tool run for the keys screen (`ssh-keygen`, `ssh-add`) ended.
+#[derive(Debug, PartialEq, Eq)]
+enum ToolEnd {
+    Done,
+    /// The user pressed Ctrl-C.
+    Cancelled,
+    /// It ran and did not succeed. Holds why, in plain English.
+    Failed(String),
+    /// It never ran. Holds why, in plain English.
+    NotRun(String),
+}
+
+impl ToolEnd {
+    /// The longest piece of what a tool said that is repeated on screen.
+    const SAID: usize = 200;
+
+    fn from(result: HandoverResult, program: &str) -> ToolEnd {
+        let outcome = match result {
+            HandoverResult::Failed(why) => return ToolEnd::NotRun(why),
+            HandoverResult::Ran(outcome) => outcome,
+        };
+        if outcome.was_interrupted() {
+            return ToolEnd::Cancelled;
+        }
+        match outcome.exit {
+            Exit::Code(0) => ToolEnd::Done,
+            Exit::Code(code) => {
+                // The end of what it said is usually the reason. Raw: the screen
+                // cleans it before drawing.
+                let said = String::from_utf8_lossy(&outcome.stderr);
+                let last = said.lines().map(str::trim).rfind(|line| !line.is_empty());
+                ToolEnd::Failed(match last {
+                    Some(line) => format!(
+                        "{program} ended with status {code}: {}",
+                        line.chars().take(Self::SAID).collect::<String>()
+                    ),
+                    None => format!("{program} ended with status {code}."),
+                })
+            }
+            Exit::Signal(signal) => {
+                ToolEnd::Failed(format!("{program} was stopped by signal {signal}."))
+            }
+        }
+    }
 }
 
 /// What the last connection left behind: enough to explain a failure and to
@@ -157,6 +210,10 @@ pub struct Metrics {
     pub list_rows: usize,
     /// The first visible line of the form, kept so that the focused field is in view.
     pub form_scroll: usize,
+    /// How many key rows fit on the keys screen.
+    pub keys_rows: usize,
+    /// How many host rows fit in the dialog that sends a key.
+    pub copy_rows: usize,
 }
 
 /// One entry of the footer: a key (or keys) and what it does.
@@ -198,6 +255,7 @@ pub const HELP: &[HelpSection] = &[
             row("PgUp/PgDn", "Move by a screenful"),
             row("Enter", "Connect to the selected host"),
             row("/", "Search the hosts"),
+            row("K", "Show your ssh keys and what the agent holds"),
             row("o", "Read what ssh printed during the last connection"),
             row("a", "Add a host"),
             row("e", "Edit the selected host"),
@@ -237,10 +295,41 @@ pub const HELP: &[HelpSection] = &[
         ],
     },
     HelpSection {
+        title: "Your ssh keys",
+        rows: &[
+            row("Up/Down j/k", "Move through the keys"),
+            row("PgUp/PgDn", "Move by a screenful"),
+            row(
+                "f",
+                "Set the selected private key's permissions to 0600, after you confirm. \
+                 Not offered for a symbolic link",
+            ),
+            row(
+                "g",
+                "Make a new ed25519 key with ssh-keygen. Tab switches between the name and \
+                 the comment. ssh-keygen asks for a passphrase itself: Bifrost never sees it",
+            ),
+            row(
+                "a",
+                "Add the selected key to the ssh agent with ssh-add, which asks for its \
+                 passphrase itself",
+            ),
+            row(
+                "c",
+                "Send the selected key's public key to a saved host, after you choose one \
+                 and confirm. It is added to ~/.ssh/authorized_keys there. ssh asks for the \
+                 password itself",
+            ),
+            row("r", "Read the keys and ask the agent again"),
+            row("?", "Open this help, then come back here"),
+            row("Esc", "Back to the host list"),
+        ],
+    },
+    HelpSection {
         title: "After a failed connection",
         rows: &[
             row("o", "Read everything ssh printed"),
-            row("Enter/Esc", "Go back to the list"),
+            row("Enter/Esc", "Go back to where you were"),
             row("Up/Down j/k", "Scroll"),
         ],
     },
@@ -326,6 +415,15 @@ pub struct App {
     key_confirm: Option<RemovalConfirm>,
     /// Where the ssh output goes back to when it is closed.
     output_return: Screen,
+    /// Where the help goes back to when it is closed.
+    help_return: Screen,
+    /// Where the screens for a failed connection go back to: the host list, or the
+    /// keys screen when the connection was made to send a key.
+    failure_return: Screen,
+    /// The keys screen, once it has been opened.
+    keys: Option<KeysScreen>,
+    /// The key to select once the keys have been read again: the one just made.
+    select_key: Option<String>,
     status: Option<Status>,
     help_scroll: usize,
     notices_scroll: usize,
@@ -354,6 +452,10 @@ impl App {
             key_change: None,
             key_confirm: None,
             output_return: Screen::List,
+            help_return: Screen::List,
+            failure_return: Screen::List,
+            keys: None,
+            select_key: None,
             status: None,
             help_scroll: 0,
             notices_scroll: 0,
@@ -423,6 +525,19 @@ impl App {
             (Request::RemoveKey(target), Response::KeyRemoved(result)) => {
                 self.key_removal_finished(target, result);
             }
+            (Request::LoadKeys, Response::Keys(snapshot)) => self.keys_loaded(snapshot),
+            (Request::FixKeyPermissions { file_name }, Response::PermissionsFixed(result)) => {
+                self.permissions_fixed(file_name, result);
+            }
+            (Request::GenerateKey { file_name, .. }, Response::KeyGenerated(result)) => {
+                self.key_generated(file_name, result);
+            }
+            (Request::AddKeyToAgent { file_name }, Response::KeyAdded(result)) => {
+                self.key_added(file_name, result);
+            }
+            (Request::CopyKey { file_name, connect }, Response::KeyCopied(result)) => {
+                self.key_copied(file_name, &connect.name, result);
+            }
             // Whoever carries requests out answers each with its own kind of
             // response; anything else is a mistake there, and the user is told
             // rather than left waiting for a result that will not come.
@@ -448,6 +563,11 @@ impl App {
     /// The removal confirmation, while it is showing.
     pub fn key_confirm(&self) -> Option<&RemovalConfirm> {
         self.key_confirm.as_ref()
+    }
+
+    /// The keys screen's state, while it is open.
+    pub fn keys(&self) -> Option<&KeysScreen> {
+        self.keys.as_ref()
     }
 
     /// How the last connection ended, if there was one.
@@ -478,6 +598,8 @@ impl App {
             Screen::Notices | Screen::List | Screen::Form => self.notices_scroll,
             Screen::ConnectError | Screen::HostKeyChanged => self.error_scroll,
             Screen::SshOutput => self.output_scroll,
+            // The keys list scrolls by selection, not as a page.
+            Screen::Keys => 0,
         }
     }
 
@@ -508,6 +630,48 @@ impl App {
                 hint("o/Esc/Enter", "back"),
                 hint("q", "quit"),
             ],
+            Screen::Keys => match self.keys.as_ref() {
+                Some(keys) if keys.copying().is_some_and(|dialog| dialog.confirming()) => {
+                    vec![hint("y", "send the key"), hint("n/Esc", "back")]
+                }
+                Some(keys) if keys.copying().is_some() => vec![
+                    hint("Up/Down j/k", "choose"),
+                    hint("Enter", "select"),
+                    hint("Esc", "cancel"),
+                ],
+                Some(keys) if keys.generating().is_some() => vec![
+                    hint("Tab", "next field"),
+                    hint("Enter", "next / make the key"),
+                    hint("Esc", "cancel"),
+                ],
+                Some(keys) if keys.confirming().is_some() => {
+                    vec![hint("y", "change to 0600"), hint("n/Esc", "cancel")]
+                }
+                keys => {
+                    let mut hints = vec![hint("Up/Down j/k", "move")];
+                    if keys
+                        .and_then(KeysScreen::selected_entry)
+                        .is_some_and(|entry| entry.can_fix_permissions())
+                    {
+                        hints.push(hint("f", "fix permissions"));
+                    }
+                    hints.push(hint("g", "new key"));
+                    if keys
+                        .and_then(KeysScreen::selected_entry)
+                        .is_some_and(|entry| entry.loaded != Some(true))
+                    {
+                        hints.push(hint("a", "add to agent"));
+                    }
+                    if keys.and_then(KeysScreen::selected_entry).is_some() {
+                        hints.push(hint("c", "send to host"));
+                    }
+                    hints.push(hint("r", "refresh"));
+                    hints.push(hint("?", "help"));
+                    hints.push(hint("Esc", "back"));
+                    hints.push(hint("q", "quit"));
+                    hints
+                }
+            },
             Screen::HostKeyChanged if self.key_confirm.is_some() => vec![
                 hint("Type", "the host name"),
                 hint("Enter", "remove"),
@@ -578,6 +742,7 @@ impl App {
                         hint("d", "delete"),
                         hint("f", "favorite"),
                         hint("c", "copy"),
+                        hint("K", "keys"),
                     ];
                     if self.has_output() {
                         hints.push(hint("o", "ssh output"));
@@ -612,6 +777,10 @@ impl App {
         if let Some(form) = &mut self.form {
             form.scroll = metrics.form_scroll;
         }
+        if let Some(keys) = &mut self.keys {
+            keys.set_visible(metrics.keys_rows);
+            keys.set_copy_visible(metrics.copy_rows);
+        }
 
         if let Some(library) = &self.library {
             let rows = list::rows(&library.hosts, self.list.query.value());
@@ -639,6 +808,7 @@ impl App {
             Screen::ConnectError => self.connect_error_key(key),
             Screen::SshOutput => self.output_key(key),
             Screen::HostKeyChanged => self.host_key_key(key),
+            Screen::Keys => self.keys_key(key),
         }
     }
 
@@ -665,7 +835,7 @@ impl App {
             Screen::Notices | Screen::List => Some(&mut self.notices_scroll),
             Screen::ConnectError | Screen::HostKeyChanged => Some(&mut self.error_scroll),
             Screen::SshOutput => Some(&mut self.output_scroll),
-            Screen::Form => None,
+            Screen::Form | Screen::Keys => None,
         }
     }
 
@@ -696,7 +866,7 @@ impl App {
             Screen::Notices => self.notices_scroll = 0,
             Screen::ConnectError | Screen::HostKeyChanged => self.error_scroll = 0,
             Screen::SshOutput => self.output_scroll = 0,
-            Screen::List | Screen::Form => {}
+            Screen::List | Screen::Form | Screen::Keys => {}
         }
         // The limit belongs to the screen that was drawn; until the new one is
         // drawn, stay put rather than scroll by a stale amount.
@@ -718,7 +888,10 @@ impl App {
         }
         match key.code {
             KeyCode::Char('q') => self.quit = true,
-            KeyCode::Char('?') | KeyCode::Esc => self.open(Screen::List),
+            KeyCode::Char('?') | KeyCode::Esc => {
+                let back = std::mem::replace(&mut self.help_return, Screen::List);
+                self.open(back);
+            }
             _ => {
                 self.scroll_key(key);
             }
@@ -839,6 +1012,8 @@ impl App {
             KeyCode::Char('f') => self.toggle_favorite(),
             KeyCode::Char('c') => self.show_command(),
             KeyCode::Char('o') => self.show_output(Screen::List),
+            // A capital: the lower case k moves the selection up.
+            KeyCode::Char('K') => self.requests.push_back(Request::LoadKeys),
             KeyCode::Enter => self.request_connect(),
             _ => {}
         }
@@ -991,14 +1166,15 @@ impl App {
     /// A failure gets a screen of its own that explains it and says what to try.
     /// Anything that is not a failure (a normal logout, the remote command's own
     /// exit status, Ctrl-C) is one line at the bottom of the list.
-    pub fn connection_ended(&mut self, name: &str, result: ConnectResult) {
+    pub fn connection_ended(&mut self, name: &str, result: HandoverResult) {
+        self.failure_return = Screen::List;
         let outcome = match result {
-            ConnectResult::Failed(text) => {
+            HandoverResult::Failed(text) => {
                 self.report = None;
                 self.set_status(StatusKind::Error, text);
                 return;
             }
-            ConnectResult::Ran(outcome) => outcome,
+            HandoverResult::Ran(outcome) => outcome,
         };
 
         let verdict = classify(&outcome);
@@ -1083,7 +1259,7 @@ impl App {
         }
         match key.code {
             KeyCode::Char('q') => self.quit = true,
-            KeyCode::Enter | KeyCode::Esc => self.open(Screen::List),
+            KeyCode::Enter | KeyCode::Esc => self.open(self.failure_return),
             KeyCode::Char('o') => self.show_output(Screen::ConnectError),
             _ => {
                 self.scroll_key(key);
@@ -1139,7 +1315,7 @@ impl App {
     fn abort_key_change(&mut self) {
         self.key_change = None;
         self.key_confirm = None;
-        self.open(Screen::List);
+        self.open(self.failure_return);
     }
 
     fn removal_confirm_key(&mut self, key: KeyEvent) {
@@ -1187,13 +1363,18 @@ impl App {
         match result {
             Removal::Removed => {
                 self.key_change = None;
-                self.open(Screen::List);
+                self.open(self.failure_return);
+                let again = if self.failure_return == Screen::Keys {
+                    "Send the key again"
+                } else {
+                    "Connect again"
+                };
                 self.set_status(
                     StatusKind::Info,
                     format!(
                         "Removed the old key of '{}' from your known_hosts; the previous file \
-                         is kept as known_hosts.old. Connect again: ssh will show the new key \
-                         and ask you to accept it.",
+                         is kept as known_hosts.old. {again}: ssh will show the new key and \
+                         ask you to accept it.",
                         target.saved_name
                     ),
                 );
@@ -1209,6 +1390,377 @@ impl App {
             Removal::Failed(output) => self.set_status(
                 StatusKind::Error,
                 format!("The old key was not removed. ssh-keygen said: {output}"),
+            ),
+        }
+    }
+
+    // ---- the keys ------------------------------------------------------------
+
+    /// Takes in the keys that were read. The first time this opens the screen;
+    /// after a refresh it keeps the same key selected.
+    fn keys_loaded(&mut self, snapshot: KeysSnapshot) {
+        let mut screen = KeysScreen::new(snapshot, self.keys.as_ref());
+        if let Some(name) = self.select_key.take() {
+            screen.select_name(&name);
+        }
+        self.keys = Some(screen);
+        if self.screen != Screen::Keys {
+            self.open(Screen::Keys);
+        }
+    }
+
+    fn keys_key(&mut self, key: KeyEvent) {
+        let Some(keys) = self.keys.as_mut() else {
+            self.open(Screen::List);
+            return;
+        };
+        if keys.generating().is_some() {
+            // Typing goes to the form; the list's keys are letters too.
+            match keys.generate_key(key) {
+                Generation::Stay | Generation::Close => {}
+                Generation::Make { name, comment } => {
+                    self.requests.push_back(Request::GenerateKey {
+                        file_name: name,
+                        comment,
+                    });
+                }
+            }
+            return;
+        }
+        if keys.copying().is_some() {
+            if let Copying::Send { key, host } = keys.copy_key(key) {
+                self.request_copy_key(&key, &host);
+            }
+            return;
+        }
+        if keys.confirming().is_some() {
+            // A question with two answers: nothing else does anything.
+            match key.code {
+                KeyCode::Char('y' | 'Y') if Self::is_plain(key) => {
+                    if let Some(file_name) = keys.confirm_fix() {
+                        self.requests
+                            .push_back(Request::FixKeyPermissions { file_name });
+                    }
+                }
+                KeyCode::Char('n' | 'N') | KeyCode::Esc => keys.cancel_fix(),
+                _ => {}
+            }
+            return;
+        }
+        if !Self::is_plain(key) {
+            return;
+        }
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => keys.move_by(-1),
+            KeyCode::Down | KeyCode::Char('j') => keys.move_by(1),
+            KeyCode::PageUp => keys.page(false),
+            KeyCode::PageDown => keys.page(true),
+            KeyCode::Home => keys.first(),
+            KeyCode::End => keys.last(),
+            KeyCode::Char('f') => match keys.start_fix() {
+                FixOutcome::Asked | FixOutcome::NothingSelected => {}
+                FixOutcome::Symlink => self.set_status(
+                    StatusKind::Info,
+                    "This key is a symbolic link, so Bifrost does not change its permissions: \
+                     that would change the file it points to. Change them on that file.",
+                ),
+                FixOutcome::NotNeeded(Permissions::Unchecked) => self.set_status(
+                    StatusKind::Info,
+                    "Bifrost cannot check the permissions of this key on this system, so it has \
+                     nothing to fix.",
+                ),
+                FixOutcome::NotNeeded(_) => self.set_status(
+                    StatusKind::Info,
+                    "The permissions of this key are fine: only you can use it.",
+                ),
+            },
+            KeyCode::Char('g') => {
+                if keys.snapshot().dir.as_os_str().is_empty() {
+                    self.set_status(
+                        StatusKind::Info,
+                        "Bifrost does not know where your ssh folder is, so it cannot make a key.",
+                    );
+                } else {
+                    keys.start_generate();
+                }
+            }
+            KeyCode::Char('a') => self.add_selected_to_agent(),
+            KeyCode::Char('c') => self.start_copy_key(),
+            KeyCode::Char('r') => self.requests.push_back(Request::LoadKeys),
+            KeyCode::Char('?') => {
+                self.help_return = Screen::Keys;
+                self.open(Screen::Help);
+            }
+            KeyCode::Esc => {
+                self.keys = None;
+                self.open(Screen::List);
+            }
+            KeyCode::Char('q') => self.quit = true,
+            _ => {}
+        }
+    }
+
+    /// Opens the dialog that sends the selected key's public key to a saved host.
+    fn start_copy_key(&mut self) {
+        let Some(hosts) = self.hosts() else {
+            self.set_status(
+                StatusKind::Info,
+                "The saved hosts could not be read, so there is nowhere to send a key.",
+            );
+            return;
+        };
+        // In the order of the host list: favorites first, then by name.
+        let choices: Vec<HostChoice> = list::rows(hosts, "")
+            .into_iter()
+            .map(|row| {
+                let host = &hosts.as_slice()[row.index];
+                let mut destination = host.hostname.clone();
+                if let Some(user) = &host.user {
+                    destination = format!("{user}@{destination}");
+                }
+                if let Some(port) = host.port {
+                    destination = format!("{destination}:{port}");
+                }
+                HostChoice {
+                    name: host.name.clone(),
+                    destination,
+                }
+            })
+            .collect();
+        if choices.is_empty() {
+            self.set_status(
+                StatusKind::Info,
+                "There are no saved hosts to send the key to. Go back with Esc and press a to \
+                 add one.",
+            );
+            return;
+        }
+        if let Some(keys) = self.keys.as_mut() {
+            keys.start_copy(choices);
+        }
+    }
+
+    /// Asks the event loop to send the public key of `file_name` to the saved
+    /// host `host`, with the arguments for that and no others.
+    fn request_copy_key(&mut self, file_name: &str, host: &str) {
+        let Some(hosts) = self.hosts() else {
+            return;
+        };
+        let Some(saved) = hosts.get(host) else {
+            self.set_status(
+                StatusKind::Error,
+                format!("The host '{host}' is not saved any more."),
+            );
+            return;
+        };
+        let built = build_copy_args(saved, hosts)
+            .and_then(|args| known_hosts_targets(saved, hosts).map(|known| (args, known)));
+        match built {
+            Ok((args, known_hosts)) => {
+                self.pending_known_hosts.clone_from(&known_hosts);
+                self.requests.push_back(Request::CopyKey {
+                    file_name: file_name.to_string(),
+                    connect: ConnectRequest {
+                        name: host.to_string(),
+                        args,
+                        known_hosts,
+                    },
+                });
+            }
+            Err(err) => self.set_status(StatusKind::Error, err.to_string()),
+        }
+    }
+
+    /// Reports how sending a key ended, once the terminal is back.
+    ///
+    /// The same judgment as for a connection: ssh's own failures (255) are
+    /// explained on the same screens, and a changed host key stops everything on
+    /// the blocking screen. What differs is what a normal end means: status 0 is
+    /// the key sent, and any other status is the server's command failing.
+    fn key_copied(&mut self, file_name: &str, host: &str, result: HandoverResult) {
+        self.failure_return = Screen::Keys;
+        let outcome = match result {
+            HandoverResult::Failed(text) => {
+                self.report = None;
+                self.set_status(StatusKind::Error, text);
+                return;
+            }
+            HandoverResult::Ran(outcome) => outcome,
+        };
+        let verdict = classify(&outcome);
+        self.report = Some(ConnectionReport {
+            name: host.to_string(),
+            failure: match verdict {
+                Verdict::Failed(kind) => Some(kind),
+                _ => None,
+            },
+            stderr: outcome.stderr.clone(),
+        });
+        let (kind, text) = match verdict {
+            Verdict::Failed(FailureKind::HostKeyChanged) => {
+                self.show_key_change(host);
+                return;
+            }
+            Verdict::Failed(_) => {
+                self.open(Screen::ConnectError);
+                return;
+            }
+            Verdict::Ended => (
+                StatusKind::Info,
+                format!(
+                    "Sent the public key of '{file_name}' to '{host}'. The server added it to \
+                     ~/.ssh/authorized_keys, or it was already there."
+                ),
+            ),
+            Verdict::RemoteStatus(code) => {
+                // The server ran the command and it failed, so this is not a
+                // connection problem: what it said last is the reason. Raw here,
+                // cleaned when drawn.
+                let said = String::from_utf8_lossy(&outcome.stderr);
+                let last = said.lines().map(str::trim).rfind(|line| !line.is_empty());
+                let why = last.map_or_else(String::new, |line| {
+                    format!(
+                        " It said: {}",
+                        line.chars().take(ToolEnd::SAID).collect::<String>()
+                    )
+                });
+                (
+                    StatusKind::Error,
+                    format!(
+                        "'{host}' ran the command that adds the key and it failed (status \
+                         {code}), so the key was probably not added.{why}"
+                    ),
+                )
+            }
+            Verdict::Cancelled => (
+                StatusKind::Info,
+                "Sending the key was cancelled.".to_string(),
+            ),
+            Verdict::ClosedByYou => (
+                StatusKind::Warning,
+                format!(
+                    "The connection to '{host}' was closed, so the key may not have been sent."
+                ),
+            ),
+            Verdict::Signalled(signal) => (
+                StatusKind::Warning,
+                format!("ssh was stopped by signal {signal}, so the key may not have been sent."),
+            ),
+        };
+        self.set_status(kind, text);
+    }
+
+    /// Asks for the selected key to be added to the agent, unless that is bound to
+    /// fail for a reason Bifrost can already tell, in which case it says why.
+    fn add_selected_to_agent(&mut self) {
+        let Some(keys) = self.keys.as_ref() else {
+            return;
+        };
+        let Some(entry) = keys.selected_entry() else {
+            return;
+        };
+        let refusal = if entry.loaded == Some(true) {
+            Some("This key is already in the agent.")
+        } else if entry.can_fix_permissions() {
+            Some(
+                "ssh-add refuses a private key that other users can read. Press f to fix its \
+                 permissions first.",
+            )
+        } else if entry.permissions.is_too_open() {
+            Some(
+                "ssh-add refuses a private key that other users can read, and this one is a \
+                 symbolic link, so Bifrost does not change it. Change the permissions of the \
+                 file it points to.",
+            )
+        } else {
+            match keys.snapshot().agent {
+                AgentState::NotStarted | AgentState::Unreachable => Some(
+                    "There is no ssh agent answering in this session to add the key to. The note \
+                     at the top says how to start one.",
+                ),
+                _ => None,
+            }
+        };
+        match refusal {
+            Some(text) => self.set_status(StatusKind::Info, text),
+            None => {
+                let file_name = entry.name.clone();
+                self.requests
+                    .push_back(Request::AddKeyToAgent { file_name });
+            }
+        }
+    }
+
+    /// Reports how making a key ended, and reads the keys again so that the new
+    /// one is listed and selected.
+    fn key_generated(&mut self, file_name: &str, result: HandoverResult) {
+        match ToolEnd::from(result, "ssh-keygen") {
+            ToolEnd::Done => {
+                self.set_status(
+                    StatusKind::Info,
+                    format!("Made the key '{file_name}'. Press a to add it to the agent."),
+                );
+                self.select_key = Some(file_name.to_string());
+                self.requests.push_back(Request::LoadKeys);
+            }
+            ToolEnd::Cancelled => {
+                self.set_status(StatusKind::Info, "Making the key was cancelled.");
+                self.requests.push_back(Request::LoadKeys);
+            }
+            ToolEnd::Failed(why) => {
+                self.set_status(
+                    StatusKind::Error,
+                    format!("Could not make the key '{file_name}': {why}"),
+                );
+                self.requests.push_back(Request::LoadKeys);
+            }
+            ToolEnd::NotRun(why) => self.set_status(StatusKind::Error, why),
+        }
+    }
+
+    /// Reports how adding a key to the agent ended, and reads the keys again so
+    /// that the screen shows whether the agent holds it now.
+    fn key_added(&mut self, file_name: &str, result: HandoverResult) {
+        match ToolEnd::from(result, "ssh-add") {
+            ToolEnd::Done => {
+                self.set_status(
+                    StatusKind::Info,
+                    format!("Added '{file_name}' to the agent."),
+                );
+                self.requests.push_back(Request::LoadKeys);
+            }
+            ToolEnd::Cancelled => {
+                self.set_status(StatusKind::Info, "Adding the key was cancelled.");
+                self.requests.push_back(Request::LoadKeys);
+            }
+            ToolEnd::Failed(why) => {
+                self.set_status(
+                    StatusKind::Error,
+                    format!("Could not add '{file_name}' to the agent: {why}"),
+                );
+                self.requests.push_back(Request::LoadKeys);
+            }
+            ToolEnd::NotRun(why) => self.set_status(StatusKind::Error, why),
+        }
+    }
+
+    /// Reports what changing a key's permissions did, and reads the keys again so
+    /// that the screen shows how things are now.
+    fn permissions_fixed(&mut self, file_name: &str, result: Result<(), String>) {
+        match result {
+            Ok(()) => {
+                self.set_status(
+                    StatusKind::Info,
+                    format!(
+                        "Changed the permissions of '{file_name}' to 0600, so only you can read \
+                         and write it."
+                    ),
+                );
+                self.requests.push_back(Request::LoadKeys);
+            }
+            Err(why) => self.set_status(
+                StatusKind::Error,
+                format!("Could not change the permissions of '{file_name}': {why}"),
             ),
         }
     }
@@ -1992,7 +2544,7 @@ mod tests {
         assert_eq!(
             labels(&app),
             [
-                "move", "connect", "search", "add", "edit", "delete", "favorite", "copy",
+                "move", "connect", "search", "add", "edit", "delete", "favorite", "copy", "keys",
                 "warnings", "help", "quit"
             ]
         );
@@ -2015,6 +2567,7 @@ mod tests {
                 "delete",
                 "favorite",
                 "copy",
+                "keys",
                 "warnings",
                 "help",
                 "clear search",
@@ -2915,8 +3468,8 @@ mod tests {
 
     // ---- connecting ------------------------------------------------------
 
-    fn ran(exit: Exit, interrupted: bool) -> ConnectResult {
-        ConnectResult::Ran(SshOutcome {
+    fn ran(exit: Exit, interrupted: bool) -> HandoverResult {
+        HandoverResult::Ran(SshOutcome {
             exit,
             stderr: Vec::new(),
             interrupted,
@@ -3034,7 +3587,7 @@ mod tests {
                 "The connection to 'web' was closed.",
             ),
             (
-                ConnectResult::Failed("Could not start ssh: no".to_string()),
+                HandoverResult::Failed("Could not start ssh: no".to_string()),
                 StatusKind::Error,
                 "Could not start ssh: no",
             ),
@@ -3048,8 +3601,8 @@ mod tests {
         }
     }
 
-    fn ran_with(code: i32, stderr: &str) -> ConnectResult {
-        ConnectResult::Ran(SshOutcome {
+    fn ran_with(code: i32, stderr: &str) -> HandoverResult {
+        HandoverResult::Ran(SshOutcome {
             exit: Exit::Code(code),
             stderr: stderr.as_bytes().to_vec(),
             interrupted: false,
@@ -3162,7 +3715,7 @@ mod tests {
     fn a_connection_that_could_not_start_forgets_the_previous_output() {
         let mut app = app();
         app.connection_ended("web", ran_with(0, "old output\r\n"));
-        app.connection_ended("web", ConnectResult::Failed("no ssh".to_string()));
+        app.connection_ended("web", HandoverResult::Failed("no ssh".to_string()));
         assert!(app.report().is_none(), "the output was of another run");
     }
 
@@ -3662,5 +4215,1363 @@ mod tests {
         let mut quiet = self::app();
         quiet.handle_response(&Request::Copy("x".to_string()), Response::Copied);
         assert!(quiet.status().is_none());
+    }
+
+    // ---- the keys screen -----------------------------------------------------
+
+    use crate::tui::keys::testing::{entry as key_entry, snapshot as key_snapshot};
+
+    fn open_keys(keys: Vec<crate::ssh::keys::KeyEntry>) -> App {
+        let mut app = app();
+        app.handle_key(ch('K'));
+        let request = app.take_request().expect("the keys are asked for");
+        app.handle_response(&request, Response::Keys(key_snapshot(keys)));
+        app
+    }
+
+    fn too_open(name: &str) -> crate::ssh::keys::KeyEntry {
+        key_entry(name, Permissions::TooOpen { mode: 0o644 }, false)
+    }
+
+    fn fine_key(name: &str) -> crate::ssh::keys::KeyEntry {
+        key_entry(name, Permissions::Fine, false)
+    }
+
+    #[test]
+    fn a_capital_k_asks_for_the_keys_and_the_screen_opens_when_they_arrive() {
+        let mut app = app();
+        app.handle_key(ch('K'));
+        assert_eq!(app.screen(), Screen::List, "nothing to show yet");
+        let request = app.take_request().unwrap();
+        assert_eq!(request, Request::LoadKeys);
+
+        app.handle_response(&request, Response::Keys(key_snapshot(vec![fine_key("a")])));
+        assert_eq!(app.screen(), Screen::Keys);
+        assert_eq!(app.keys().unwrap().snapshot().keys.len(), 1);
+    }
+
+    #[test]
+    fn a_lower_case_k_still_moves_the_selection_up_on_the_list() {
+        let mut app = app();
+        app.handle_key(press(KeyCode::Down));
+        let moved = selected(&app).map(str::to_string);
+        app.handle_key(ch('k'));
+        assert_ne!(selected(&app).map(str::to_string), moved);
+        assert!(app.take_request().is_none(), "k is not the keys key");
+    }
+
+    #[test]
+    fn the_keys_key_is_not_offered_without_hosts_to_show_and_not_with_modifiers() {
+        let mut broken = unavailable();
+        broken.handle_key(ch('K'));
+        assert!(broken.take_request().is_none());
+
+        let mut app = app();
+        app.handle_key(with(KeyCode::Char('K'), KeyModifiers::CONTROL));
+        app.handle_key(with(KeyCode::Char('K'), KeyModifiers::ALT));
+        assert!(app.take_request().is_none());
+    }
+
+    #[test]
+    fn the_selection_moves_with_the_usual_keys_and_stays_inside_the_list() {
+        let mut app = open_keys(vec![fine_key("a"), fine_key("b"), fine_key("c")]);
+        let at = |app: &App| app.keys().unwrap().selected();
+        app.handle_key(ch('j'));
+        app.handle_key(press(KeyCode::Down));
+        app.handle_key(press(KeyCode::Down));
+        assert_eq!(at(&app), 2);
+        app.handle_key(ch('k'));
+        assert_eq!(at(&app), 1);
+        app.handle_key(press(KeyCode::Home));
+        assert_eq!(at(&app), 0);
+        app.handle_key(press(KeyCode::End));
+        assert_eq!(at(&app), 2);
+        app.handle_key(press(KeyCode::Up));
+        app.handle_key(press(KeyCode::PageUp));
+        assert_eq!(at(&app), 0);
+        app.handle_key(press(KeyCode::PageDown));
+        assert!(at(&app) > 0);
+    }
+
+    #[test]
+    fn f_on_a_key_that_is_too_open_asks_and_only_y_changes_it() {
+        let mut app = open_keys(vec![fine_key("a"), too_open("b")]);
+        app.handle_key(ch('j'));
+        assert_eq!(
+            labels(&app),
+            [
+                "move",
+                "fix permissions",
+                "new key",
+                "add to agent",
+                "send to host",
+                "refresh",
+                "help",
+                "back",
+                "quit"
+            ]
+        );
+
+        app.handle_key(ch('f'));
+        assert_eq!(app.keys().unwrap().confirming(), Some("b"));
+        assert_eq!(labels(&app), ["change to 0600", "cancel"]);
+        assert!(app.take_request().is_none(), "asking is not doing");
+
+        app.handle_key(ch('y'));
+        assert_eq!(
+            app.take_request(),
+            Some(Request::FixKeyPermissions {
+                file_name: "b".to_string()
+            })
+        );
+        assert!(app.keys().unwrap().confirming().is_none());
+    }
+
+    #[test]
+    fn n_and_esc_cancel_and_nothing_is_changed() {
+        for answer in [ch('n'), ch('N'), press(KeyCode::Esc)] {
+            let mut app = open_keys(vec![too_open("a")]);
+            app.handle_key(ch('f'));
+            app.handle_key(answer);
+            assert!(app.keys().unwrap().confirming().is_none());
+            assert!(app.take_request().is_none());
+            assert_eq!(app.screen(), Screen::Keys, "Esc answered the question only");
+        }
+    }
+
+    #[test]
+    fn while_the_question_shows_nothing_else_does_anything() {
+        let mut app = open_keys(vec![too_open("a"), fine_key("b")]);
+        app.handle_key(ch('f'));
+        for key in [
+            ch('q'),
+            ch('j'),
+            ch('r'),
+            ch('?'),
+            ch('f'),
+            press(KeyCode::Enter),
+            press(KeyCode::Down),
+        ] {
+            app.handle_key(key);
+            assert_eq!(app.keys().unwrap().confirming(), Some("a"), "{key:?}");
+            assert!(!app.should_quit());
+            assert!(app.take_request().is_none());
+        }
+        assert_eq!(app.keys().unwrap().selected(), 0);
+        // Only a plain y confirms.
+        app.handle_key(with(KeyCode::Char('y'), KeyModifiers::ALT));
+        assert!(app.take_request().is_none());
+    }
+
+    #[test]
+    fn ctrl_c_quits_from_the_keys_screen_and_from_the_question() {
+        let mut app = open_keys(vec![too_open("a")]);
+        app.handle_key(with(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.should_quit());
+
+        let mut asking = open_keys(vec![too_open("a")]);
+        asking.handle_key(ch('f'));
+        asking.handle_key(with(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(asking.should_quit());
+        assert!(asking.take_request().is_none());
+    }
+
+    #[test]
+    fn f_says_why_when_there_is_nothing_to_fix_or_it_is_not_allowed() {
+        let mut app = open_keys(vec![
+            fine_key("fine"),
+            key_entry("link", Permissions::TooOpen { mode: 0o644 }, true),
+            key_entry("unchecked", Permissions::Unchecked, false),
+        ]);
+        let says = |app: &mut App, expected: &str| {
+            app.handle_key(ch('f'));
+            let status = app.status().expect("a message").text.clone();
+            assert!(status.contains(expected), "{status}");
+            assert!(app.keys().unwrap().confirming().is_none());
+            assert!(app.take_request().is_none());
+        };
+        says(&mut app, "permissions of this key are fine");
+        app.handle_key(ch('j'));
+        says(&mut app, "symbolic link");
+        app.handle_key(ch('j'));
+        says(&mut app, "cannot check the permissions");
+    }
+
+    #[test]
+    fn f_with_no_keys_does_nothing() {
+        let mut app = open_keys(Vec::new());
+        app.handle_key(ch('f'));
+        assert!(app.status().is_none());
+        assert!(app.take_request().is_none());
+    }
+
+    #[test]
+    fn the_fix_footer_is_offered_only_for_a_key_that_can_be_fixed() {
+        let mut app = open_keys(vec![
+            fine_key("fine"),
+            key_entry("link", Permissions::TooOpen { mode: 0o644 }, true),
+            too_open("open"),
+        ]);
+        assert!(!labels(&app).contains(&"fix permissions"));
+        app.handle_key(ch('j'));
+        assert!(!labels(&app).contains(&"fix permissions"), "not for a link");
+        app.handle_key(ch('j'));
+        assert!(labels(&app).contains(&"fix permissions"));
+    }
+
+    #[test]
+    fn a_fixed_key_is_reported_and_the_keys_are_read_again() {
+        let mut app = open_keys(vec![too_open("a b")]);
+        let request = Request::FixKeyPermissions {
+            file_name: "a b".to_string(),
+        };
+        app.handle_response(&request, Response::PermissionsFixed(Ok(())));
+        let status = app.status().unwrap();
+        assert_eq!(status.kind, StatusKind::Info);
+        assert!(
+            status.text.contains("'a b'") && status.text.contains("0600"),
+            "{}",
+            status.text
+        );
+        assert_eq!(app.take_request(), Some(Request::LoadKeys));
+    }
+
+    #[test]
+    fn a_fix_that_failed_says_why_and_reads_nothing_again() {
+        let mut app = open_keys(vec![too_open("a")]);
+        let request = Request::FixKeyPermissions {
+            file_name: "a".to_string(),
+        };
+        app.handle_response(
+            &request,
+            Response::PermissionsFixed(Err("Operation not permitted".to_string())),
+        );
+        let status = app.status().unwrap();
+        assert_eq!(status.kind, StatusKind::Error);
+        assert!(
+            status.text.contains("Operation not permitted"),
+            "{}",
+            status.text
+        );
+        assert!(app.take_request().is_none());
+        assert_eq!(app.screen(), Screen::Keys);
+    }
+
+    #[test]
+    fn r_reads_the_keys_again_and_keeps_the_selected_key() {
+        let mut app = open_keys(vec![fine_key("a"), fine_key("b"), fine_key("c")]);
+        app.handle_key(ch('j'));
+        app.handle_key(ch('j'));
+        app.handle_key(ch('r'));
+        let request = app.take_request().unwrap();
+        assert_eq!(request, Request::LoadKeys);
+        app.handle_response(
+            &request,
+            Response::Keys(key_snapshot(vec![
+                fine_key("new"),
+                fine_key("a"),
+                fine_key("b"),
+                fine_key("c"),
+            ])),
+        );
+        assert_eq!(app.screen(), Screen::Keys, "still there, not reopened");
+        assert_eq!(app.keys().unwrap().selected_entry().unwrap().name, "c");
+    }
+
+    #[test]
+    fn esc_goes_back_to_the_list_and_q_quits() {
+        let mut app = open_keys(vec![fine_key("a")]);
+        app.handle_key(press(KeyCode::Esc));
+        assert_eq!(app.screen(), Screen::List);
+        assert!(app.keys().is_none());
+        assert!(!app.should_quit());
+
+        let mut app = open_keys(vec![fine_key("a")]);
+        app.handle_key(ch('q'));
+        assert!(app.should_quit());
+    }
+
+    #[test]
+    fn the_help_opened_from_the_keys_comes_back_to_the_keys() {
+        let mut app = open_keys(vec![fine_key("a"), fine_key("b")]);
+        app.handle_key(ch('j'));
+        app.handle_key(ch('?'));
+        assert_eq!(app.screen(), Screen::Help);
+        app.handle_key(press(KeyCode::Esc));
+        assert_eq!(app.screen(), Screen::Keys);
+        assert_eq!(app.keys().unwrap().selected(), 1, "where it was");
+
+        // And the help opened from the list still goes back to the list.
+        let mut from_list = self::app();
+        from_list.handle_key(ch('?'));
+        from_list.handle_key(ch('?'));
+        assert_eq!(from_list.screen(), Screen::List);
+    }
+
+    #[test]
+    fn keys_with_modifiers_do_not_act_as_their_plain_letter() {
+        let mut app = open_keys(vec![too_open("a")]);
+        for key in [
+            with(KeyCode::Char('f'), KeyModifiers::ALT),
+            with(KeyCode::Char('r'), KeyModifiers::ALT),
+            with(KeyCode::Char('q'), KeyModifiers::CONTROL),
+        ] {
+            app.handle_key(key);
+        }
+        assert!(app.keys().unwrap().confirming().is_none());
+        assert!(app.take_request().is_none());
+        assert!(!app.should_quit());
+    }
+
+    #[test]
+    fn the_help_and_the_footer_cover_the_keys_screen() {
+        let documented: Vec<&str> = HELP
+            .iter()
+            .flat_map(|section| section.rows)
+            .flat_map(|row| tokens(row.keys))
+            .collect();
+        let mut app = open_keys(vec![too_open("a")]);
+        let mut seen = app.footer_hints();
+        app.handle_key(ch('f'));
+        seen.extend(app.footer_hints());
+        app.handle_key(press(KeyCode::Esc));
+        app.handle_key(ch('g'));
+        seen.extend(app.footer_hints());
+        for hint in seen {
+            for key in tokens(hint.keys) {
+                assert!(documented.contains(&key), "{key:?} is not in the help");
+            }
+        }
+        assert!(documented.contains(&"K"), "the key that opens it");
+    }
+
+    #[test]
+    fn the_host_list_footer_offers_the_keys() {
+        assert!(labels(&app()).contains(&"keys"));
+    }
+
+    // ---- making a key and adding it to the agent -------------------------------
+
+    fn open_keys_with_agent(keys: Vec<crate::ssh::keys::KeyEntry>, agent: AgentState) -> App {
+        let mut app = app();
+        app.handle_key(ch('K'));
+        let request = app.take_request().expect("the keys are asked for");
+        let mut snapshot = key_snapshot(keys);
+        snapshot.agent = agent;
+        app.handle_response(&request, Response::Keys(snapshot));
+        app
+    }
+
+    fn running() -> AgentState {
+        AgentState::Running { hashes: Vec::new() }
+    }
+
+    /// Empties the field that has the focus.
+    fn empty_field(app: &mut App) {
+        for _ in 0..100 {
+            app.handle_key(press(KeyCode::Backspace));
+        }
+    }
+
+    fn form_of(app: &App) -> &crate::tui::keys::GenerateForm {
+        app.keys().unwrap().generating().expect("the form is open")
+    }
+
+    #[test]
+    fn g_opens_the_form_with_a_free_name_in_it() {
+        let mut app = open_keys(vec![fine_key("id_ed25519")]);
+        app.handle_key(ch('g'));
+        assert_eq!(form_of(&app).name().value(), "id_ed25519_2");
+        assert_eq!(form_of(&app).comment().value(), "");
+        assert!(
+            app.take_request().is_none(),
+            "opening the form asks for nothing"
+        );
+        assert_eq!(
+            labels(&app),
+            ["next field", "next / make the key", "cancel"]
+        );
+    }
+
+    #[test]
+    fn while_the_form_is_open_every_key_goes_to_the_form_and_none_to_the_list() {
+        let mut app = open_keys(vec![fine_key("a")]);
+        app.handle_key(ch('g'));
+        empty_field(&mut app);
+        type_text(&mut app, "qjkgarfK?");
+        assert_eq!(form_of(&app).name().value(), "qjkgarfK?");
+        assert!(!app.should_quit());
+        assert_eq!(app.screen(), Screen::Keys);
+        assert!(app.take_request().is_none());
+    }
+
+    #[test]
+    fn enter_goes_to_the_comment_and_then_asks_for_the_key() {
+        let mut app = open_keys(vec![fine_key("a")]);
+        app.handle_key(ch('g'));
+        empty_field(&mut app);
+        type_text(&mut app, "work");
+        app.handle_key(press(KeyCode::Enter));
+        assert_eq!(
+            form_of(&app).focus(),
+            crate::tui::keys::GenerateField::Comment
+        );
+        assert!(
+            app.take_request().is_none(),
+            "the first Enter only moves on"
+        );
+
+        type_text(&mut app, "me on my laptop");
+        app.handle_key(press(KeyCode::Enter));
+        assert_eq!(
+            app.take_request(),
+            Some(Request::GenerateKey {
+                file_name: "work".to_string(),
+                comment: Some("me on my laptop".to_string()),
+            })
+        );
+        assert!(
+            app.keys().unwrap().generating().is_none(),
+            "the form is over"
+        );
+        assert!(app.take_request().is_none());
+    }
+
+    #[test]
+    fn an_empty_comment_is_no_comment() {
+        let mut app = open_keys(vec![]);
+        app.handle_key(ch('g'));
+        app.handle_key(press(KeyCode::Enter));
+        app.handle_key(press(KeyCode::Enter));
+        assert_eq!(
+            app.take_request(),
+            Some(Request::GenerateKey {
+                file_name: "id_ed25519".to_string(),
+                comment: None,
+            })
+        );
+    }
+
+    #[test]
+    fn a_name_that_is_not_allowed_is_refused_on_its_field_and_the_edit_clears_the_complaint() {
+        for bad in [
+            "",
+            "two words",
+            "-oProxyCommand=x",
+            ".hidden",
+            "key.pub",
+            "config",
+            "known_hosts",
+            "caf\u{e9}",
+            "../up",
+            &"x".repeat(65),
+        ] {
+            let mut app = open_keys(vec![fine_key("a")]);
+            app.handle_key(ch('g'));
+            empty_field(&mut app);
+            type_text(&mut app, bad);
+            app.handle_key(press(KeyCode::Enter));
+            let form = form_of(&app);
+            let (field, message) = form
+                .error()
+                .unwrap_or_else(|| panic!("{bad:?} was accepted"));
+            assert_eq!(field, crate::tui::keys::GenerateField::Name, "{bad:?}");
+            assert!(!message.is_empty());
+            assert_eq!(
+                form.focus(),
+                crate::tui::keys::GenerateField::Name,
+                "{bad:?}"
+            );
+            assert!(app.take_request().is_none(), "{bad:?}");
+
+            // Typing on the field is an answer to the complaint.
+            app.handle_key(ch('x'));
+            assert!(form_of(&app).error().is_none(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_name_that_is_listed_is_refused_whatever_its_case() {
+        let mut app = open_keys(vec![fine_key("Work")]);
+        app.handle_key(ch('g'));
+        empty_field(&mut app);
+        type_text(&mut app, "work");
+        app.handle_key(press(KeyCode::Enter));
+        let (_, message) = form_of(&app).error().expect("refused");
+        assert!(message.contains("already a key"), "{message}");
+        assert!(app.take_request().is_none());
+    }
+
+    #[test]
+    fn a_comment_that_is_not_allowed_is_refused_on_the_comment() {
+        for bad in [
+            " padded".to_string(),
+            "padded ".to_string(),
+            "x".repeat(101),
+            "right-to-left \u{202e}override".to_string(),
+        ] {
+            let mut app = open_keys(vec![]);
+            app.handle_key(ch('g'));
+            app.handle_key(press(KeyCode::Enter));
+            type_text(&mut app, &bad);
+            app.handle_key(press(KeyCode::Enter));
+            let (field, _) = form_of(&app)
+                .error()
+                .unwrap_or_else(|| panic!("{bad:?} was accepted"));
+            assert_eq!(field, crate::tui::keys::GenerateField::Comment, "{bad:?}");
+            assert!(app.take_request().is_none(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_bad_name_is_still_caught_when_enter_is_pressed_on_the_comment() {
+        let mut app = open_keys(vec![]);
+        app.handle_key(ch('g'));
+        app.handle_key(press(KeyCode::Enter));
+        // Back to the name, spoil it, and go straight to the comment and on.
+        app.handle_key(press(KeyCode::BackTab));
+        app.handle_key(ch(' '));
+        app.handle_key(press(KeyCode::Tab));
+        app.handle_key(press(KeyCode::Enter));
+        let (field, _) = form_of(&app).error().expect("refused");
+        assert_eq!(field, crate::tui::keys::GenerateField::Name);
+        assert_eq!(form_of(&app).focus(), crate::tui::keys::GenerateField::Name);
+        assert!(app.take_request().is_none());
+    }
+
+    #[test]
+    fn tab_and_the_arrows_switch_fields_and_typing_edits_the_focused_one() {
+        let mut app = open_keys(vec![]);
+        app.handle_key(ch('g'));
+        for key in [press(KeyCode::Tab), press(KeyCode::Down)] {
+            let before = form_of(&app).focus();
+            app.handle_key(key);
+            assert_ne!(form_of(&app).focus(), before, "{key:?}");
+        }
+        app.handle_key(press(KeyCode::Up));
+        assert_eq!(
+            form_of(&app).focus(),
+            crate::tui::keys::GenerateField::Comment
+        );
+        type_text(&mut app, "hi");
+        assert_eq!(form_of(&app).comment().value(), "hi");
+        assert_eq!(form_of(&app).name().value(), "id_ed25519");
+    }
+
+    #[test]
+    fn esc_closes_the_form_and_asks_for_nothing_and_stays_on_the_keys() {
+        let mut app = open_keys(vec![fine_key("a")]);
+        app.handle_key(ch('g'));
+        type_text(&mut app, "zzz");
+        app.handle_key(press(KeyCode::Esc));
+        assert!(app.keys().unwrap().generating().is_none());
+        assert_eq!(app.screen(), Screen::Keys);
+        assert!(app.take_request().is_none());
+        // A form opened again starts fresh.
+        app.handle_key(ch('g'));
+        assert_eq!(form_of(&app).name().value(), "id_ed25519");
+    }
+
+    #[test]
+    fn ctrl_c_quits_from_the_form() {
+        let mut app = open_keys(vec![]);
+        app.handle_key(ch('g'));
+        app.handle_key(with(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.should_quit());
+        assert!(app.take_request().is_none());
+    }
+
+    #[test]
+    fn keys_with_ctrl_or_alt_do_not_type_into_the_form() {
+        let mut app = open_keys(vec![]);
+        app.handle_key(ch('g'));
+        app.handle_key(with(KeyCode::Char('x'), KeyModifiers::CONTROL));
+        app.handle_key(with(KeyCode::Char('x'), KeyModifiers::ALT));
+        assert_eq!(form_of(&app).name().value(), "id_ed25519");
+    }
+
+    #[test]
+    fn without_an_ssh_folder_there_is_no_form() {
+        let mut app = app();
+        app.handle_key(ch('K'));
+        let request = app.take_request().unwrap();
+        app.handle_response(
+            &request,
+            Response::Keys(KeysSnapshot::unavailable("no home")),
+        );
+        app.handle_key(ch('g'));
+        assert!(app.keys().unwrap().generating().is_none());
+        assert!(app.status().unwrap().text.contains("ssh folder"));
+    }
+
+    #[test]
+    fn a_asks_for_the_selected_key_to_go_into_the_agent() {
+        let mut app = open_keys_with_agent(vec![fine_key("a"), fine_key("b")], running());
+        app.handle_key(ch('j'));
+        app.handle_key(ch('a'));
+        assert_eq!(
+            app.take_request(),
+            Some(Request::AddKeyToAgent {
+                file_name: "b".to_string()
+            })
+        );
+        assert!(app.status().is_none());
+    }
+
+    #[test]
+    fn a_tries_when_the_agent_could_not_be_told_about() {
+        for agent in [
+            AgentState::Unavailable("slow".to_string()),
+            AgentState::Unknown("odd".to_string()),
+        ] {
+            let mut app = open_keys_with_agent(vec![fine_key("a")], agent);
+            app.handle_key(ch('a'));
+            assert!(matches!(
+                app.take_request(),
+                Some(Request::AddKeyToAgent { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn a_says_why_it_will_not_when_the_attempt_is_bound_to_fail() {
+        let mut loaded = fine_key("loaded");
+        loaded.loaded = Some(true);
+        let mut app = open_keys_with_agent(
+            vec![
+                loaded,
+                too_open("open"),
+                key_entry("link", Permissions::TooOpen { mode: 0o644 }, true),
+            ],
+            running(),
+        );
+        let says = |app: &mut App, expected: &str| {
+            app.handle_key(ch('a'));
+            let status = app.status().expect("a message").text.clone();
+            assert!(status.contains(expected), "{status}");
+            assert!(app.take_request().is_none());
+        };
+        says(&mut app, "already in the agent");
+        app.handle_key(ch('j'));
+        says(&mut app, "Press f");
+        app.handle_key(ch('j'));
+        says(&mut app, "symbolic link");
+
+        for agent in [AgentState::NotStarted, AgentState::Unreachable] {
+            let mut app = open_keys_with_agent(vec![fine_key("a")], agent);
+            says(&mut app, "no ssh agent");
+        }
+    }
+
+    #[test]
+    fn a_with_no_keys_does_nothing() {
+        let mut app = open_keys_with_agent(vec![], running());
+        app.handle_key(ch('a'));
+        assert!(app.status().is_none());
+        assert!(app.take_request().is_none());
+    }
+
+    #[test]
+    fn the_footer_offers_a_new_key_always_and_adding_only_for_a_key_the_agent_lacks() {
+        let mut loaded = fine_key("loaded");
+        loaded.loaded = Some(true);
+        let mut app = open_keys_with_agent(vec![fine_key("missing"), loaded], running());
+        assert!(labels(&app).contains(&"new key"));
+        assert!(labels(&app).contains(&"add to agent"));
+        app.handle_key(ch('j'));
+        assert!(labels(&app).contains(&"new key"));
+        assert!(!labels(&app).contains(&"add to agent"));
+        assert!(labels(&open_keys(vec![])).contains(&"new key"));
+    }
+
+    fn generated(app: &mut App, name: &str, result: HandoverResult) {
+        let request = Request::GenerateKey {
+            file_name: name.to_string(),
+            comment: None,
+        };
+        app.handle_response(&request, Response::KeyGenerated(result));
+    }
+
+    fn added(app: &mut App, name: &str, result: HandoverResult) {
+        let request = Request::AddKeyToAgent {
+            file_name: name.to_string(),
+        };
+        app.handle_response(&request, Response::KeyAdded(result));
+    }
+
+    #[test]
+    fn a_made_key_is_reported_listed_and_selected() {
+        let mut app = open_keys(vec![fine_key("a"), fine_key("c")]);
+        generated(&mut app, "b", ran(Exit::Code(0), false));
+        let status = app.status().unwrap();
+        assert_eq!(status.kind, StatusKind::Info);
+        assert!(status.text.contains("'b'") && status.text.contains("Press a"));
+        let request = app.take_request().unwrap();
+        assert_eq!(request, Request::LoadKeys);
+
+        app.handle_response(
+            &request,
+            Response::Keys(key_snapshot(vec![
+                fine_key("a"),
+                fine_key("b"),
+                fine_key("c"),
+            ])),
+        );
+        assert_eq!(app.keys().unwrap().selected_entry().unwrap().name, "b");
+        // Only once: the next refresh keeps whatever is selected then.
+        app.handle_key(ch('j'));
+        app.handle_key(ch('r'));
+        let request = app.take_request().unwrap();
+        app.handle_response(
+            &request,
+            Response::Keys(key_snapshot(vec![
+                fine_key("a"),
+                fine_key("b"),
+                fine_key("c"),
+            ])),
+        );
+        assert_eq!(app.keys().unwrap().selected_entry().unwrap().name, "c");
+    }
+
+    #[test]
+    fn a_cancelled_key_is_said_to_be_cancelled_and_the_keys_are_read_again() {
+        for result in [ran(Exit::Signal(2), false), ran(Exit::Code(1), true)] {
+            let mut app = open_keys(vec![fine_key("a")]);
+            generated(&mut app, "b", result);
+            let status = app.status().unwrap();
+            assert_eq!(status.kind, StatusKind::Info);
+            assert!(status.text.contains("cancelled"), "{}", status.text);
+            assert_eq!(app.take_request(), Some(Request::LoadKeys));
+        }
+    }
+
+    #[test]
+    fn a_key_that_failed_says_what_the_tool_said_last_and_selects_nothing_new() {
+        let mut app = open_keys(vec![fine_key("a"), fine_key("c")]);
+        generated(
+            &mut app,
+            "b",
+            ran_with(1, "warning: first\nsomething went wrong\n\n"),
+        );
+        let status = app.status().unwrap();
+        assert_eq!(status.kind, StatusKind::Error);
+        assert!(
+            status.text.contains("'b'")
+                && status.text.contains("status 1")
+                && status.text.contains("something went wrong")
+                && !status.text.contains("first"),
+            "{}",
+            status.text
+        );
+        let request = app.take_request().unwrap();
+        app.handle_response(
+            &request,
+            Response::Keys(key_snapshot(vec![
+                fine_key("a"),
+                fine_key("b"),
+                fine_key("c"),
+            ])),
+        );
+        assert_eq!(app.keys().unwrap().selected_entry().unwrap().name, "a");
+    }
+
+    #[test]
+    fn a_failure_without_words_or_stopped_by_a_signal_or_never_started_is_still_plain() {
+        let mut app = open_keys(vec![]);
+        generated(&mut app, "b", ran_with(3, ""));
+        assert!(app.status().unwrap().text.ends_with("status 3."));
+
+        generated(&mut app, "b", ran(Exit::Signal(9), false));
+        assert!(app.status().unwrap().text.contains("stopped by signal 9"));
+
+        // Never started: nothing changed, so nothing is read again.
+        let mut app = open_keys(vec![]);
+        app.take_request();
+        generated(
+            &mut app,
+            "b",
+            HandoverResult::Failed("Could not start ssh-keygen: no".to_string()),
+        );
+        let status = app.status().unwrap();
+        assert_eq!(status.kind, StatusKind::Error);
+        assert_eq!(status.text, "Could not start ssh-keygen: no");
+        assert!(app.take_request().is_none());
+    }
+
+    #[test]
+    fn what_a_tool_said_is_cut_to_a_line_of_reasonable_length() {
+        let mut app = open_keys(vec![]);
+        generated(&mut app, "b", ran_with(1, &"x".repeat(5000)));
+        assert!(app.status().unwrap().text.len() < 400);
+    }
+
+    #[test]
+    fn an_added_key_is_reported_and_the_agent_is_asked_again() {
+        let mut app = open_keys_with_agent(vec![fine_key("a")], running());
+        added(&mut app, "a", ran(Exit::Code(0), false));
+        let status = app.status().unwrap();
+        assert_eq!(status.kind, StatusKind::Info);
+        assert_eq!(status.text, "Added 'a' to the agent.");
+        assert_eq!(app.take_request(), Some(Request::LoadKeys));
+    }
+
+    #[test]
+    fn a_cancelled_or_failed_add_is_told_apart_and_reads_again() {
+        let mut app = open_keys_with_agent(vec![fine_key("a")], running());
+        added(&mut app, "a", ran(Exit::Code(1), true));
+        assert!(app.status().unwrap().text.contains("cancelled"));
+        assert_eq!(app.take_request(), Some(Request::LoadKeys));
+
+        added(
+            &mut app,
+            "a",
+            ran_with(1, "Bad passphrase, try again for /x\n"),
+        );
+        let status = app.status().unwrap();
+        assert_eq!(status.kind, StatusKind::Error);
+        assert!(
+            status.text.contains("'a'") && status.text.contains("Bad passphrase"),
+            "{}",
+            status.text
+        );
+        assert_eq!(app.take_request(), Some(Request::LoadKeys));
+
+        added(
+            &mut app,
+            "a",
+            HandoverResult::Failed("Could not start ssh-add: no".to_string()),
+        );
+        assert_eq!(app.status().unwrap().kind, StatusKind::Error);
+        assert!(app.take_request().is_none());
+    }
+
+    #[test]
+    fn the_help_documents_making_and_adding_keys() {
+        let text: Vec<&str> = HELP
+            .iter()
+            .filter(|section| section.title == "Your ssh keys")
+            .flat_map(|section| section.rows)
+            .flat_map(|row| tokens(row.keys))
+            .collect();
+        assert!(text.contains(&"g") && text.contains(&"a"), "{text:?}");
+    }
+
+    // ---- sending a public key to a host ----------------------------------------
+
+    fn open_keys_in(mut app: App, keys: Vec<crate::ssh::keys::KeyEntry>) -> App {
+        app.handle_key(ch('K'));
+        let request = app.take_request().expect("the keys are asked for");
+        app.handle_response(&request, Response::Keys(key_snapshot(keys)));
+        app
+    }
+
+    fn dialog_of(app: &App) -> &crate::tui::keys::CopyDialog {
+        app.keys().unwrap().copying().expect("the dialog is open")
+    }
+
+    fn choice_names(app: &App) -> Vec<&str> {
+        dialog_of(app)
+            .choices()
+            .iter()
+            .map(|choice| choice.name.as_str())
+            .collect()
+    }
+
+    /// Opens the dialog for key `a`, picks the first host and confirms: the state
+    /// in which the question is showing.
+    fn asking_to_send() -> App {
+        let mut app = open_keys(vec![fine_key("a"), fine_key("b")]);
+        app.handle_key(ch('c'));
+        app.handle_key(press(KeyCode::Enter));
+        assert!(dialog_of(&app).confirming());
+        app
+    }
+
+    fn take_copy_key_request(app: &mut App) -> (String, ConnectRequest) {
+        match app.take_request() {
+            Some(Request::CopyKey { file_name, connect }) => (file_name, connect),
+            other => panic!("expected a request to send a key, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn c_opens_the_hosts_for_the_selected_key_in_the_order_of_the_host_list() {
+        let mut app = open_keys(vec![fine_key("a"), fine_key("b")]);
+        app.handle_key(ch('j'));
+        app.handle_key(ch('c'));
+        assert_eq!(dialog_of(&app).key(), "b");
+        // Favorites first, then by name: as on the host list.
+        assert_eq!(choice_names(&app), ["backup", "db", "web"]);
+        assert!(!dialog_of(&app).confirming());
+        assert_eq!(labels(&app), ["choose", "select", "cancel"]);
+        assert!(app.take_request().is_none(), "opening asks for nothing");
+    }
+
+    #[test]
+    fn where_a_host_is_says_its_user_and_port_only_when_they_are_set() {
+        let mut plain = host("plain", false);
+        plain.user = None;
+        let mut full = host("full", false);
+        full.user = Some("deploy".to_string());
+        full.port = Some(2222);
+        let mut port_only = host("port", false);
+        port_only.port = Some(2200);
+        let mut app = open_keys_in(
+            app_with(hosts(vec![plain, full, port_only]), Vec::new()).0,
+            vec![fine_key("a")],
+        );
+        app.handle_key(ch('c'));
+        let destinations: Vec<&str> = dialog_of(&app)
+            .choices()
+            .iter()
+            .map(|choice| choice.destination.as_str())
+            .collect();
+        assert_eq!(
+            destinations,
+            [
+                "deploy@full.example.com:2222",
+                "plain.example.com",
+                "port.example.com:2200"
+            ]
+        );
+    }
+
+    #[test]
+    fn c_needs_a_key_and_a_host_and_says_so_when_there_is_no_host() {
+        let mut none_selected = open_keys(Vec::new());
+        none_selected.handle_key(ch('c'));
+        assert!(none_selected.keys().unwrap().copying().is_none());
+
+        let mut no_hosts = open_keys_in(
+            app_with(hosts(Vec::new()), Vec::new()).0,
+            vec![fine_key("a")],
+        );
+        no_hosts.handle_key(ch('c'));
+        assert!(no_hosts.keys().unwrap().copying().is_none());
+        assert!(
+            no_hosts.status().unwrap().text.contains("no saved hosts"),
+            "{:?}",
+            no_hosts.status()
+        );
+    }
+
+    #[test]
+    fn while_the_hosts_are_showing_the_lists_keys_do_not_act() {
+        let mut app = open_keys(vec![fine_key("a")]);
+        app.handle_key(ch('c'));
+        for key in [
+            ch('q'),
+            ch('g'),
+            ch('a'),
+            ch('r'),
+            ch('f'),
+            ch('?'),
+            ch('K'),
+            ch('c'),
+        ] {
+            app.handle_key(key);
+            assert!(
+                dialog_of(&app).key() == "a" && !app.should_quit(),
+                "{key:?}"
+            );
+            assert!(app.take_request().is_none(), "{key:?}");
+            assert_eq!(app.screen(), Screen::Keys);
+        }
+    }
+
+    #[test]
+    fn the_hosts_are_moved_through_and_the_selection_stays_inside() {
+        let mut app = open_keys(vec![fine_key("a")]);
+        app.handle_key(ch('c'));
+        let at = |app: &App| dialog_of(app).selected();
+        app.handle_key(press(KeyCode::Up));
+        assert_eq!(at(&app), 0);
+        app.handle_key(ch('j'));
+        app.handle_key(press(KeyCode::Down));
+        app.handle_key(press(KeyCode::Down));
+        assert_eq!(at(&app), 2);
+        app.handle_key(ch('k'));
+        assert_eq!(at(&app), 1);
+        app.handle_key(press(KeyCode::Home));
+        assert_eq!(at(&app), 0);
+        app.handle_key(press(KeyCode::End));
+        assert_eq!(at(&app), 2);
+        app.handle_key(press(KeyCode::PageUp));
+        assert_eq!(at(&app), 1, "a page is at least one row");
+        app.handle_key(press(KeyCode::PageDown));
+        assert_eq!(at(&app), 2);
+    }
+
+    #[test]
+    fn esc_on_the_hosts_closes_the_dialog_and_asks_for_nothing() {
+        let mut app = open_keys(vec![fine_key("a")]);
+        app.handle_key(ch('c'));
+        app.handle_key(press(KeyCode::Esc));
+        assert!(app.keys().unwrap().copying().is_none());
+        assert_eq!(app.screen(), Screen::Keys);
+        assert!(app.take_request().is_none());
+    }
+
+    #[test]
+    fn choosing_a_host_asks_a_question_and_sends_nothing_yet() {
+        let mut app = open_keys(vec![fine_key("a")]);
+        app.handle_key(ch('c'));
+        app.handle_key(ch('j'));
+        app.handle_key(press(KeyCode::Enter));
+        let dialog = dialog_of(&app);
+        assert!(dialog.confirming());
+        assert_eq!(dialog.selected_choice().unwrap().name, "db");
+        assert_eq!(labels(&app), ["send the key", "back"]);
+        assert!(app.take_request().is_none(), "asking is not doing");
+    }
+
+    #[test]
+    fn only_a_plain_y_sends_and_then_the_dialog_is_over() {
+        for answer in [ch('y'), ch('Y')] {
+            let mut app = asking_to_send();
+            app.handle_key(answer);
+            let (file_name, connect) = take_copy_key_request(&mut app);
+            assert_eq!(file_name, "a");
+            assert_eq!(connect.name, "backup");
+            assert!(app.keys().unwrap().copying().is_none());
+            assert!(app.take_request().is_none());
+        }
+    }
+
+    #[test]
+    fn nothing_but_y_sends() {
+        let mut app = asking_to_send();
+        for key in [
+            press(KeyCode::Enter),
+            ch('j'),
+            ch('q'),
+            ch(' '),
+            ch('a'),
+            with(KeyCode::Char('y'), KeyModifiers::CONTROL),
+            with(KeyCode::Char('y'), KeyModifiers::ALT),
+            with(KeyCode::Char('Y'), KeyModifiers::CONTROL),
+        ] {
+            app.handle_key(key);
+            assert!(dialog_of(&app).confirming(), "{key:?}");
+            assert!(app.take_request().is_none(), "{key:?}");
+            assert!(!app.should_quit(), "{key:?}");
+        }
+    }
+
+    #[test]
+    fn n_and_esc_at_the_question_go_back_to_the_hosts_and_send_nothing() {
+        for answer in [ch('n'), ch('N'), press(KeyCode::Esc)] {
+            let mut app = asking_to_send();
+            app.handle_key(answer);
+            assert!(!dialog_of(&app).confirming(), "{answer:?}");
+            assert!(app.take_request().is_none());
+            assert_eq!(labels(&app), ["choose", "select", "cancel"]);
+        }
+    }
+
+    #[test]
+    fn ctrl_c_quits_from_every_step_of_the_dialog() {
+        let mut choosing = open_keys(vec![fine_key("a")]);
+        choosing.handle_key(ch('c'));
+        choosing.handle_key(with(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(choosing.should_quit());
+
+        let mut asking = asking_to_send();
+        asking.handle_key(with(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(asking.should_quit());
+        assert!(asking.take_request().is_none());
+    }
+
+    #[test]
+    fn the_request_carries_the_arguments_for_sending_a_key_and_no_others() {
+        let mut app = asking_to_send();
+        app.handle_key(ch('y'));
+        let (_, connect) = take_copy_key_request(&mut app);
+        assert!(connect.args.is_key_copy());
+        let backup = host("backup", true);
+        let expected = build_copy_args(&backup, &sample()).unwrap();
+        assert_eq!(connect.args, expected);
+        assert_ne!(connect.args, build_args(&backup, &sample()).unwrap());
+        assert_eq!(connect.known_hosts.len(), 1);
+        assert_eq!(connect.known_hosts[0].saved_name, "backup");
+    }
+
+    #[test]
+    fn a_host_with_forwards_and_agent_forwarding_gets_none_of_them_when_a_key_is_sent() {
+        let mut busy = host("busy", true);
+        busy.forward_agent = true;
+        busy.local_forwards.push(crate::domain::Forward {
+            listen_port: 8080,
+            dest_host: "localhost".to_string(),
+            dest_port: 80,
+        });
+        let mut app = open_keys_in(
+            app_with(hosts(vec![busy]), Vec::new()).0,
+            vec![fine_key("a")],
+        );
+        app.handle_key(ch('c'));
+        app.handle_key(press(KeyCode::Enter));
+        app.handle_key(ch('y'));
+        let (_, connect) = take_copy_key_request(&mut app);
+        let args = connect.args.as_slice();
+        assert!(
+            !args.iter().any(|a| a == "-A" || a == "-L" || a == "-R"),
+            "{args:?}"
+        );
+    }
+
+    fn copied(app: &mut App, result: HandoverResult) {
+        let request = Request::CopyKey {
+            file_name: "a".to_string(),
+            connect: ConnectRequest {
+                name: "web".to_string(),
+                args: build_copy_args(&host("web", false), &sample()).unwrap(),
+                known_hosts: Vec::new(),
+            },
+        };
+        app.handle_response(&request, Response::KeyCopied(result));
+    }
+
+    #[test]
+    fn a_key_that_was_sent_is_reported_on_the_keys_screen_and_nothing_is_read_again() {
+        let mut app = open_keys(vec![fine_key("a")]);
+        copied(&mut app, ran(Exit::Code(0), false));
+        let status = app.status().unwrap();
+        assert_eq!(status.kind, StatusKind::Info);
+        assert!(
+            status.text.contains("'a'") && status.text.contains("'web'"),
+            "{}",
+            status.text
+        );
+        assert_eq!(app.screen(), Screen::Keys);
+        assert!(app.take_request().is_none());
+    }
+
+    #[test]
+    fn the_servers_own_failure_is_told_apart_from_a_connection_failure() {
+        let mut app = open_keys(vec![fine_key("a")]);
+        copied(
+            &mut app,
+            ran_with(
+                1,
+                "mkdir: cannot create directory '.ssh': Permission denied\n",
+            ),
+        );
+        let status = app.status().unwrap();
+        assert_eq!(status.kind, StatusKind::Error);
+        assert!(
+            status.text.contains("'web' ran the command")
+                && status.text.contains("status 1")
+                && status.text.contains("probably not added")
+                && status
+                    .text
+                    .contains("It said: mkdir: cannot create directory"),
+            "{}",
+            status.text
+        );
+        assert_eq!(
+            app.screen(),
+            Screen::Keys,
+            "not the connection error screen"
+        );
+
+        copied(&mut app, ran_with(127, ""));
+        let text = app.status().unwrap().text.clone();
+        assert!(
+            text.contains("status 127") && !text.contains("It said"),
+            "{text}"
+        );
+
+        copied(&mut app, ran_with(1, &"y".repeat(5000)));
+        assert!(app.status().unwrap().text.len() < 400);
+    }
+
+    #[test]
+    fn cancelled_stopped_and_closed_are_said_plainly_and_do_not_claim_success() {
+        let mut app = open_keys(vec![fine_key("a")]);
+        copied(&mut app, ran(Exit::Code(1), true));
+        assert!(app.status().unwrap().text.contains("cancelled"));
+        copied(&mut app, ran(Exit::Signal(9), false));
+        let stopped = app.status().unwrap();
+        assert_eq!(stopped.kind, StatusKind::Warning);
+        assert!(stopped.text.contains("signal 9") && stopped.text.contains("may not"));
+        copied(&mut app, ran_with(255, "Connection to web closed.\r\n"));
+        assert!(
+            app.status()
+                .unwrap()
+                .text
+                .contains("may not have been sent")
+        );
+        assert_eq!(app.screen(), Screen::Keys);
+    }
+
+    #[test]
+    fn a_key_that_was_not_sent_because_nothing_could_run_says_why_and_leaves_no_report() {
+        let mut app = open_keys(vec![fine_key("a")]);
+        copied(
+            &mut app,
+            HandoverResult::Failed("The public key /x.pub is not a regular file.".to_string()),
+        );
+        let status = app.status().unwrap();
+        assert_eq!(status.kind, StatusKind::Error);
+        assert_eq!(status.text, "The public key /x.pub is not a regular file.");
+        assert!(app.report().is_none());
+        assert_eq!(app.screen(), Screen::Keys);
+    }
+
+    #[test]
+    fn a_connection_that_failed_is_explained_on_the_same_screen_and_goes_back_to_the_keys() {
+        let mut app = open_keys(vec![fine_key("a")]);
+        copied(
+            &mut app,
+            ran_with(
+                255,
+                "deploy@web: Permission denied (publickey,password).\r\n",
+            ),
+        );
+        assert_eq!(app.screen(), Screen::ConnectError);
+        assert_eq!(app.report().unwrap().name, "web");
+        assert_eq!(
+            app.report().unwrap().failure,
+            Some(FailureKind::PermissionDenied)
+        );
+        app.handle_key(press(KeyCode::Esc));
+        assert_eq!(app.screen(), Screen::Keys, "where the key was sent from");
+        assert!(app.keys().is_some());
+
+        copied(
+            &mut app,
+            ran_with(
+                255,
+                "ssh: connect to host web port 22: Connection refused\r\n",
+            ),
+        );
+        app.handle_key(press(KeyCode::Enter));
+        assert_eq!(app.screen(), Screen::Keys);
+    }
+
+    #[test]
+    fn the_output_page_opened_from_that_screen_comes_back_to_it() {
+        let mut app = open_keys(vec![fine_key("a")]);
+        copied(
+            &mut app,
+            ran_with(
+                255,
+                "ssh: connect to host web port 22: Connection refused\r\n",
+            ),
+        );
+        app.handle_key(ch('o'));
+        assert_eq!(app.screen(), Screen::SshOutput);
+        app.handle_key(press(KeyCode::Esc));
+        assert_eq!(app.screen(), Screen::ConnectError);
+        app.handle_key(press(KeyCode::Esc));
+        assert_eq!(app.screen(), Screen::Keys);
+    }
+
+    #[test]
+    fn a_changed_host_key_stops_everything_on_the_blocking_screen_even_when_sending_a_key() {
+        let mut app = open_keys(vec![fine_key("a")]);
+        app.set_known_hosts_file(Some(PathBuf::from(DEFAULT_KNOWN_HOSTS)));
+        // The dialog is how the connection was asked for, so the hosts it may
+        // remove an old key of are those of that request.
+        app.handle_key(ch('c'));
+        app.handle_key(press(KeyCode::Enter));
+        app.handle_key(ch('y'));
+        let (file_name, connect) = take_copy_key_request(&mut app);
+        let request = Request::CopyKey {
+            file_name,
+            connect: connect.clone(),
+        };
+        app.handle_response(
+            &request,
+            Response::KeyCopied(ran_with(
+                255,
+                &changed_key_output("backup.example.com", DEFAULT_KNOWN_HOSTS),
+            )),
+        );
+        assert_eq!(app.screen(), Screen::HostKeyChanged);
+        assert_eq!(app.key_change().unwrap().name, "backup");
+        assert!(app.key_change().unwrap().removal.is_some());
+        assert!(
+            app.take_request().is_none(),
+            "nothing is sent or removed by itself"
+        );
+
+        // Aborting is the safe way out, and it goes back to the keys.
+        app.handle_key(press(KeyCode::Enter));
+        assert_eq!(app.screen(), Screen::Keys);
+        assert!(app.key_change().is_none());
+    }
+
+    #[test]
+    fn after_removing_the_old_key_the_advice_is_to_send_the_key_again() {
+        let mut app = open_keys(vec![fine_key("a")]);
+        app.set_known_hosts_file(Some(PathBuf::from(DEFAULT_KNOWN_HOSTS)));
+        app.handle_key(ch('c'));
+        app.handle_key(press(KeyCode::Enter));
+        app.handle_key(ch('y'));
+        let (file_name, connect) = take_copy_key_request(&mut app);
+        let request = Request::CopyKey { file_name, connect };
+        app.handle_response(
+            &request,
+            Response::KeyCopied(ran_with(
+                255,
+                &changed_key_output("backup.example.com", DEFAULT_KNOWN_HOSTS),
+            )),
+        );
+        app.handle_key(ch('r'));
+        type_name(&mut app, "backup");
+        app.handle_key(press(KeyCode::Enter));
+        let Some(Request::RemoveKey(target)) = app.take_request() else {
+            panic!("the removal was asked for");
+        };
+        app.key_removal_finished(&target, Removal::Removed);
+        assert_eq!(app.screen(), Screen::Keys);
+        let text = app.status().unwrap().text.clone();
+        assert!(
+            text.contains("Send the key again") && !text.contains("Connect again"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_connection_from_the_list_still_goes_back_to_the_list_after_a_key_was_sent() {
+        let mut app = open_keys(vec![fine_key("a")]);
+        copied(
+            &mut app,
+            ran_with(
+                255,
+                "ssh: connect to host web port 22: Connection refused\r\n",
+            ),
+        );
+        app.handle_key(press(KeyCode::Esc)); // to the keys
+        app.handle_key(press(KeyCode::Esc)); // to the list
+        assert_eq!(app.screen(), Screen::List);
+
+        app.handle_key(press(KeyCode::Enter));
+        take_connect_request(&mut app);
+        app.connection_ended(
+            "backup",
+            ran_with(
+                255,
+                "ssh: connect to host backup port 22: Connection refused\r\n",
+            ),
+        );
+        assert_eq!(app.screen(), Screen::ConnectError);
+        app.handle_key(press(KeyCode::Esc));
+        assert_eq!(app.screen(), Screen::List, "not the keys");
+    }
+
+    #[test]
+    fn the_help_documents_sending_a_key_and_the_footer_offers_it_for_a_selected_key() {
+        let documented: Vec<&str> = HELP
+            .iter()
+            .filter(|section| section.title == "Your ssh keys")
+            .flat_map(|section| section.rows)
+            .flat_map(|row| tokens(row.keys))
+            .collect();
+        assert!(documented.contains(&"c"), "{documented:?}");
+        assert!(labels(&open_keys(vec![fine_key("a")])).contains(&"send to host"));
+        assert!(!labels(&open_keys(Vec::new())).contains(&"send to host"));
     }
 }

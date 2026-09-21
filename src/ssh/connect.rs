@@ -1,7 +1,8 @@
 //! Running ssh attached to the user's terminal.
 //!
-//! [`run`] starts the program with an argument vector (never through a shell),
-//! gives it the real stdin and stdout, and waits. Its stderr goes through a pipe
+//! [`run`] (and [`run_program`], for other programs) starts the program with an
+//! argument vector (never through a shell), gives it the real stdin and stdout,
+//! and waits. [`run_with_input`] gives it bytes on stdin instead. Its stderr goes through a pipe
 //! so that two things can happen at once: every byte is passed on to the real
 //! stderr as it arrives (so the user sees ssh's own messages, unaltered), and the
 //! last [`RETAINED`] bytes are kept for [`Outcome`], which is what later lets
@@ -93,6 +94,45 @@ const SIGINT: i32 = 2;
 pub fn run(
     program: &Path,
     args: &SshArgs,
+    tee: impl Write + Send + 'static,
+) -> io::Result<Outcome> {
+    run_program(program, args.as_slice(), tee)
+}
+
+/// [`run`] for any program: ssh, and the interactive tools Bifrost hands the
+/// terminal to (`ssh-keygen`, `ssh-add`). The arguments are one element each,
+/// never quoted and never through a shell.
+pub fn run_program(
+    program: &Path,
+    args: &[String],
+    tee: impl Write + Send + 'static,
+) -> io::Result<Outcome> {
+    run_inner(program, args, None, tee)
+}
+
+/// [`run`] with `input` on ssh's stdin instead of the terminal, and then the end
+/// of input.
+///
+/// This is how a public key is sent: through the pipe, never in the arguments.
+/// ssh asks for a password and for a new host's key on the terminal itself (it
+/// opens the terminal for that, and does not use stdin), so both still work.
+/// The input is written from another thread, so that a server that answers
+/// slowly, or a connection that fails before ssh reads anything, cannot make
+/// Bifrost wait on the pipe. A failure to write is ignored: ssh's own exit status
+/// and messages say what went wrong.
+pub fn run_with_input(
+    program: &Path,
+    args: &[String],
+    input: Vec<u8>,
+    tee: impl Write + Send + 'static,
+) -> io::Result<Outcome> {
+    run_inner(program, args, Some(input), tee)
+}
+
+fn run_inner(
+    program: &Path,
+    args: &[String],
+    input: Option<Vec<u8>>,
     mut tee: impl Write + Send + 'static,
 ) -> io::Result<Outcome> {
     interrupt::arm()?;
@@ -102,12 +142,25 @@ pub fn run(
 
     let mut child = ChildGuard::spawn(
         Command::new(program)
-            .args(args.as_slice())
-            .stdin(Stdio::inherit())
+            .args(args)
+            .stdin(if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::inherit()
+            })
             .stdout(Stdio::inherit())
             .stderr(Stdio::piped()),
     )?;
     let mut stderr = child.take_stderr()?;
+    if let Some(input) = input {
+        let mut stdin = child.take_stdin()?;
+        thread::Builder::new()
+            .name("ssh-stdin".to_string())
+            .spawn(move || {
+                let _ = stdin.write_all(&input).and_then(|()| stdin.flush());
+                // Dropping it closes the pipe: that is the end of the input.
+            })?;
+    }
 
     let tail = Arc::new(Mutex::new(Tail::default()));
     let (ended, stderr_ended) = mpsc::channel();
@@ -195,6 +248,13 @@ struct ChildGuard(Option<Child>);
 impl ChildGuard {
     fn spawn(command: &mut Command) -> io::Result<Self> {
         command.spawn().map(|child| ChildGuard(Some(child)))
+    }
+
+    fn take_stdin(&mut self) -> io::Result<std::process::ChildStdin> {
+        self.0
+            .as_mut()
+            .and_then(|child| child.stdin.take())
+            .ok_or_else(|| io::Error::other("the child's stdin was not captured"))
     }
 
     fn take_stderr(&mut self) -> io::Result<std::process::ChildStderr> {
@@ -310,5 +370,70 @@ mod tests {
         assert_eq!(exit_of(ExitStatus::from_raw(255 << 8)), Exit::Code(255));
         assert_eq!(exit_of(ExitStatus::from_raw(2)), Exit::Signal(2));
         assert_eq!(exit_of(ExitStatus::from_raw(9)), Exit::Signal(9));
+    }
+
+    /// The arguments of `sh -c <script>`: the program is `sh`, so nothing is
+    /// written as an executable and nothing races with other tests' processes.
+    #[cfg(unix)]
+    fn sh(script: &str) -> Vec<String> {
+        vec!["-c".to_string(), script.to_string()]
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn what_is_given_arrives_on_stdin_whole_and_then_the_input_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("stdin.out");
+        let args = sh(&format!("cat > '{}'", file.display()));
+        let input = b"ssh-ed25519 AAAA me@laptop\n".to_vec();
+        let outcome = run_with_input(Path::new("sh"), &args, input.clone(), io::sink()).unwrap();
+        assert_eq!(outcome.exit, Exit::Code(0));
+        // `cat` only ends when the input does.
+        assert_eq!(std::fs::read(&file).unwrap(), input);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_exit_status_and_stderr_of_a_program_that_was_given_input_are_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("in");
+        let args = sh(&format!(
+            "cat > '{}'; echo denied >&2; exit 255",
+            file.display()
+        ));
+        let outcome = run_with_input(Path::new("sh"), &args, b"x\n".to_vec(), io::sink()).unwrap();
+        assert_eq!(outcome.exit, Exit::Code(255));
+        assert_eq!(outcome.stderr, b"denied\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_program_that_never_reads_its_input_does_not_hang_or_kill_bifrost() {
+        // Far more than a pipe holds, to a program that exits at once: the write
+        // fails with a broken pipe, and that is ignored.
+        let args = sh("exit 3");
+        let outcome = run_with_input(
+            Path::new("sh"),
+            &args,
+            vec![b'x'; 4 * 1024 * 1024],
+            io::sink(),
+        )
+        .unwrap();
+        assert_eq!(outcome.exit, Exit::Code(3));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_program_that_cannot_be_started_is_an_error_not_a_hang() {
+        let args: Vec<String> = Vec::new();
+        assert!(
+            run_with_input(
+                Path::new("/nonexistent/ssh"),
+                &args,
+                b"x".to_vec(),
+                io::sink()
+            )
+            .is_err()
+        );
     }
 }

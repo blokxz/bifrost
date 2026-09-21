@@ -1,49 +1,66 @@
-# Bifrost — UI design decisions
+# Bifrost — UI notes: reference mockups and proposals
 
-Status: accepted (2026-09-19, updated 2026-09-20). Reference layouts: `docs/ui/*.txt` (120×36), palette and conventions in `docs/ui/README.md`. The matching entries in `docs/DECISIONS.md` (Terminal interface) take precedence if anything here disagrees.
+**This is not a specification of what 0.1.0 does.** It holds the reference
+mockups in `docs/ui/*.txt` and ideas for a later release, and it says for each
+whether it is built. What is decided is in `CLAUDE.md` and `docs/DECISIONS.md`;
+what is built is the code. Where this file disagrees with any of them, they win.
 
-## Screens
+Anything under "Proposals for 0.2" is **not decided and not built**. A session
+that reads this file must not treat it as a description of the program.
 
-| # | Screen | Reference | Role |
-|---|--------|-----------|------|
-| 1 | Full view (split panels) | `ui/01-main.txt` | Start view option A. New screen: hosts grouped by favorites/tags, detail panel, equivalent `ssh` command, notes. |
-| 2 | Launcher | `ui/02-launcher.txt` | Start view option B. **The existing host list screen**, kept as it is. |
-| 3 | New host wizard | `ui/03-new-host.txt` | Stepped flow: Connection → Authentication → Organize → Review, with a tips panel. |
-| 4 | Keys | `ui/04-keys.txt` | Key table (type, agent, permissions, used by, health) + problems panel with one-key fixes (chmod 600, rotate). |
-| 5 | Host key changed | `ui/05-host-key-changed.txt` | Blocking dialog: saved vs received fingerprint, "Abort" is the default, trusting requires typing the host name. |
-| 6 | Settings | `ui/06-settings.txt` | Start view selector, beginner-help toggles, security policies shown as locked. |
+## What 0.1.0 has
 
-## Start views (decided 2026-09-20)
+- One start view: the host list (search, connect, add, edit, delete, favorite,
+  copy the ssh command, help). There is no separate launcher and no view switch.
+- One add/edit form, not a wizard.
+- A screen for a failed connection, and a blocking screen for a changed host key.
+- A keys screen (Block 6), opened with a capital `K` from the host list.
+- Colors come from the terminal's 16 ANSI colors, and `NO_COLOR` removes them.
+  The theme is `src/tui/theme.rs`.
 
-- There are two: the **full view** (new, `01-main.txt`) and the **launcher**, which is the host list screen Bifrost already has.
-- The separate fuzzy launcher from the first mockups (centered search box, recent hosts, route preview) is **dropped**. Do not build it.
-- The launcher keeps everything it does today: `/` search, connect, add, edit, delete, favorite, copy command, help. The only additions are `Tab` to switch to the full view and the new palette.
-- Config key: `ui.start_view = "full" | "launcher"`, default `"full"`.
-- CLI override for a single run: `bifrost --launcher` (short `-l`).
-- `Tab` switches between the two views at runtime and keeps the selected host.
+## The mockups
 
-## Palette (decided 2026-09-20)
+| # | Screen | Reference | In 0.1.0 |
+|---|--------|-----------|----------|
+| 1 | Full view (split panels) | `ui/01-main.txt` | Proposal for 0.2. Not built. |
+| 2 | Launcher | `ui/02-launcher.txt` | Proposal for 0.2. The host list is the only start view in 0.1.0; there is no `Tab` and no full view to switch to. |
+| 3 | New host wizard | `ui/03-new-host.txt` | Proposal for 0.2. 0.1.0 has one form. |
+| 4 | Keys | `ui/04-keys.txt` | Built in part (Block 6). See the notes in the file. |
+| 5 | Host key changed | `ui/05-host-key-changed.txt` | Built, differently. See the notes in the file. |
+| 6 | Settings | `ui/06-settings.txt` | Proposal for 0.2. There is no settings screen. |
 
-- The truecolor palette in `docs/ui/README.md` is the Bifrost palette. It replaces the earlier ANSI-only theme decision.
-- 16-color fallback on terminals without truecolor; `NO_COLOR` keeps the current plain theme.
-- One theme module: `src/tui/theme.rs`. `src/tui/ui/theme.rs` is a draft to merge into it and delete.
+The mockups are visual reference, not expected output. Nothing is tested against
+them, and the built screens differ from them where the notes in each file say so.
 
-## Beginner help toggles
+## Proposals for 0.2 (not decided, not built)
 
-- `ui.show_tips` (default `true`): tips panels such as "What is an SSH key?".
-- `ui.show_command` (default `true`): show the equivalent `ssh` command for the selected host.
+- **Two start views.** A full view with panels (`01-main.txt`) and a launcher,
+  which would be the existing host list. A setting would choose which opens, a
+  flag such as `bifrost --launcher` could override it for one run, and `Tab`
+  could switch between them keeping the selected host. The separate fuzzy
+  launcher from the first mockups (a centered search box with recent hosts and a
+  route preview) was considered and set aside.
+- **A truecolor palette** (listed in `docs/ui/README.md`) with the 16-color
+  fallback and `NO_COLOR` keeping the plain theme.
+- **Beginner help toggles.** Tips panels such as "What is an SSH key?" and
+  showing the equivalent `ssh` command for the selected host, each switchable.
+- **A settings screen** for the above.
 
-## Security settings are not configurable from the UI
+## Settings, when they exist
 
-- Always ask before trusting a new host key.
-- Always block when a host key changes (explicit confirmation by typing the host name).
+Decided in `CLAUDE.md`: settings live in a `[ui]` table inside `hosts.toml`.
+There is no separate `config.toml`. No settings exist yet in 0.1.0, and the store
+has no `[ui]` table.
+
+## Security prompts are not configurable
+
+The prompt for a new host key and the blocking screen for a changed one are never
+configurable and never skipped. This is a rule in `CLAUDE.md` and it holds today.
 
 ## Verification
 
-- Every screen has a snapshot test rendered with `TestBackend` at 120×36, using fixture data that matches its reference file.
-- When closing a UI block, run `bifrost` in a 120×36 terminal and compare against the reference and the design canvas.
-
-## Open questions
-
-- Settings in a separate `config.toml` vs. a `[ui]` table inside the existing host store TOML. The references show a separate `config.toml`, which is not decided yet.
-- Which block of the plan implements the full view and the view switch.
+- Screens are tested by rendering them with `ratatui`'s `TestBackend` and
+  asserting on what is drawn, at several sizes including the 60x15 minimum.
+- There are no snapshot files, and no test compares a screen to a mockup in
+  `docs/ui/`.
+- When closing a UI block, run `bifrost` in a real terminal and look at it.

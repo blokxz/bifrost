@@ -503,7 +503,7 @@ mod tests {
         let mut app = app_with(one_host(), Vec::new());
         app.handle_key(key('?'));
         // Tall enough for the whole page, so nothing needs scrolling.
-        let text = text_of(&mut app, 100, 80);
+        let text = text_of(&mut app, 100, 120);
         assert!(text.contains("Help"), "{text}");
         // Long descriptions wrap, so compare with the layout squeezed out.
         let flat = text
@@ -670,12 +670,12 @@ mod tests {
     // ---- a failed connection ---------------------------------------------
 
     use crate::ssh::connect::{Exit, Outcome};
-    use crate::tui::app::ConnectResult;
+    use crate::tui::app::HandoverResult;
 
     fn fail(app: &mut App, stderr: &str) {
         app.connection_ended(
             "web",
-            ConnectResult::Ran(Outcome {
+            HandoverResult::Ran(Outcome {
                 exit: Exit::Code(255),
                 stderr: stderr.as_bytes().to_vec(),
                 interrupted: false,
@@ -904,7 +904,7 @@ mod tests {
         let mut app = app_with(one_host(), Vec::new());
         app.connection_ended(
             "web",
-            ConnectResult::Ran(Outcome {
+            HandoverResult::Ran(Outcome {
                 exit: Exit::Code(0),
                 stderr: b"Warning: Permanently added 'x'.\r\n".to_vec(),
                 interrupted: false,

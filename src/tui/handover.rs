@@ -1,6 +1,8 @@
-//! Handing the terminal to ssh and taking it back.
+//! Handing the terminal to a program and taking it back: ssh for a connection,
+//! and the tools that ask for a passphrase themselves (`ssh-keygen`, `ssh-add`),
+//! so that Bifrost never sees one.
 //!
-//! The sequence, for every connection and every way it can end:
+//! The sequence, for every program and every way it can end:
 //!
 //! 1. Leave TUI mode ([`TerminalGuard::suspend`]): cursor shown, alternate
 //!    screen left, raw mode off. Everything ssh writes lands on the user's
@@ -23,7 +25,7 @@ use std::time::Duration;
 
 use ratatui::crossterm::event;
 
-use super::app::{ConnectRequest, ConnectResult};
+use super::app::{ConnectRequest, HandoverResult};
 use super::terminal::{TerminalGuard, TerminalOps};
 use crate::sanitize::sanitize;
 use crate::ssh::connect::{self, Outcome};
@@ -35,41 +37,97 @@ const MAX_DISCARDED_EVENTS: usize = 10_000;
 /// Runs one connection on the real terminal, with the real ssh at `ssh`.
 ///
 /// An error means the terminal could not be taken back, so the TUI cannot go on.
-/// Anything wrong with the connection itself is a [`ConnectResult`].
+/// Anything wrong with the connection itself is a [`HandoverResult`].
 pub fn connect<O: TerminalOps>(
     guard: &mut TerminalGuard<O>,
     ssh: &Path,
     request: &ConnectRequest,
-) -> io::Result<ConnectResult> {
+) -> io::Result<HandoverResult> {
     hand_over(
         guard,
         &mut io::stdout(),
-        &request.name,
+        &format!("Bifrost: connecting to {}...", request.name),
+        "ssh",
         || connect::run(ssh, &request.args, io::stderr()),
         discard_pending_input,
     )
 }
 
+/// Sends a public key to a server: ssh on the real terminal, so that it can ask
+/// for a password and for a new host's key, with `input` (the key) on its stdin.
+///
+/// The arguments must be those of `build_copy_args`, which is checked here: with
+/// any others the key could reach a shell on the server as commands. A refusal
+/// is a [`HandoverResult::Failed`] and nothing is run.
+pub fn copy_key<O: TerminalOps>(
+    guard: &mut TerminalGuard<O>,
+    ssh: &Path,
+    request: &ConnectRequest,
+    key_name: &str,
+    input: Vec<u8>,
+) -> io::Result<HandoverResult> {
+    if !request.args.is_key_copy() {
+        return Ok(HandoverResult::Failed(
+            "Internal error: the key was not sent, because the ssh command was not the one \
+             for copying a key."
+                .to_string(),
+        ));
+    }
+    hand_over(
+        guard,
+        &mut io::stdout(),
+        &format!(
+            "Bifrost: sending the public key '{key_name}' to {}...",
+            request.name
+        ),
+        "ssh",
+        || connect::run_with_input(ssh, request.args.as_slice(), input, io::stderr()),
+        discard_pending_input,
+    )
+}
+
+/// Runs `program` with `args` on the real terminal, the same way, saying `banner`
+/// first. The program is named in the message if it cannot be started.
+///
+/// Nothing is passed to it through the arguments that it should ask for itself:
+/// a passphrase is typed straight into `ssh-keygen` or `ssh-add`.
+pub fn run_tool<O: TerminalOps>(
+    guard: &mut TerminalGuard<O>,
+    program: &Path,
+    label: &str,
+    args: &[String],
+    banner: &str,
+) -> io::Result<HandoverResult> {
+    hand_over(
+        guard,
+        &mut io::stdout(),
+        banner,
+        label,
+        || connect::run_program(program, args, io::stderr()),
+        discard_pending_input,
+    )
+}
+
 /// The handover sequence with its steps supplied, so that its order and its
-/// failure paths can be tested without a terminal or a real ssh.
+/// failure paths can be tested without a terminal or a real program.
 pub fn hand_over<O: TerminalOps>(
     guard: &mut TerminalGuard<O>,
     out: &mut impl Write,
-    name: &str,
+    banner: &str,
+    program: &str,
     run: impl FnOnce() -> io::Result<Outcome>,
     discard_input: impl FnOnce(),
-) -> io::Result<ConnectResult> {
+) -> io::Result<HandoverResult> {
     if let Err(err) = guard.suspend() {
-        // Still in TUI mode, so nothing is broken; just do not start ssh.
-        return Ok(ConnectResult::Failed(format!(
-            "Could not leave the interface to run ssh: {err}"
+        // Still in TUI mode, so nothing is broken; just do not start the program.
+        return Ok(HandoverResult::Failed(format!(
+            "Could not leave the interface to run {program}: {err}"
         )));
     }
 
     // The banner is a courtesy: a failure to print it must not stop the
-    // connection.
-    let _ =
-        writeln!(out, "Bifrost: connecting to {}...", sanitize(name)).and_then(|()| out.flush());
+    // program. It can hold a host name, so it is sanitized.
+    let _ = writeln!(out, "{}", sanitize(banner)).and_then(|()| out.flush());
 
     let ran = run();
 
@@ -77,8 +135,8 @@ pub fn hand_over<O: TerminalOps>(
     discard_input();
 
     Ok(match ran {
-        Ok(outcome) => ConnectResult::Ran(outcome),
-        Err(err) => ConnectResult::Failed(format!("Could not start ssh: {err}")),
+        Ok(outcome) => HandoverResult::Ran(outcome),
+        Err(err) => HandoverResult::Failed(format!("Could not start {program}: {err}")),
     })
 }
 
@@ -150,7 +208,8 @@ mod tests {
         let result = hand_over(
             &mut guard,
             &mut out,
-            "web",
+            "Bifrost: connecting to web...",
+            "ssh",
             || {
                 log.borrow_mut().push("ssh");
                 Ok(outcome(0))
@@ -164,7 +223,7 @@ mod tests {
             ["enter", "leave", "ssh", "enter", "discard input"]
         );
         assert!(guard.is_active());
-        assert!(matches!(result, ConnectResult::Ran(o) if o == outcome(0)));
+        assert!(matches!(result, HandoverResult::Ran(o) if o == outcome(0)));
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "Bifrost: connecting to web...\n"
@@ -180,7 +239,8 @@ mod tests {
         let result = hand_over(
             &mut guard,
             &mut Vec::new(),
-            "web",
+            "Bifrost: connecting to web...",
+            "ssh",
             || Err(io::Error::other("permission denied")),
             || log.borrow_mut().push("discard input"),
         )
@@ -189,7 +249,7 @@ mod tests {
         assert!(guard.is_active());
         assert_eq!(logged(&log), ["enter", "leave", "enter", "discard input"]);
         assert!(
-            matches!(result, ConnectResult::Failed(text) if text == "Could not start ssh: permission denied")
+            matches!(result, HandoverResult::Failed(text) if text == "Could not start ssh: permission denied")
         );
     }
 
@@ -204,7 +264,8 @@ mod tests {
         let result = hand_over(
             &mut guard,
             &mut Vec::new(),
-            "web",
+            "Bifrost: connecting to web...",
+            "ssh",
             || {
                 log.borrow_mut().push("ssh");
                 Ok(outcome(0))
@@ -215,7 +276,7 @@ mod tests {
 
         assert!(!logged(&log).contains(&"ssh"));
         assert!(guard.is_active(), "the TUI carries on");
-        assert!(matches!(result, ConnectResult::Failed(text) if text.contains("leave failed")));
+        assert!(matches!(result, HandoverResult::Failed(text) if text.contains("leave failed")));
     }
 
     #[test]
@@ -229,7 +290,8 @@ mod tests {
         let err = hand_over(
             &mut guard,
             &mut Vec::new(),
-            "web",
+            "Bifrost: connecting to web...",
+            "ssh",
             || Ok(outcome(0)),
             || log.borrow_mut().push("discard input"),
         )
@@ -249,7 +311,8 @@ mod tests {
             let _ = hand_over(
                 &mut guard,
                 &mut Vec::new(),
-                "web",
+                "Bifrost: connecting to web...",
+                "ssh",
                 || panic!("Bifrost failed while ssh was running"),
                 || {},
             );
@@ -269,7 +332,8 @@ mod tests {
         hand_over(
             &mut guard,
             &mut out,
-            "evil\x1b[2Jname\u{202e}",
+            "Bifrost: connecting to evil\x1b[2Jname\u{202e}...",
+            "ssh",
             || Ok(outcome(0)),
             || {},
         )
@@ -292,7 +356,87 @@ mod tests {
             }
         }
         let mut guard = TerminalGuard::enter(Ops::default()).unwrap();
-        let result = hand_over(&mut guard, &mut Broken, "web", || Ok(outcome(0)), || {}).unwrap();
-        assert!(matches!(result, ConnectResult::Ran(_)));
+        let result = hand_over(
+            &mut guard,
+            &mut Broken,
+            "Bifrost: connecting to web...",
+            "ssh",
+            || Ok(outcome(0)),
+            || {},
+        )
+        .unwrap();
+        assert!(matches!(result, HandoverResult::Ran(_)));
+    }
+
+    #[test]
+    fn a_failure_names_the_program_that_could_not_be_started() {
+        for program in ["ssh", "ssh-keygen", "ssh-add"] {
+            let mut guard = TerminalGuard::enter(Ops::default()).unwrap();
+            let result = hand_over(
+                &mut guard,
+                &mut Vec::new(),
+                "banner",
+                program,
+                || Err(io::Error::other("no such file")),
+                || {},
+            )
+            .unwrap();
+            assert!(
+                matches!(&result, HandoverResult::Failed(text)
+                    if *text == format!("Could not start {program}: no such file")),
+                "{result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_terminal_that_cannot_be_left_names_the_program_too() {
+        let ops = Ops::default();
+        let fail_leave = Rc::clone(&ops.fail_leave);
+        let mut guard = TerminalGuard::enter(ops).unwrap();
+        fail_leave.set(true);
+        let result = hand_over(
+            &mut guard,
+            &mut Vec::new(),
+            "banner",
+            "ssh-keygen",
+            || Ok(outcome(0)),
+            || {},
+        )
+        .unwrap();
+        assert!(
+            matches!(&result, HandoverResult::Failed(text) if text.contains("run ssh-keygen")),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn a_key_is_not_sent_with_arguments_that_are_not_the_copy_ones() {
+        // With the arguments of a session, ssh would open a shell on the server
+        // and read the key as commands. Nothing must run, and the terminal must
+        // not even be touched.
+        let ops = Ops::default();
+        let log = Rc::clone(&ops.log);
+        let mut guard = TerminalGuard::enter(ops).unwrap();
+        let host = crate::domain::Host::new("web", "web.example.com");
+        let hosts = crate::domain::Hosts::from_vec(vec![host.clone()]).unwrap();
+        let request = ConnectRequest {
+            name: "web".to_string(),
+            args: crate::ssh::command::build_args(&host, &hosts).unwrap(),
+            known_hosts: Vec::new(),
+        };
+        let result = copy_key(
+            &mut guard,
+            Path::new("/nonexistent/ssh"),
+            &request,
+            "id_ed25519",
+            b"ssh-ed25519 AAAA\n".to_vec(),
+        )
+        .unwrap();
+        let HandoverResult::Failed(why) = result else {
+            panic!("{result:?}");
+        };
+        assert!(why.contains("not the one for copying a key"), "{why}");
+        assert_eq!(logged(&log), ["enter"], "the terminal was never left");
     }
 }

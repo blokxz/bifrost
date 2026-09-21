@@ -36,15 +36,17 @@
 Up/Down j/k move  Enter connect  / search  a add  e edit  d delete  f favorite  c copy  Tab view  ? help  q/Esc quit
 
 ==================== notes (not part of the render) ====================
-Screen: Launcher (start view "launcher", or `bifrost --launcher`).
-This is the existing host list screen, rendered from the real code at 120x36.
-It stays as it is; the only additions are:
-- `Tab` switches to the full view (01-main.txt) with the same host selected
-  (added to the footer above as "Tab view").
-- The colors below, from the Bifrost palette (docs/ui/README.md).
-Search keeps working with `/`; add, edit, delete, favorite and copy stay here.
+Status: PROPOSAL FOR 0.2. NOT BUILT. Hand-drawn: this was NOT rendered from Bifrost's code.
+What it shows is the host list that 0.1.0 already has, with one thing 0.1.0 does not
+have: a `Tab view` hint, to switch to a full view (01-main.txt) that does not exist.
+0.1.0 has one start view, this list, and no Tab. Its real footer also differs (for
+example it offers K for the keys screen). See docs/ui-design.md.
 
-Colors (layout, text and markers do not change):
+The idea, if a full view is ever built: keep this list as a second start view, with
+everything it does today (search with /, connect, add, edit, delete, favorite, copy
+the command, help), and let Tab switch to the full view with the same host selected.
+
+Colors below are the proposed palette (docs/ui/README.md), not what is drawn today:
 - Box border `border`; title "Bifrost 0.1.0" in `accent`, bold.
 - "Saved hosts: 8" and the Name/Target/Tags header in `muted`.
 - Selected row: `selection` background, `bright` text; keeps its `>` marker.

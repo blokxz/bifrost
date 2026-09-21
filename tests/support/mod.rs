@@ -11,8 +11,8 @@ use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -217,6 +217,59 @@ pub fn serialize_spawns() -> std::sync::MutexGuard<'static, ()> {
     SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Makes sure that the `bifrost` a test starts has no controlling terminal, so
+/// that the pty it is given is the only terminal it knows.
+///
+/// A child inherits its parent's controlling terminal, and when the tests are
+/// run from a terminal that is the terminal they were started from. That is
+/// not harmless: crossterm asks `/dev/tty`, the controlling terminal, for the
+/// size, and uses the terminal of its stdout only when there is none. So under
+/// a person's terminal `bifrost` drew for that window (say 200x50) instead of
+/// the 80x24 of its test pty, and ignored every resize of the test pty. Tests
+/// that run without a controlling terminal, as in CI or from an editor's task
+/// runner, never showed it.
+///
+/// A process that starts a session of its own has none, and so do its children.
+/// `setsid` can only be called by a process that is not a process group leader,
+/// which `cargo test` makes sure of for the test binary, so it is called on this
+/// process, once, before the first child is started. The price: Ctrl-C at the
+/// keyboard no longer reaches the tests (it stops `cargo`), and the test binary,
+/// which finishes in seconds and gives up by itself after [`PATIENCE`], runs to
+/// its end.
+///
+/// Where it cannot be done (the binary was started directly by a shell that
+/// does job control, or by a runner that gives each test a group of its own) the
+/// tests stop at once and say why, instead of timing out on a screen of the
+/// wrong size.
+fn detach_from_controlling_terminal() {
+    static DETACHED: OnceLock<Result<(), String>> = OnceLock::new();
+    let result = DETACHED.get_or_init(|| {
+        let has_terminal = || File::open("/dev/tty").is_ok();
+        if !has_terminal() {
+            return Ok(());
+        }
+        rustix::process::setsid().map_err(|err| {
+            format!(
+                "These tests start bifrost in a pseudo-terminal of its own, but this process \
+                 has a controlling terminal (the one they were started from), and bifrost \
+                 would size itself from that one instead. Leaving it failed ({err}): the test \
+                 binary is a process group leader. Run it through `cargo test`, or as \
+                 `setsid -w <test binary>`."
+            )
+        })?;
+        if has_terminal() {
+            return Err(
+                "Starting a session of its own did not remove the controlling terminal."
+                    .to_string(),
+            );
+        }
+        Ok(())
+    });
+    if let Err(why) = result {
+        panic!("{why}");
+    }
+}
+
 /// Writes an executable script, without racing a spawn (see [`SPAWN_LOCK`]).
 pub fn write_script(path: &Path, content: &str, mode: u32) {
     use std::os::unix::fs::PermissionsExt;
@@ -241,6 +294,7 @@ pub struct Session {
 
 impl Session {
     pub fn start(config_dir: &Path, height: u16, width: u16, env: &[(&str, &str)]) -> Session {
+        detach_from_controlling_terminal();
         let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).expect("open a pty");
         // Keep the master out of the child, which must only see the slave side.
         fcntl_setfd(&master, FdFlags::CLOEXEC).expect("set close-on-exec");

@@ -36,6 +36,10 @@
  ↑↓ choose   space select   ctrl+→ next step   ctrl+← back                                                   esc cancel
 
 ==================== notes (not part of the render) ====================
+Status: PROPOSAL FOR 0.2. NOT BUILT. 0.1.0 has one add/edit form: no wizard, no
+steps, no tips panel. The "install it (ssh-copy-id)" line is not how Bifrost will
+copy a key: it sends the public key on stdin to a fixed remote command and never
+uses ssh-copy-id (Block 6).
 Screen: New host wizard, step 2 of 4. Steps: done = `green` with ✓, current = `accent` keycap, pending = `muted`.
 - Focused panel (How do you want to log in?): `accent` border.
 - (•) selected radio in `accent`; "recommended" in `green`.

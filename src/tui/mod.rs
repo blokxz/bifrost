@@ -5,6 +5,7 @@
 //!   [`persist`].
 //! - [`startup`]: the store's load result as plain data for the first screen.
 //! - [`list`], [`fuzzy`], [`input`]: the host list, the search and text editing.
+//! - [`keys`]: the keys screen's state.
 //! - [`form`]: the add/edit form's state machine.
 //! - [`clipboard`]: asking the terminal to copy text (OSC 52).
 //! - [`effects`]: what the app asks the outside world to do, and how it is done.
@@ -18,7 +19,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use crate::error::{AppError, Result};
-use crate::ssh::binary::{resolve_keygen, resolve_ssh};
+use crate::ssh::binary::{resolve_keygen, resolve_ssh, resolve_ssh_add};
 use crate::ssh::interrupt;
 use crate::store::{Loaded, Store, StoreError};
 use crate::sysenv::{Env, Platform, home_dir};
@@ -31,6 +32,7 @@ pub mod form;
 pub mod fuzzy;
 pub mod handover;
 pub mod input;
+pub mod keys;
 pub mod list;
 pub mod persist;
 pub mod startup;
@@ -40,7 +42,7 @@ pub mod ui;
 pub mod wrap;
 
 use app::App;
-use effects::System;
+use effects::{Programs, System};
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use startup::Startup;
 use terminal::{CrosstermOps, TerminalGuard};
@@ -62,12 +64,17 @@ pub fn run(loaded: std::result::Result<(Store, Loaded), StoreError>, env: Env<'_
     // Resolved once, before anything runs, to an absolute path. Not finding one
     // is not fatal: the list still works, and the action that needs it explains
     // what is missing.
-    let ssh = resolve_ssh();
-    let keygen = resolve_keygen();
+    let programs = Programs {
+        ssh: resolve_ssh(),
+        keygen: resolve_keygen(),
+        ssh_add: resolve_ssh_add(),
+    };
+    let home = home_dir(Platform::current(), env);
     // The file `ssh-keygen -R` edits when it is not told which: the only one
     // Bifrost offers to remove a key from.
     app.set_known_hosts_file(
-        home_dir(Platform::current(), env).map(|home| home.join(".ssh").join("known_hosts")),
+        home.as_ref()
+            .map(|home| home.join(".ssh").join("known_hosts")),
     );
     // From here a SIGINT (which raw mode keeps the keyboard from producing, but
     // `kill -INT` and Ctrl-C during a connection do) no longer kills Bifrost.
@@ -77,7 +84,7 @@ pub fn run(loaded: std::result::Result<(Store, Loaded), StoreError>, env: Env<'_
     // Created before the ratatui terminal so that it is dropped after it.
     let mut guard = TerminalGuard::enter(CrosstermOps)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    let mut system = System::new(&mut guard, ssh, keygen);
+    let mut system = System::new(&mut guard, programs, home.map(|home| home.join(".ssh")));
 
     event::run_loop(
         &mut terminal,

@@ -91,7 +91,7 @@ pub fn run_loop<B: Backend>(
 mod tests {
     use super::*;
     use crate::domain::Hosts;
-    use crate::tui::app::{ConnectResult, Screen};
+    use crate::tui::app::{HandoverResult, Screen};
     use crate::tui::persist::testing::FakeStore;
     use crate::tui::startup::Startup;
     use ratatui::backend::TestBackend;
@@ -337,9 +337,9 @@ mod tests {
         App::new(Startup::loaded(hosts, FakeStore::default(), Vec::new()))
     }
 
-    fn quiet_outcome(code: i32) -> ConnectResult {
+    fn quiet_outcome(code: i32) -> HandoverResult {
         use crate::ssh::connect::{Exit, Outcome};
-        ConnectResult::Ran(Outcome {
+        HandoverResult::Ran(Outcome {
             exit: Exit::Code(code),
             stderr: Vec::new(),
             interrupted: false,

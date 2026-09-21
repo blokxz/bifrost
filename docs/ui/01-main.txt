@@ -36,6 +36,9 @@
  ⏎ connect   n new   e edit   f favorite   / filter   ctrl+p jump to…   tab next panel                  ? help   q quit
 
 ==================== notes (not part of the render) ====================
+Status: PROPOSAL FOR 0.2. NOT BUILT. Do not read this as a description of Bifrost.
+0.1.0 has one start view, the host list. There is no full view, no tab bar and no
+panels. See docs/ui-design.md.
 Screen: Full view (start view "full"). Tab bar: Hosts active.
 - Hosts panel has focus: border + title in `accent`. Other panels: border `border`, title `muted`.
 - Selected row (›): background `selection`, text `bright`. Only the focused panel shows a selection highlight.

@@ -36,6 +36,65 @@ Then, in `bifrost`:
    wrong port it prints ssh's message, then Bifrost's explanation, and 255.
    `bifrost nosuchhost` prints the closest names and 2.
 
+## Making a key and adding it to the agent
+
+The automated tests use fake `ssh-keygen` and `ssh-add`, and one ignored test
+runs the real `ssh-keygen` (`cargo test --test pty_keys -- --ignored`). By hand,
+with the real tools, in a real terminal:
+
+1. **Generate.** `K`, `g`. Look for: a free name is in the form, the passphrase
+   note is in the form, and Enter goes name, comment, then to `ssh-keygen`.
+   `ssh-keygen` asks for the passphrase and its confirmation in the normal
+   screen. Afterwards the keys screen is back, drawn correctly, with the new key
+   selected and a line saying it was made. Try a passphrase, and an empty one.
+2. **Cancel.** Start again and press Ctrl-C at the passphrase prompt. Look for:
+   "Making the key was cancelled." and Bifrost still running.
+3. **Never overwrite.** Give the name of an existing key: refused in the form.
+   Give the name of a file that is not a key pair (a private file with no `.pub`):
+   refused with a message. Neither file changes.
+4. **Add.** With an agent running (`eval "$(ssh-agent -s)"` before starting
+   Bifrost), select a key that has a passphrase and press `a`. Look for: `ssh-add`
+   asks for it on the terminal, then the row says "loaded". A wrong passphrase
+   gives an error that says what `ssh-add` said.
+5. **No agent.** Start Bifrost without one: `a` explains, and does not run
+   `ssh-add`.
+6. **Permissions.** Make a key 0644 and press `a`: it points to `f`, and does not
+   run `ssh-add`.
+
+## Sending a public key to a host
+
+The automated tests use a fake ssh (`tests/pty_keys.rs`). Against a real server,
+with the real ssh:
+
+```text
+BIFROST_TEST_SSH_TARGET=user@host[:port] cargo test --test copy_real -- --ignored --nocapture
+```
+
+It adds a throwaway key to the server's `authorized_keys` and removes it again.
+It needs a server this machine can log in to without typing (an agent or a
+default key) and whose host key is in your `known_hosts`. By hand, from the keys
+screen with a server that asks for a password:
+
+1. **Send.** Select a key, press `c`, choose the host, Enter. Look for: the
+   question names the key, its fingerprint and the host. `y`: ssh asks for the
+   password on the normal screen, not in Bifrost, and after it the keys screen is
+   back with "Sent the public key of ...". Then `ssh HOST` with that key logs in.
+2. **Twice.** Send the same key again: the server's `authorized_keys` has the line
+   once.
+3. **Nothing sent by mistake.** `n` and Esc at the question send nothing.
+4. **A wrong password** three times: the screen explains that the server refused
+   the login and Esc goes back to the keys screen.
+5. **Cancel.** Ctrl-C at the password prompt: "Sending the key was cancelled."
+6. **A changed host key** (see the changed-key steps above): the blocking screen
+   appears, aborting goes back to the keys, and after removing the old key the
+   message says to send the key again.
+7. **A server without `sh`** (a Windows server with the default shell): the
+   message says the server ran the command and it failed, with what it said.
+8. **A server whose login shell is fish or csh**: the key is still added once.
+   (csh has not been tried.)
+9. **A hostile `.pub`.** Put `command="id" ` in front of a key line in a copy of a
+   `.pub`, or two keys on two lines: it is refused, and ssh is not run.
+
 ## Windows
 
 `cargo test --locked` runs the command line tests (`cli_connect`) with a fake ssh,
@@ -67,3 +126,15 @@ the Windows VM, with the real `ssh.exe` (OpenSSH Client installed):
    - `bifrost HOST` prints `ssh-keygen -R "[host]:port"` or `ssh-keygen -R host`:
      paste it into cmd and PowerShell and check it runs.
 8. **`--help`** shows the exit status section.
+9. **Generate.** `K`, `g`. Look for: `ssh-keygen.exe` asks for its passphrase and
+   the interface comes back drawn correctly, in Windows Terminal and in the legacy
+   console host. Ctrl-C at the prompt is expected to end Bifrost too (see item 4).
+10. **Add.** With the "OpenSSH Authentication Agent" service running, select a
+    key and press `a`. Look for: `ssh-add.exe` asks for the passphrase and the row
+    says "loaded". With the service stopped: what does the screen say about the
+    agent? Note the exact wording, it has not been checked.
+11. **Send a public key.** `K`, select a key, `c`. Look for: does ssh.exe ask for the
+    password on the console while its stdin is a pipe? Does the server get the
+    key (`authorized_keys` on the server has one line for it)? The command's
+    double quotes are the risk: if the server answers that the command failed,
+    note exactly what it printed.

@@ -36,6 +36,15 @@
  g generate   a add to agent   c copy public key   i install on host   R rotate                         ? help   q quit
 
 ==================== notes (not part of the render) ====================
+Status: BUILT IN PART (Block 6). The keys screen opens with a capital K from the
+host list. Built: the list (name, type, agent, permissions), a details panel, the
+agent's state, and `f` to set a private key to 0600 after a yes/no question (a
+lower case f, not F). Also built: g generate (a small form, then ssh-keygen
+on the real terminal), a add to agent (ssh-add) and c send the public key to a
+saved host (a list of hosts, a question, then ssh on the real terminal). The
+mockup's "copy public key" is not clipboard copying: it is this. NOT built, proposals for 0.2: the "used by" and
+"health" columns, the problems panel, "rotate" and "install on host". The built
+screen writes "loaded" / "not loaded" and "0644 too open" in words, with no ● or ○.
 Screen: Keys tab.
 - Column headers in `muted`.
 - ● loaded `green`; ○ not loaded `muted`; bad perms (0644) `red`; rsa 2048 `amber`; ✓ ok `green`; ✗ issues `red`.

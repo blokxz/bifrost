@@ -331,7 +331,7 @@ pub struct HostKeyChange {
 }
 
 /// Whether `text` is a SHA-256 fingerprint as ssh prints it.
-fn is_sha256_fingerprint(text: &str) -> bool {
+pub(crate) fn is_sha256_fingerprint(text: &str) -> bool {
     text.strip_prefix("SHA256:").is_some_and(|hash| {
         hash.len() == 43
             && hash
@@ -341,7 +341,7 @@ fn is_sha256_fingerprint(text: &str) -> bool {
 }
 
 /// A key type as ssh names it: `ED25519`, `ECDSA`, `RSA`, `ED25519-SK`.
-fn is_key_type(text: &str) -> bool {
+pub(crate) fn is_key_type(text: &str) -> bool {
     (2..=24).contains(&text.len())
         && text
             .chars()

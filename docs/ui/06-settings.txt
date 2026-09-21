@@ -1,7 +1,7 @@
  bifrost  v0.1.0      Hosts   Keys   Known hosts  [Settings]                                          ● unsaved changes
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-┌─ Start view ─────────────────────────────────────────────────────────┐ ┌─ config.toml preview ───────────────────────┐
-│ What opens when you run bifrost                                      │ │ ~/.config/bifrost/config.toml               │
+┌─ Start view ─────────────────────────────────────────────────────────┐ ┌─ hosts.toml [ui] preview ───────────────────┐
+│ What opens when you run bifrost                                      │ │ ~/.config/bifrost/hosts.toml                │
 │                                                                      │ │                                             │
 │ › (•) Full view        hosts, details, keys and settings in panels   │ │ [ui]                                        │
 │   ( ) Quick launcher   search box only: type, press ⏎, connect       │ │ start_view = "full"  # "full" | "launcher"  │
@@ -30,14 +30,16 @@
 │                                                                      │ │                                             │
 │                                                                      │ │                                             │
 │                                                                      │ │                                             │
-│                                                                      │ │ Windows: %APPDATA%\bifrost\config.toml      │
+│                                                                      │ │ Windows: %APPDATA%\bifrost\hosts.toml       │
 └──────────────────────────────────────────────────────────────────────┘ └─────────────────────────────────────────────┘
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
  ↑↓ move   space toggle   ctrl+s save   esc discard                                                     ? help   q quit
 
 ==================== notes (not part of the render) ====================
+Status: PROPOSAL FOR 0.2. NOT BUILT. 0.1.0 has no settings screen and no settings.
+Settings, when they exist, live in a [ui] table inside hosts.toml. There is no
+config.toml: the preview panel shows what that table would look like.
 Screen: Settings tab.
 - "● unsaved changes" in `amber` (only shown when dirty).
 - (•) / [x] in `accent`; [■] locked items in `muted` with "always on".
 - TOML preview: [ui] in `violet`, keys `bright`, strings `green`, booleans `amber`, comments `muted`.
-- OPEN QUESTION: separate config.toml vs a [ui] table in the host store TOML. The preview path is not final.

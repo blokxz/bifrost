@@ -7,6 +7,7 @@
 //! so.
 //!
 //! - [`list`]: the host list.
+//! - [`keys`]: the keys screen.
 //! - [`form`]: the add/edit form.
 //! - [`modal`]: boxes drawn over a screen.
 //! - [`page`]: text pages: help, warnings, the explanation shown when the hosts
@@ -26,6 +27,7 @@ use super::wrap::{display_width, wrap};
 use crate::sanitize::{has_unsafe_chars, sanitize};
 
 mod form;
+mod keys;
 mod list;
 mod modal;
 mod page;
@@ -58,6 +60,7 @@ pub fn render(app: &App, theme: &Theme, frame: &mut Frame) -> Metrics {
         Screen::ConnectError => page::render_connect_error(app, theme, frame, area),
         Screen::SshOutput => page::render_ssh_output(app, theme, frame, area),
         Screen::HostKeyChanged => page::render_host_key_changed(app, theme, frame, area),
+        Screen::Keys => keys::render(app, theme, frame, area),
     }
 }
 

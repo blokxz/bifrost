@@ -150,6 +150,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     opens or when connecting. When ssh is missing, the list still works and
     connecting explains what to install.
 
+- **Keys screen** (Block 6)
+  - `K` on the host list shows the key pairs in `~/.ssh` (a private key with a
+    `.pub` next to it): name, type and size, whether the agent holds it, and
+    whether its permissions are ones ssh accepts. The selected key's fingerprint,
+    comment and paths are shown below the list.
+  - Type, size, fingerprint and comment come from `ssh-keygen -l -f` run on the
+    public file. Bifrost never reads a private key.
+  - The agent is asked with `ssh-add -l`, waiting at most 3 seconds. An agent that
+    is not running is a normal state and is explained, not reported as an error;
+    keys are then neither "loaded" nor "not loaded" but "unknown".
+  - On Linux and macOS a private key that other users can read is flagged in
+    words, and `f` sets it to 0600 after a yes/no question. It is not offered for
+    a symbolic link. Only the private file of a key pair in `~/.ssh` can be
+    changed. On Windows permissions are not checked.
+  - Bifrost never deletes or overwrites a key.
+  - `g` makes a new ed25519 key. A small form asks for the file name (one that is
+    free is suggested) and an optional comment, and says beforehand that
+    `ssh-keygen` will ask for a passphrase and that Bifrost never sees it. Then the
+    interface steps aside and `ssh-keygen` runs on the real terminal, where it asks
+    for the passphrase itself. Back on the keys screen, the new key is listed and
+    selected. A name that is already a key, or a file that exists in `~/.ssh` under
+    that name or `name.pub`, is refused.
+  - `a` adds the selected key to the agent with `ssh-add`, the same way. It is not
+    tried when it cannot work and says why instead: the key is already loaded, its
+    permissions are too open (`f` fixes them), or there is no agent to add it to.
+  - Ctrl-C at either passphrase prompt cancels that action and Bifrost goes on. A
+    failure says what the tool said last.
+  - `c` sends the selected key's public key to a saved host, without
+    `ssh-copy-id`. A list of the saved hosts (in the order of the host list) is
+    followed by a question that names the key, its fingerprint and the host,
+    because this lets whoever has the private key log in there. Then ssh runs on
+    the real terminal, where it asks for the password and for a new server's key
+    itself. The key is added to `~/.ssh/authorized_keys` on the server, and not a
+    second time if it is already there.
+  - How it ended is judged like a connection: ssh's own failures are explained on
+    the same screens, a changed host key stops on the blocking screen, and going
+    back returns to the keys screen. A command that the server ran and that
+    failed (any other status) is said to be that, with what the server said last.
+
 ### Security
 
 - Removing a host key is an explicit action confirmed by typing the host's name,
@@ -170,6 +209,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   raw. Input typed during a connection that ssh did not read is discarded, so it
   cannot run as commands afterwards. ssh is killed if Bifrost fails while it
   runs.
+- Making a key and adding one to the agent never put a passphrase in a command
+  line, an environment variable or Bifrost's memory: `ssh-keygen` and `ssh-add`
+  ask for it on the terminal themselves. `ssh-keygen` is never given `-N`.
+  What they are given is checked again just before they run: a file name of one
+  plain path component that cannot be read as an option, a comment without
+  control characters, and the key's absolute path.
+- Sending a public key never puts the key on a command line. It is written to
+  ssh's stdin, and what runs on the server is one fixed command that holds no
+  user data (the key is read by its script from stdin into a quoted variable).
+  Before that the file is checked to be exactly one line that starts with a real
+  key type, with no control characters: a private key, several keys, or a line
+  with `command="..."` options in front of the key are never sent. The check is
+  repeated where the bytes are made, and the arguments are checked to be the ones
+  for sending a key before the key is attached to ssh, because with any others
+  ssh could start a shell on the server and read the key as commands. Port
+  forwards and agent forwarding are not requested for it, even if the host has
+  them or the user's ssh config asks for them.
 - Bifrost stores no secrets: only paths to key files, never passwords,
   passphrases or key material.
 - Files and directories are user-only (0600 and 0700) on Unix.
