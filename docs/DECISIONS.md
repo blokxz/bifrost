@@ -33,6 +33,26 @@ settled: reopen one only with a clear new reason.
   command users type stays short.
 - **Linux, macOS and Windows for 0.1.0.** Windows is tested in CI and in a
   separate VM.
+- **Paths are compared as text, by explicit rules, in one place** (`src/pathtext.rs`).
+  `std::path` splits a path by the rules of the system that runs it, so a comparison
+  built on it cannot be tested for the other system, and one built on plain strings
+  says two spellings of a Windows file are two files. The rules are an argument
+  (`Rules::Unix`: `/` only, case matters, `\` is a letter; `Rules::Windows`: `/` and
+  `\`, any case, drives, network paths, the `\\?\` prefix ignored), the
+  production call passes `Rules::native()` and is the only place that looks at the
+  system, and every test runs both sets on every system. Four decisions use it:
+  which saved key is a key on disk, which file ssh named as holding the old host key,
+  which `Include` reaches the exported file, and which identity files ssh adds by
+  default. `~` is the home with `/` under both rules and with `\` only under the
+  rules of Windows.
+- **`..` is never resolved from the words where a file is chosen.** `same_path`
+  (used for the changed-key file, the `Include` and the default identity files) is
+  false for any path with `..` in it, even one identical to the other: `a/../b` is
+  `b` only when `a` is not a link, the words cannot say, and a wrong yes would pick
+  the file that `ssh-keygen -R` edits. A path that exists is resolved by the disk
+  first (`canonicalize`), which does follow links. Only key matching applies `..`
+  from the words (`same_path_resolving_dots`), as it always did, because a wrong
+  answer there only changes whether a question is asked.
 
 ## Store
 
@@ -667,11 +687,11 @@ stays refused (see above).
   with both, is the same key. Every place that matches a saved key path with a key
   on disk (the identity file list, "the host already has it", the hosts listed
   before a key is deleted) goes through `names_this_key`, which compares the parts
-  of the paths and never their text. `~` means the home only for a folder that is a
-  `.ssh`. The comparison works on text, never on `std::path`, whose separators
-  are those of the system running it: the rules of Windows and the rules of the
-  others are a parameter, and each set is tested the same on every system. Only
-  the production call picks one, with `cfg!(windows)`.
+  of the paths and never their text (see "Paths are compared as text", under
+  Architecture). `~` means the home only for a folder that is a `.ssh`. This is the
+  one comparison that applies `..` to the name before it, because it decides from
+  the words what a person meant and a wrong answer only changes whether a question
+  is asked.
 - **The stored value is `~/.ssh/<name>`.** It is what people write, it keeps the
   hosts file readable and movable, and ssh expands the `~` itself for `-i` and
   `IdentityFile`. A key found in some other folder would be stored in full. A host
@@ -832,8 +852,10 @@ stays refused (see above).
 - **The changed-key screen offers removal only for the default `known_hosts`.**
   A key kept in another file (a system-wide `ssh_known_hosts`, or a
   `UserKnownHostsFile` in ssh's config) is shown, and the user removes it by
-  hand. On Windows the file is compared ignoring case and the kind of slash; that
-  comparison, and what path ssh.exe prints, have not been verified there.
+  hand. The file is compared by the rules of the system (on Windows: either slash,
+  any case, a drive or a network path, the `\\?\` prefix ignored), and those rules
+  are tested on every system; what path ssh.exe really prints has not been verified
+  there. A printed path with `..` in it is never the default file.
 - **`bifrost <host>` cannot tell its own status 2 from a remote status 2** by the
   status alone. The message on stderr can.
 - **The keys screen cannot check or fix permissions on Windows.** ssh.exe checks
@@ -866,7 +888,8 @@ stays refused (see above).
 - **The ssh config screen has not been run on Windows.** Not checked: that
   `Include ~/.ssh/bifrost_config` (with `~`) is what OpenSSH for Windows accepts in
   `%USERPROFILE%\.ssh\config`, and how the import's `ssh -G` output paths look
-  there. The include check compares paths ignoring case and the kind of slash.
+  there. The include check resolves each file through the disk and then compares it by
+  the rules of Windows (either slash, any case, the `\\?\` prefix ignored).
 - **Making a key and adding one to the agent have not been run on Windows.** They
   use the same handover as a connection, so the limits above hold, and how
   `ssh-keygen.exe` prompts on the legacy console host and in Windows Terminal, and

@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 use super::jump::{ChainError, jump_chain};
 use super::{Forward, Host, Warning};
+use crate::pathtext::{Rules, expand_tilde};
 use crate::text::escape_control;
 
 pub const MAX_NAME_LEN: usize = 64;
@@ -427,7 +428,8 @@ pub fn check_hosts(hosts: &[Host]) -> Check {
 /// leading `~`; without it, `~` paths cannot be checked and yield no warning.
 pub fn identity_file_warning(host: &Host, home: Option<&Path>) -> Option<Warning> {
     let path = host.identity_file.as_deref()?;
-    let expanded = expand_tilde(path, home)?;
+    let home = home.map(Path::to_string_lossy);
+    let expanded = PathBuf::from(expand_tilde(path, home.as_deref(), Rules::native())?);
     if expanded.exists() {
         return None;
     }
@@ -435,18 +437,6 @@ pub fn identity_file_warning(host: &Host, home: Option<&Path>) -> Option<Warning
         "Host '{}': the identity file '{}' does not exist.",
         host.name, path
     )))
-}
-
-pub(crate) fn expand_tilde(path: &str, home: Option<&Path>) -> Option<PathBuf> {
-    match path.strip_prefix('~') {
-        None => Some(PathBuf::from(path)),
-        Some("") => home.map(Path::to_path_buf),
-        Some(rest) => match rest.strip_prefix(['/', '\\']) {
-            Some(tail) => home.map(|home| home.join(tail)),
-            // `~user/...` is not supported; treat as an ordinary path.
-            None => Some(PathBuf::from(path)),
-        },
-    }
 }
 
 #[cfg(test)]
@@ -699,6 +689,20 @@ mod tests {
         assert!(identity_file_warning(&host, Some(dir.path())).is_some());
         // Without a home directory a `~` path cannot be checked.
         assert_eq!(identity_file_warning(&host, None), None);
+    }
+
+    #[test]
+    fn a_backslash_after_the_tilde_is_the_home_only_where_the_system_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("key"), "x").unwrap();
+        let mut host = host("web");
+        host.identity_file = Some(r"~\key".to_string());
+        // Under the rules of Windows it is the file in the home; elsewhere it is a
+        // name that starts with a tilde, which is not there.
+        assert_eq!(
+            identity_file_warning(&host, Some(dir.path())).is_none(),
+            cfg!(windows)
+        );
     }
 
     // ---- jump host name ----------------------------------------------------

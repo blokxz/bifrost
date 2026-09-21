@@ -257,6 +257,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     are never held back however many there are. In the preview, hosts skipped for the
     same reason are shown as one entry.
 
+### Changed
+
+- **Every decision Bifrost takes from the words of a path goes through one module
+  (`pathtext`), on text, with the rules of Windows and of the others as an argument,
+  and both sets are tested on every system.** It replaces four separate
+  comparisons: which saved key is a key on disk, which file ssh named as holding the
+  old host key, which `Include` reaches the exported file, and which identity files
+  ssh adds by default. What changes for the user:
+  - A path with `..` in it is never taken for the default `known_hosts`, so removing
+    a changed host key is never offered for a file that only might be that one. On
+    Unix, `//` and `/./` in the path ssh printed no longer make it a different file.
+  - `~\` is the home directory only on Windows; on Unix it is an ordinary name.
+
 ### Fixed
 
 - **A host's key file is recognized on Windows.** The identity file list, the

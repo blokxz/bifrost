@@ -32,6 +32,7 @@ use std::path::Path;
 
 use super::command::KnownHostsTarget;
 use super::connect::{Exit, Outcome};
+use crate::pathtext::{Rules, same_path};
 use crate::sanitize::{PLACEHOLDER, is_unsafe_char};
 
 /// How a connection ended, as far as the user needs to know.
@@ -401,31 +402,35 @@ impl HostKeyChange {
     /// `known_hosts` that `ssh-keygen -R` edits without being told which file.
     /// Anything else, including anything missing, is `None`: text that a server
     /// could have printed must never choose what gets removed, or from where.
+    ///
+    /// The file is the same one only by [`same_path`]: the same words up to the
+    /// way the system writes a path, and never when either has a `..` in it, which
+    /// the words cannot resolve (`a/../b` is not `b` when `a` is a link).
     pub fn removal_target<'a>(
         &self,
         known: &'a [KnownHostsTarget],
         default_file: Option<&Path>,
     ) -> Option<&'a KnownHostsTarget> {
+        let default_file = default_file.map(Path::to_string_lossy);
+        self.removal_target_by(known, default_file.as_deref(), Rules::native())
+    }
+
+    /// [`Self::removal_target`] with the rules for writing a path given, so that the
+    /// rules of Windows and of the others are both tested on every system.
+    fn removal_target_by<'a>(
+        &self,
+        known: &'a [KnownHostsTarget],
+        default_file: Option<&str>,
+        rules: Rules,
+    ) -> Option<&'a KnownHostsTarget> {
         let host = self.host.as_deref()?;
         let file = self.file.as_deref()?;
-        if !same_file(file, default_file?) {
+        if !same_path(file, default_file?, rules) {
             return None;
         }
         known
             .iter()
             .find(|target| target.entry.eq_ignore_ascii_case(host))
-    }
-}
-
-/// Whether the path ssh printed is `expected`. Windows paths are compared
-/// ignoring case and the kind of slash, since ssh mixes them.
-fn same_file(printed: &str, expected: &Path) -> bool {
-    let expected = expected.to_string_lossy();
-    if cfg!(windows) {
-        let normal = |path: &str| path.replace('\\', "/").to_ascii_lowercase();
-        normal(printed) == normal(&expected)
-    } else {
-        printed == expected
     }
 }
 
@@ -1114,12 +1119,208 @@ Host key verification failed.\r\n";
         assert_eq!(removal(&no_file, Some(DEFAULT_FILE)), None);
     }
 
-    #[cfg(windows)]
+    // ---- which file: both ways of writing a path, on every system --------------
+
+    /// The target for `printed` (as ssh printed the file) when the default file is
+    /// `default`, by the given rules. `None` when it is not one to remove from.
+    fn removal_by(printed: &str, default: &str, rules: Rules) -> Option<String> {
+        let read = HostKeyChange {
+            host: Some("192.0.2.1".to_string()),
+            file: Some(printed.to_string()),
+            ..HostKeyChange::default()
+        };
+        let known = known();
+        read.removal_target_by(&known, Some(default), rules)
+            .map(|t| t.saved_name.clone())
+    }
+
+    const WINDOWS_DEFAULT: &str = r"C:\Users\Dev\.ssh\known_hosts";
+
     #[test]
-    fn windows_paths_match_whatever_the_slashes_and_case() {
-        assert!(same_file(
+    fn under_the_rules_of_windows_the_slashes_the_case_and_the_prefix_do_not_matter() {
+        for printed in [
+            WINDOWS_DEFAULT,
             "C:/Users/Dev/.ssh/known_hosts",
-            Path::new("c:\\users\\dev\\.ssh\\known_hosts")
-        ));
+            r"C:\Users/Dev\.ssh/known_hosts",
+            r"c:\users\dev\.ssh\known_hosts",
+            r"C:\USERS\DEV\.SSH\KNOWN_HOSTS",
+            r"C:\Users\Dev\.ssh\\known_hosts",
+            r"C:\Users\Dev\.\.ssh\known_hosts",
+            r"\\?\C:\Users\Dev\.ssh\known_hosts",
+        ] {
+            assert_eq!(
+                removal_by(printed, WINDOWS_DEFAULT, Rules::Windows).as_deref(),
+                Some("web"),
+                "{printed}"
+            );
+        }
+        // The default file may as well come written the other way.
+        assert!(
+            removal_by(
+                WINDOWS_DEFAULT,
+                "c:/users/dev/.ssh/known_hosts",
+                Rules::Windows
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn under_the_rules_of_windows_another_file_is_still_another_file() {
+        for printed in [
+            r"D:\Users\Dev\.ssh\known_hosts",
+            r"C:\Users\Other\.ssh\known_hosts",
+            r"C:\Users\Dev\.ssh\known_hosts2",
+            r"C:\Users\Dev\.ssh\authorized_keys",
+            r"C:\Users\Dev\known_hosts",
+            r"C:\Users\Dev\.ssh",
+            // Not the same start: the root of the current drive, the folder of a
+            // drive, a relative path, a network path.
+            r"\Users\Dev\.ssh\known_hosts",
+            r"C:Users\Dev\.ssh\known_hosts",
+            r"Users\Dev\.ssh\known_hosts",
+            r"\\Users\Dev\.ssh\known_hosts",
+            "known_hosts",
+            "~/.ssh/known_hosts",
+            " ",
+        ] {
+            assert_eq!(
+                removal_by(printed, WINDOWS_DEFAULT, Rules::Windows),
+                None,
+                "{printed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn under_the_rules_of_the_others_case_and_backslashes_count() {
+        let default = "/home/dev/.ssh/known_hosts";
+        for printed in [
+            default,
+            "/home/dev//.ssh/known_hosts",
+            "/home/dev/./.ssh/known_hosts",
+            "//home/dev/.ssh/known_hosts",
+        ] {
+            assert_eq!(
+                removal_by(printed, default, Rules::Unix).as_deref(),
+                Some("web"),
+                "{printed}"
+            );
+        }
+        for printed in [
+            "/home/dev/.ssh/Known_Hosts",
+            "/Home/dev/.ssh/known_hosts",
+            r"/home/dev/.ssh\known_hosts",
+            r"\home\dev\.ssh\known_hosts",
+            "home/dev/.ssh/known_hosts",
+            "known_hosts",
+            "~/.ssh/known_hosts",
+            "/home/dev/.ssh/known_hosts2",
+            "",
+        ] {
+            assert_eq!(
+                removal_by(printed, default, Rules::Unix),
+                None,
+                "{printed:?}"
+            );
+        }
+        // The same words are two files under the other rules and one under these.
+        assert!(removal_by("/home/dev/.ssh/Known_Hosts", default, Rules::Windows).is_some());
+        assert!(removal_by(r"/home/dev/.ssh\known_hosts", default, Rules::Windows).is_some());
+    }
+
+    #[test]
+    fn a_path_with_dot_dot_is_never_the_file_even_when_it_leads_there() {
+        // These all reach the default file if no name on the way is a link, and
+        // the words cannot say. What is removed is chosen by the answer here.
+        let unix_default = "/home/dev/.ssh/known_hosts";
+        for printed in [
+            "/home/dev/.ssh/../.ssh/known_hosts",
+            "/home/dev/x/../.ssh/known_hosts",
+            "/home/dev/.ssh/known_hosts/../known_hosts",
+            "/../home/dev/.ssh/known_hosts",
+            "/home/dev/.ssh/known_hosts/..",
+        ] {
+            assert_eq!(
+                removal_by(printed, unix_default, Rules::Unix),
+                None,
+                "{printed}"
+            );
+        }
+        for printed in [
+            r"C:\Users\Dev\.ssh\..\.ssh\known_hosts",
+            r"C:\Users\Dev\x\..\.ssh\known_hosts",
+            r"C:\..\Users\Dev\.ssh\known_hosts",
+            "C:/Users/Dev/.ssh/../.ssh/known_hosts",
+        ] {
+            assert_eq!(
+                removal_by(printed, WINDOWS_DEFAULT, Rules::Windows),
+                None,
+                "{printed}"
+            );
+        }
+        // Nor when the default file is the one written with it: a wrong yes on
+        // either side picks the wrong file, and identical words do not change that.
+        for (printed, default) in [
+            ("/a/../known_hosts", "/a/../known_hosts"),
+            ("/known_hosts", "/a/../known_hosts"),
+            ("/a/../known_hosts", "/known_hosts"),
+        ] {
+            for rules in [Rules::Unix, Rules::Windows] {
+                assert_eq!(
+                    removal_by(printed, default, rules),
+                    None,
+                    "{printed} {default}"
+                );
+            }
+        }
+        // A name that only has dots in it is a name.
+        assert!(
+            removal_by(
+                "/home/dev/..ssh/known_hosts",
+                "/home/dev/..ssh/known_hosts",
+                Rules::Unix
+            )
+            .is_some()
+        );
+        assert!(
+            removal_by(
+                "/home/dev/.ssh/known_hosts.",
+                "/home/dev/.ssh/known_hosts.",
+                Rules::Unix
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn the_public_entry_uses_the_rules_of_the_system_that_is_running() {
+        // Case is the difference: the same file under Windows, another one elsewhere.
+        let read = HostKeyChange {
+            host: Some("192.0.2.1".to_string()),
+            file: Some("/home/dev/.ssh/Known_Hosts".to_string()),
+            ..HostKeyChange::default()
+        };
+        let known = known();
+        let target = read.removal_target(&known, Some(Path::new(DEFAULT_FILE)));
+        assert_eq!(target.is_some(), cfg!(windows));
+    }
+
+    #[test]
+    fn the_host_is_still_needed_whatever_the_rules_say_of_the_file() {
+        // The file is the default one under both, and the host is not a known one.
+        let read = HostKeyChange {
+            host: Some("other.example".to_string()),
+            file: Some(WINDOWS_DEFAULT.to_string()),
+            ..HostKeyChange::default()
+        };
+        let known = known();
+        for rules in [Rules::Unix, Rules::Windows] {
+            assert!(
+                read.removal_target_by(&known, Some(WINDOWS_DEFAULT), rules)
+                    .is_none()
+            );
+            assert!(read.removal_target_by(&known, None, rules).is_none());
+        }
     }
 }

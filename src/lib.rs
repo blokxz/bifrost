@@ -11,6 +11,7 @@ pub mod cli;
 pub mod commands;
 pub mod domain;
 pub mod error;
+pub(crate) mod pathtext;
 pub mod sanitize;
 pub mod ssh;
 pub mod store;

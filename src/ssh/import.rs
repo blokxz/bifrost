@@ -33,7 +33,7 @@
 use std::cell::Cell;
 use std::fmt;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -41,6 +41,7 @@ use super::scan::scan_host_names;
 use super::timed::{Timed, output_within};
 use crate::domain::validate;
 use crate::domain::{Forward, Host, Hosts, Warning};
+use crate::pathtext::{Rules, expand_tilde, same_path};
 use crate::sysenv::{self, Env, Platform};
 use crate::text::escape_control;
 
@@ -568,18 +569,23 @@ fn build_candidate(
 /// True for `~/.ssh/id_*` (and the same path spelled out) that ssh tries by
 /// default.
 fn is_default_identity(value: &str, source: &ImportSource) -> bool {
-    let normalize = |text: &str| {
-        let text = text.replace('\\', "/");
-        if cfg!(windows) {
-            text.to_ascii_lowercase()
-        } else {
-            text
-        }
-    };
-    let value = normalize(value);
+    is_default_identity_by(value, source, Rules::native())
+}
+
+/// [`is_default_identity`] by the given rules for writing a path, so that both sets
+/// are tested on every system. `value` is what `ssh -G` printed, `~` and all: it is
+/// a default file if it is `~/.ssh/<default>` as written, or, with the home known,
+/// the same file as `<ssh dir>/<default>`. A path with `..` in it is neither: it
+/// is then imported as a key of its own, which costs nothing.
+fn is_default_identity_by(value: &str, source: &ImportSource, rules: Rules) -> bool {
+    let home = source.home.as_deref().map(Path::to_string_lossy);
+    let expanded = expand_tilde(value, home.as_deref(), rules);
+    let ssh_dir = source.ssh_dir.to_string_lossy();
     DEFAULT_IDENTITY_FILES.iter().any(|default| {
-        value == normalize(&format!("~/.ssh/{default}"))
-            || value == normalize(&source.ssh_dir.join(default).to_string_lossy())
+        same_path(value, &format!("~/.ssh/{default}"), rules)
+            || expanded
+                .as_deref()
+                .is_some_and(|value| same_path(value, &format!("{ssh_dir}/{default}"), rules))
     })
 }
 
@@ -672,6 +678,138 @@ mod tests {
             config: PathBuf::from("unused"),
             ssh_dir: crate::sysenv::testing::abs("home/me/.ssh"),
             home: Some(crate::sysenv::testing::abs("home/me")),
+        }
+    }
+
+    /// A source made of text, so that the rules of Windows can be given on any system.
+    fn text_source(ssh_dir: &str, home: Option<&str>) -> ImportSource {
+        ImportSource {
+            config: PathBuf::from("unused"),
+            ssh_dir: PathBuf::from(ssh_dir),
+            home: home.map(PathBuf::from),
+        }
+    }
+
+    #[test]
+    fn under_the_rules_of_windows_a_default_key_is_one_however_it_is_written() {
+        let src = text_source(r"C:\Users\dev\.ssh", Some(r"C:\Users\dev"));
+        for default in [
+            "~/.ssh/id_rsa",
+            r"~\.ssh\id_ed25519",
+            "~/.ssh/ID_ED25519",
+            r"C:\Users\dev\.ssh\id_ed25519",
+            "C:/Users/dev/.ssh/id_ecdsa",
+            r"c:\users\DEV\.ssh\id_rsa",
+            r"\\?\C:\Users\dev\.ssh\id_rsa",
+        ] {
+            assert!(
+                is_default_identity_by(default, &src, Rules::Windows),
+                "{default}"
+            );
+        }
+        for explicit in [
+            "~/keys/work",
+            "~/.ssh/id_rsa.old",
+            r"C:\Users\dev\.ssh\work",
+            r"C:\Users\other\.ssh\id_rsa",
+            r"D:\Users\dev\.ssh\id_rsa",
+            r"\Users\dev\.ssh\id_rsa",
+            "id_rsa",
+        ] {
+            assert!(
+                !is_default_identity_by(explicit, &src, Rules::Windows),
+                "{explicit}"
+            );
+        }
+    }
+
+    #[test]
+    fn under_the_rules_of_the_others_case_and_backslashes_count() {
+        let src = text_source("/home/dev/.ssh", Some("/home/dev"));
+        for default in [
+            "~/.ssh/id_rsa",
+            "/home/dev/.ssh/id_ed25519",
+            "/home/dev//.ssh/./id_ed25519",
+            "~//.ssh/id_rsa",
+        ] {
+            assert!(
+                is_default_identity_by(default, &src, Rules::Unix),
+                "{default}"
+            );
+        }
+        for explicit in [
+            "~/.ssh/ID_RSA",
+            "/HOME/dev/.ssh/id_rsa",
+            // `~\` is a name that starts with a tilde here, not the home.
+            r"~\.ssh\id_rsa",
+            r"/home/dev/.ssh\id_rsa",
+            "/home/other/.ssh/id_rsa",
+            "id_rsa",
+        ] {
+            assert!(
+                !is_default_identity_by(explicit, &src, Rules::Unix),
+                "{explicit}"
+            );
+        }
+        assert!(is_default_identity_by(
+            r"~\.ssh\id_rsa",
+            &src,
+            Rules::Windows
+        ));
+    }
+
+    #[test]
+    fn the_public_entry_uses_the_rules_of_the_system_that_is_running() {
+        let src = text_source("/home/dev/.ssh", Some("/home/dev"));
+        // Case is the difference: a default key under Windows, another file elsewhere.
+        assert_eq!(is_default_identity("~/.ssh/ID_RSA", &src), cfg!(windows));
+        assert_eq!(is_default_identity(r"~\.ssh\id_rsa", &src), cfg!(windows));
+    }
+
+    #[test]
+    fn the_tilde_is_expanded_against_the_home_and_by_the_rules_given() {
+        // The ssh directory is the home itself, so that a default key is `~/id_rsa`
+        // and only the expanded form can say so.
+        let src = text_source("/home/dev", Some("/home/dev"));
+        for rules in [Rules::Unix, Rules::Windows] {
+            assert!(is_default_identity_by("~/id_rsa", &src, rules), "{rules:?}");
+            assert!(
+                is_default_identity_by("~//id_rsa", &src, rules),
+                "{rules:?}"
+            );
+        }
+        // With no home there is nothing to expand it against.
+        let homeless = text_source("/home/dev", None);
+        assert!(!is_default_identity_by("~/id_rsa", &homeless, Rules::Unix));
+        // `~\` is the home only under the rules of Windows.
+        assert!(is_default_identity_by(r"~\id_rsa", &src, Rules::Windows));
+        assert!(!is_default_identity_by(r"~\id_rsa", &src, Rules::Unix));
+    }
+
+    #[test]
+    fn a_default_key_needs_no_home_when_it_is_written_with_the_tilde() {
+        let src = text_source("/home/dev/.ssh", None);
+        for rules in [Rules::Unix, Rules::Windows] {
+            assert!(is_default_identity_by("~/.ssh/id_rsa", &src, rules));
+            // The full path needs no home either: the ssh directory is given.
+            assert!(is_default_identity_by("/home/dev/.ssh/id_rsa", &src, rules));
+            assert!(!is_default_identity_by("~/keys/id_rsa", &src, rules));
+        }
+    }
+
+    #[test]
+    fn a_default_key_written_with_dot_dot_is_not_taken_for_one() {
+        // It is imported as a key of its own, which costs nothing.
+        let src = text_source("/home/dev/.ssh", Some("/home/dev"));
+        for rules in [Rules::Unix, Rules::Windows] {
+            for value in [
+                "~/.ssh/../.ssh/id_rsa",
+                "/home/dev/.ssh/../.ssh/id_rsa",
+                "/home/dev/x/../.ssh/id_rsa",
+                "~/.ssh/id_rsa/..",
+            ] {
+                assert!(!is_default_identity_by(value, &src, rules), "{value}");
+            }
         }
     }
 

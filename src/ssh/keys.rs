@@ -26,6 +26,7 @@ use std::process::{Command, Stdio};
 
 use super::agent::{self, AGENT_TIMEOUT, AgentState};
 use super::diagnose::{is_key_type, is_sha256_fingerprint};
+use crate::pathtext::{Rules, expand_tilde, same_path_resolving_dots};
 
 /// How many key pairs are read. Far more than anyone keeps; a bound so that a
 /// directory with thousands of files cannot make the screen slow.
@@ -188,67 +189,18 @@ pub fn names_this_key(identity_file: &str, ssh_dir: &Path, file_name: &str) -> b
     // Joined here, with `/`, which separates under the rules of every system,
     // and not with `Path::join`, whose separator depends on the system.
     let key = format!("{}/{file_name}", ssh_dir.to_string_lossy());
-    names_key(identity_file, home.as_deref(), &key, cfg!(windows))
+    names_key(identity_file, home.as_deref(), &key, Rules::native())
 }
 
-/// [`names_this_key`] on text, by the rules of Windows or of the others as
-/// `windows` says. Nothing in it depends on the system that runs it (`std::path`
-/// splits by the rules of the running system), so both sets of rules are tested
-/// on every system.
+/// [`names_this_key`] on text, by the given rules (see [`crate::pathtext`]), so
+/// that both sets are tested on every system.
 ///
 /// `home` is what a leading `~` stands for; without it a `~` path matches nothing.
-/// `~user` is an ordinary relative path, and `~\` is a home path only with the
-/// rules of Windows.
-fn names_key(identity_file: &str, home: Option<&str>, key: &str, windows: bool) -> bool {
-    let text = identity_file.trim();
-    let expanded = match text.strip_prefix('~') {
-        None => text.to_string(),
-        Some("") => match home {
-            Some(home) => home.to_string(),
-            None => return false,
-        },
-        Some(rest) => match rest.strip_prefix(|c| c == '/' || (windows && c == '\\')) {
-            Some(tail) => match home {
-                Some(home) => format!("{home}/{tail}"),
-                None => return false,
-            },
-            None => text.to_string(),
-        },
-    };
-    path_parts(&expanded, windows) == path_parts(key, windows)
-}
-
-/// The parts of `path` with `.` dropped and `..` applied, so that two spellings of
-/// one path have the same parts. The first part is `/` for a path that starts at
-/// a root. With `windows`, both `/` and `\` separate, a drive (`C:`) is kept as the
-/// start, and case does not matter; otherwise only `/` separates and `\` is a
-/// letter of a name.
-fn path_parts(path: &str, windows: bool) -> Vec<String> {
-    let text = if windows {
-        path.replace('\\', "/")
-    } else {
-        path.to_string()
-    };
-    let mut parts: Vec<String> = Vec::new();
-    for (at, part) in text.split('/').enumerate() {
-        match part {
-            "" if at == 0 => parts.push("/".to_string()),
-            "" | "." => {}
-            ".." => match parts.last() {
-                // Nothing to go up from, in a path that is not anchored.
-                None => parts.push("..".to_string()),
-                Some(last) if last == ".." => parts.push("..".to_string()),
-                // The root and a drive have no parent: `..` stays where it is.
-                Some(last) if last == "/" || (windows && last.ends_with(':')) => {}
-                Some(_) => {
-                    parts.pop();
-                }
-            },
-            other if windows => parts.push(other.to_lowercase()),
-            other => parts.push(other.to_string()),
-        }
-    }
-    parts
+/// A `..` is applied to the name before it: what is asked is what a person meant,
+/// and a wrong answer only changes whether a question is asked.
+fn names_key(identity_file: &str, home: Option<&str>, key: &str, rules: Rules) -> bool {
+    expand_tilde(identity_file.trim(), home, rules)
+        .is_some_and(|path| same_path_resolving_dots(&path, key, rules))
 }
 
 /// Sets the private key `name` in `ssh_dir` to 0600, so that only its owner can
@@ -1680,7 +1632,10 @@ mod tests {
                 // `..` cannot climb out of a drive.
                 r"C:\..\..\Users\dev\.ssh\id_ed25519",
             ] {
-                assert!(names_key(spelled, home, key, true), "{spelled:?} {key:?}");
+                assert!(
+                    names_key(spelled, home, key, Rules::Windows),
+                    "{spelled:?} {key:?}"
+                );
             }
             for spelled in [
                 "",
@@ -1693,12 +1648,25 @@ mod tests {
                 r"~other\.ssh\id_ed25519",
                 "id_ed25519",
             ] {
-                assert!(!names_key(spelled, home, key, true), "{spelled:?} {key:?}");
+                assert!(
+                    !names_key(spelled, home, key, Rules::Windows),
+                    "{spelled:?} {key:?}"
+                );
             }
         }
         // A `~` with no home to stand for is nothing.
-        assert!(!names_key("~/.ssh/id", None, r"C:\Users\dev\.ssh/id", true));
-        assert!(!names_key("~", None, r"C:\Users\dev\.ssh/id", true));
+        assert!(!names_key(
+            "~/.ssh/id",
+            None,
+            r"C:\Users\dev\.ssh/id",
+            Rules::Windows
+        ));
+        assert!(!names_key(
+            "~",
+            None,
+            r"C:\Users\dev\.ssh/id",
+            Rules::Windows
+        ));
     }
 
     #[test]
@@ -1712,7 +1680,7 @@ mod tests {
             "/home/dev/.ssh/../.ssh/id_ed25519",
             "~/./.ssh//id_ed25519",
         ] {
-            assert!(names_key(spelled, home, key, false), "{spelled:?}");
+            assert!(names_key(spelled, home, key, Rules::Unix), "{spelled:?}");
         }
         for spelled in [
             r"~\.ssh\id_ed25519",
@@ -1720,29 +1688,39 @@ mod tests {
             "/home/dev/.ssh/ID_ED25519",
             "/HOME/dev/.ssh/id_ed25519",
         ] {
-            assert!(!names_key(spelled, home, key, false), "{spelled:?}");
+            assert!(!names_key(spelled, home, key, Rules::Unix), "{spelled:?}");
         }
         // `~\` is a home path only with the rules of Windows: here it is a file called
         // `~\id` in the current folder, and not `id` in the home.
-        assert!(!names_key(r"~\id", home, "/home/dev/id", false));
+        assert!(!names_key(r"~\id", home, "/home/dev/id", Rules::Unix));
         assert!(names_key(
             r"~\id",
             Some("C:/Users/dev"),
             "C:/Users/dev/id",
-            true
+            Rules::Windows
         ));
         // The same name with a backslash in it is its own file.
-        assert!(names_key(r"~/.ssh/a\b", home, r"/home/dev/.ssh/a\b", false));
-        assert!(!names_key(r"~/.ssh/a\b", home, "/home/dev/.ssh/a/b", false));
+        assert!(names_key(
+            r"~/.ssh/a\b",
+            home,
+            r"/home/dev/.ssh/a\b",
+            Rules::Unix
+        ));
+        assert!(!names_key(
+            r"~/.ssh/a\b",
+            home,
+            "/home/dev/.ssh/a/b",
+            Rules::Unix
+        ));
     }
 
     #[test]
     fn a_relative_path_is_never_a_key_of_an_absolute_folder() {
-        for windows in [false, true] {
+        for rules in [Rules::Unix, Rules::Windows] {
             for spelled in ["k", ".ssh/k", "../k", "../.ssh/k", "./.ssh/k"] {
                 assert!(
-                    !names_key(spelled, Some("/home/dev"), "/home/dev/.ssh/k", windows),
-                    "{spelled:?} {windows}"
+                    !names_key(spelled, Some("/home/dev"), "/home/dev/.ssh/k", rules),
+                    "{spelled:?} {rules:?}"
                 );
             }
         }
@@ -1753,8 +1731,11 @@ mod tests {
         // `/srv/keys` says nothing about where `~` is: `~/keys/k` is not its `k`.
         assert!(!names_this_key("~/keys/k", Path::new("/srv/keys"), "k"));
         assert!(names_this_key("/srv/keys/k", Path::new("/srv/keys"), "k"));
-        // No folder, no key: a bare file name is not one.
+        // No folder, no key: a bare file name is not one, and neither is the one
+        // that the empty folder would join to, in the root.
         assert!(!names_this_key("k", Path::new(""), "k"));
+        assert!(!names_this_key("/k", Path::new(""), "k"));
+        assert!(!names_this_key("~/k", Path::new(""), "k"));
     }
 
     #[test]

@@ -14,7 +14,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::domain::Warning;
-use crate::domain::validate::expand_tilde;
+use crate::pathtext::{Rules, expand_tilde, same_path};
 use crate::text::escape_control;
 
 /// How deeply `Include` directives are followed.
@@ -95,24 +95,28 @@ pub fn find_include(
         seen_names: HashSet::new(),
         visited: HashSet::new(),
         warnings: Vec::new(),
-        target: Some(same_file_key(target)),
+        target: Some(resolved(target)),
         found: None,
     };
     scanner.scan_file(config, 0, true)?;
     Ok(scanner.found.unwrap_or(IncludeStatus::Missing))
 }
 
-/// A path as a string that two spellings of the same file agree on: resolved
-/// when the file exists, and otherwise only with the slashes made alike (and, on
-/// Windows, the case).
-fn same_file_key(path: &Path) -> String {
-    let resolved = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let text = resolved.to_string_lossy().replace('\\', "/");
-    if cfg!(windows) {
-        text.to_lowercase()
-    } else {
-        text
-    }
+/// `path` as the disk resolves it when the file exists (links followed, `.` and
+/// `..` applied, on Windows the `\\?\` form), and as it was written when it does not.
+fn resolved(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Whether `included` and `target` are the same file, by [`same_path`] on what the
+/// disk says of them. A path that could not be resolved and still has a `..` in it is
+/// not the same as anything: the words cannot say what it reaches.
+fn same_file(included: &Path, target: &Path, rules: Rules) -> bool {
+    same_path(
+        &resolved(included).to_string_lossy(),
+        &target.to_string_lossy(),
+        rules,
+    )
 }
 
 struct Scanner<'a> {
@@ -122,8 +126,8 @@ struct Scanner<'a> {
     seen_names: HashSet<String>,
     visited: HashSet<PathBuf>,
     warnings: Vec<Warning>,
-    /// The file [`find_include`] looks for, as [`same_file_key`] spells it.
-    target: Option<String>,
+    /// The file [`find_include`] looks for, as the disk resolves it ([`resolved`]).
+    target: Option<PathBuf>,
     /// What was found about it. `Found` is not replaced by `FoundInsideBlock`.
     found: Option<IncludeStatus>,
 }
@@ -194,7 +198,7 @@ impl Scanner<'_> {
         let Some(target) = &self.target else {
             return;
         };
-        if same_file_key(included) != *target {
+        if !same_file(included, target, Rules::native()) {
             return;
         }
         // Applying everywhere wins over applying to one block.
@@ -208,7 +212,9 @@ impl Scanner<'_> {
     /// Resolves an `Include` argument to files. Wildcards are supported in the
     /// last path component only.
     fn expand_include(&mut self, arg: &str) -> Vec<PathBuf> {
-        let mut path = expand_tilde(arg, self.home).unwrap_or_else(|| PathBuf::from(arg));
+        let home = self.home.map(Path::to_string_lossy);
+        let mut path = expand_tilde(arg, home.as_deref(), Rules::native())
+            .map_or_else(|| PathBuf::from(arg), PathBuf::from);
         if !path.is_absolute() {
             path = self.ssh_dir.join(path);
         }
@@ -700,5 +706,158 @@ mod tests {
             &dir.path().join("bifrost_config"),
         );
         assert!(result.is_err());
+    }
+
+    // ---- which file an include reaches: both ways of writing a path ---------------
+
+    #[test]
+    fn under_the_rules_of_windows_the_same_file_is_found_however_it_is_written() {
+        // None of these exist, so the words are all there is to go by.
+        let target = Path::new(r"C:\Users\Dev\.ssh\bifrost_config");
+        for included in [
+            r"C:\Users\Dev\.ssh\bifrost_config",
+            "C:/Users/Dev/.ssh/bifrost_config",
+            r"c:\users\dev\.ssh\BIFROST_CONFIG",
+            r"C:\Users/Dev\.ssh/./bifrost_config",
+            r"\\?\C:\Users\Dev\.ssh\bifrost_config",
+        ] {
+            assert!(
+                same_file(Path::new(included), target, Rules::Windows),
+                "{included}"
+            );
+        }
+        for included in [
+            r"D:\Users\Dev\.ssh\bifrost_config",
+            r"C:\Users\Dev\.ssh\bifrost_config2",
+            r"C:\Users\Dev\bifrost_config",
+            r"\Users\Dev\.ssh\bifrost_config",
+            "bifrost_config",
+        ] {
+            assert!(
+                !same_file(Path::new(included), target, Rules::Windows),
+                "{included}"
+            );
+        }
+    }
+
+    #[test]
+    fn under_the_rules_of_the_others_case_and_backslashes_count() {
+        let target = Path::new("/home/dev/.ssh/bifrost_config");
+        for included in [
+            "/home/dev/.ssh/bifrost_config",
+            "/home/dev//.ssh/./bifrost_config",
+        ] {
+            assert!(
+                same_file(Path::new(included), target, Rules::Unix),
+                "{included}"
+            );
+        }
+        for included in [
+            "/home/dev/.ssh/Bifrost_Config",
+            r"/home/dev/.ssh\bifrost_config",
+            "bifrost_config",
+        ] {
+            assert!(
+                !same_file(Path::new(included), target, Rules::Unix),
+                "{included}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_path_that_cannot_be_resolved_and_has_dot_dot_in_it_is_not_the_file() {
+        // Neither exists, so nothing says what `x/..` is.
+        for rules in [Rules::Unix, Rules::Windows] {
+            let target = Path::new("/home/dev/.ssh/bifrost_config");
+            for included in [
+                "/home/dev/.ssh/x/../bifrost_config",
+                "/home/dev/.ssh/bifrost_config/../bifrost_config",
+            ] {
+                assert!(!same_file(Path::new(included), target, rules), "{included}");
+            }
+            // Nor is it when the target is the one written with it.
+            let with_dots = Path::new("/home/dev/x/../.ssh/bifrost_config");
+            assert!(!same_file(with_dots, with_dots, rules));
+        }
+    }
+
+    #[test]
+    fn a_dot_dot_that_the_disk_can_resolve_is_resolved_by_the_disk() {
+        // It exists, so `sub/..` is what the disk says: the folder itself.
+        let ssh = Ssh::new(&[
+            ("config", "Include sub/../bifrost_config\n"),
+            ("sub/keep", ""),
+            ("bifrost_config", ""),
+        ]);
+        assert_eq!(ssh.check().unwrap(), IncludeStatus::Found);
+        // Not there: only the words are left, and they are not enough.
+        let absent = Ssh::new(&[("config", "Include nowhere/../bifrost_config\n")]);
+        assert_eq!(absent.check().unwrap(), IncludeStatus::Missing);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_include_through_a_link_is_the_file_it_leads_to() {
+        let ssh = Ssh::new(&[
+            ("real/bifrost_config", ""),
+            ("config", "Include link/bifrost_config\n"),
+        ]);
+        std::os::unix::fs::symlink(ssh.dir.path().join("real"), ssh.dir.path().join("link"))
+            .unwrap();
+        let through_link = find_include(
+            &ssh.dir.path().join("config"),
+            ssh.dir.path(),
+            Some(ssh.dir.path()),
+            &ssh.dir.path().join("real/bifrost_config"),
+        )
+        .unwrap();
+        assert_eq!(through_link, IncludeStatus::Found);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_backslash_after_the_tilde_is_not_the_home_here() {
+        // On Unix `~\bifrost_config` is a name in the ssh directory, and not the
+        // exported file that `~/bifrost_config` would be.
+        let ssh = Ssh::new(&[
+            ("bifrost_config", ""),
+            ("config", "Include ~\\bifrost_config\n"),
+        ]);
+        assert_eq!(ssh.check().unwrap(), IncludeStatus::Missing);
+        let slash = Ssh::new(&[
+            ("bifrost_config", ""),
+            ("config", "Include ~/bifrost_config\n"),
+        ]);
+        assert_eq!(slash.check().unwrap(), IncludeStatus::Found);
+    }
+
+    // A disk that tells `A` from `a` (not the default one of macOS or Windows).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_name_in_another_case_is_another_file_on_linux() {
+        let ssh = Ssh::new(&[
+            ("bifrost_config", ""),
+            ("config", "Include BIFROST_CONFIG\n"),
+        ]);
+        assert_eq!(ssh.check().unwrap(), IncludeStatus::Missing);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_target_given_through_a_link_is_the_file_it_leads_to() {
+        let ssh = Ssh::new(&[
+            ("real/bifrost_config", ""),
+            ("config", "Include real/bifrost_config\n"),
+        ]);
+        std::os::unix::fs::symlink(ssh.dir.path().join("real"), ssh.dir.path().join("link"))
+            .unwrap();
+        let status = find_include(
+            &ssh.dir.path().join("config"),
+            ssh.dir.path(),
+            Some(ssh.dir.path()),
+            &ssh.dir.path().join("link/bifrost_config"),
+        )
+        .unwrap();
+        assert_eq!(status, IncludeStatus::Found);
     }
 }
