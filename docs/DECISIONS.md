@@ -725,6 +725,20 @@ stays refused (see above).
   test code stays free of `unsafe`), and stops with a message that says why when
   that is impossible (the binary is a process group leader), instead of timing out on
   a screen of the wrong size.
+- **The harness asks the terminal through the slave side, never the master.** Linux
+  answers a size or a modes ioctl on the master at any time; macOS answers
+  `ENOTTY` ("Inappropriate ioctl for device") while the slave has not been opened
+  (which is how the pty suites first failed there: the size was set right after the
+  pty was created), and, by the same rule, once every descriptor of the slave has
+  been closed, which is when the tests read the modes to see that raw mode was left.
+  So the harness holds one close-on-exec descriptor of the slave for the whole
+  session and uses it to set the size, read the modes and resize. The price is that
+  the master no longer reports end of file when bifrost exits (the harness itself
+  still has the slave), so `wait_until` looks at whether the child has exited while
+  nothing arrives, and gives up 500 ms after it has, with the reason "its output
+  ended". The rule is inferred from the failure seen in CI and from how the
+  platforms differ, not from reading macOS's kernel; whether it fully explains the
+  behaviour is confirmed only by the pty suites passing on macOS in CI.
 - **A test waits for the whole screen it asserts about.** A frame arrives in pieces,
   the list and the keys screen share words in their footers, and a popup's wrapped
   lines are joined, in a flattened screen, with what is drawn beside the popup. So

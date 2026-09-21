@@ -284,6 +284,11 @@ pub struct Session {
     pub signal_note: std::cell::RefCell<String>,
     /// The terminal's modes as the shell would have left them.
     initial_modes: Modes,
+    /// The slave side of the terminal, held by the harness for the whole session,
+    /// which is what every ask of the terminal itself (its size, its modes) goes
+    /// through. See [`Session::start`]. Taken away by [`Session::finish`] once the
+    /// last question has been asked, so that the pty can report its end.
+    terminal: Option<OwnedFd>,
     pub child: Child,
     pub master: File,
     pub chunks: Receiver<Vec<u8>>,
@@ -300,7 +305,6 @@ impl Session {
         fcntl_setfd(&master, FdFlags::CLOEXEC).expect("set close-on-exec");
         grantpt(&master).expect("grant the pty");
         unlockpt(&master).expect("unlock the pty");
-        set_size(&master, height, width);
 
         let slave_path = ptsname(&master, Vec::new()).expect("name the pty");
         let slave: OwnedFd = rustix::fs::open(
@@ -310,8 +314,20 @@ impl Session {
         )
         .expect("open the slave side");
 
+        // The terminal itself (its size, its modes) is asked through the slave, and
+        // never through the master. Linux answers the master as well; macOS does
+        // not: an ioctl on the master that needs the terminal fails with ENOTTY
+        // ("Inappropriate ioctl for device") when the slave has not been opened yet
+        // (setting the size here, first, was what failed), and, going by the same
+        // rule, after every slave descriptor has been closed. So one descriptor of
+        // the slave stays open with the harness, close-on-exec so that bifrost does
+        // not get it, and it is what the size is set and the modes are read from,
+        // at the start, on a resize and after bifrost has gone.
+        let terminal = slave.try_clone().expect("keep the terminal side");
+        set_size(&terminal, height, width);
+
         // Before the child exists: it switches the terminal as soon as it starts.
-        let initial_modes = Modes::of(&master);
+        let initial_modes = Modes::of(&terminal);
 
         let mut command = Command::new(env!("CARGO_BIN_EXE_bifrost"));
         command
@@ -350,6 +366,7 @@ impl Session {
         Session {
             signal_note: std::cell::RefCell::new(String::new()),
             initial_modes,
+            terminal: Some(terminal),
             child,
             master: File::from(master),
             chunks,
@@ -379,7 +396,11 @@ impl Session {
     /// for the driver to look that up in, so the signal is sent here, to the
     /// same processes.
     pub fn resize(&mut self, height: u16, width: u16) {
-        set_size(&self.master, height, width);
+        set_size(
+            self.terminal.as_ref().expect("the terminal is open"),
+            height,
+            width,
+        );
         self.signal_foreground_group(Signal::WINCH);
     }
 
@@ -404,28 +425,54 @@ impl Session {
 
     /// Reads output until `ready` is true of the screen, or fails the test.
     pub fn wait_until(&mut self, what: &str, ready: impl Fn(&Screen) -> bool) {
+        /// Once bifrost has been seen to have exited, this long with nothing more
+        /// from the terminal is the end of what it wrote. What it wrote before it
+        /// exited is already in the pty, and the reader thread takes it out at
+        /// once: this is only for a thread that is slow to be scheduled.
+        const SETTLE: Duration = Duration::from_millis(500);
+        /// How often to look at whether bifrost has exited while nothing arrives.
+        const LOOK: Duration = Duration::from_millis(100);
+
         let started = Instant::now();
         let deadline = started + PATIENCE;
+        let mut quiet_since_exit: Option<Instant> = None;
         loop {
             let screen = self.screen();
             if ready(&screen) {
                 return;
             }
             let left = deadline.saturating_duration_since(Instant::now());
-            match self.chunks.recv_timeout(left) {
-                Ok(chunk) => self.output.extend(chunk),
+            // The terminal does not close when bifrost exits, because this side
+            // holds the slave open (see `start`), so that is noticed by asking the
+            // child, in short waits: a bifrost that died fails the test at once and
+            // not after `PATIENCE`.
+            match self.chunks.recv_timeout(left.min(LOOK)) {
+                Ok(chunk) => {
+                    self.output.extend(chunk);
+                    quiet_since_exit = None;
+                }
                 Err(reason) => {
                     // "Nothing more will come" has two very different causes, and
                     // a failure has to say which: bifrost still running but not
                     // doing what was expected, or bifrost gone.
-                    let ended = match self.child.try_wait() {
+                    let exited = self.child.try_wait();
+                    if matches!(exited, Ok(Some(_))) {
+                        quiet_since_exit.get_or_insert_with(Instant::now);
+                    }
+                    let output_ended = matches!(reason, RecvTimeoutError::Disconnected)
+                        || quiet_since_exit.is_some_and(|since| since.elapsed() >= SETTLE);
+                    if !output_ended && Instant::now() < deadline {
+                        continue;
+                    }
+                    let ended = match exited {
                         Ok(Some(status)) => format!("bifrost had exited ({status:?})"),
                         Ok(None) => "bifrost was still running".to_string(),
                         Err(err) => format!("bifrost's state is unknown ({err})"),
                     };
-                    let cause = match reason {
-                        RecvTimeoutError::Timeout => "timed out",
-                        RecvTimeoutError::Disconnected => "the terminal closed",
+                    let cause = if output_ended {
+                        "its output ended"
+                    } else {
+                        "timed out"
                     };
                     panic!(
                         "gave up waiting for {what} after {:?}: {cause}, and {ended}. The \
@@ -461,10 +508,14 @@ impl Session {
         // The strongest check of "the terminal is as the shell left it": the
         // real modes, read from the terminal itself after bifrost has gone.
         assert_eq!(
-            Modes::of(&self.master),
+            Modes::of(self.terminal.as_ref().expect("the terminal is open")),
             self.initial_modes,
             "the terminal's modes were not restored when bifrost exited"
         );
+        // Nothing more is asked of the terminal. Letting go of the last descriptor
+        // of the slave that this side has is what makes the master report its end
+        // (once bifrost, which has gone, and what it started have let go too).
+        drop(self.terminal.take());
         // The reader thread ends when the pty closes; collect what is left.
         while let Ok(chunk) = self.chunks.recv_timeout(Duration::from_millis(500)) {
             self.output.extend(chunk);
