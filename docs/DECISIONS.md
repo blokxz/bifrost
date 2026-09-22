@@ -867,10 +867,11 @@ stays refused (see above).
 ## Continuous integration and dependencies (Block 7)
 
 - **CI runs on Linux, Windows and macOS**, each with format, clippy (warnings are
-  errors) and the whole test suite. Three more jobs on Ubuntu: the minimum
-  supported Rust version, the static musl target that the Linux release is built
-  for, and the pseudo-terminal tests repeated twenty times. macOS is in the matrix
-  but no one has used Bifrost on a Mac by hand: the README says "covered by CI only".
+  errors) and the whole test suite, pseudo-terminal suites included. Three more
+  jobs on Ubuntu: the minimum supported Rust version, the static musl target that
+  the Linux release is built for, and the pseudo-terminal tests repeated twenty
+  times. macOS is in the matrix but no one has used Bifrost on a Mac by hand: the
+  README says "covered by CI, including the terminal tests".
 - **Every `cargo test` in CI has `--no-fail-fast`.** Cargo stops at the first test
   binary that fails and never runs the ones after it, so a run that showed one
   failure could be hiding a suite that had never run at all (this happened on macOS:
@@ -919,6 +920,41 @@ stays refused (see above).
 - **Release binaries are not stripped.** It would save about 22% (3.2 MB to 2.5 MB)
   and remove the function names from a panic's backtrace, which is what a bug
   report needs.
+- **The release workflow (`.github/workflows/release.yml`) builds every archive
+  natively where a runner for it still exists, one job per platform, instead of
+  cross-compiling from fewer runners.** A native build cannot produce something
+  the target system itself could not have built. Only the last job, which
+  checksums the archives, attests them and opens the draft release, gets
+  `contents: write`; every build job stays at `contents: read`, matching
+  "workflows start with no permissions".
+- **`x86_64-apple-darwin` is cross-built on the `macos-14` (arm64) runner, not
+  built natively.** GitHub retired its Intel macOS runners (`macos-13`) in
+  December 2025; there is no Intel macOS image left to build it on. Its binary
+  is smoke-tested only if it can actually run there, under Rosetta, which the
+  `macos-14` image does not list as installed software: the step tries, and a
+  binary that cannot execute at all is not a workflow failure, but one that runs
+  and prints the wrong version is. This is the one archive of the four that may
+  ship without ever having been run anywhere in CI.
+- **A `verify` job runs before any build, and a `--version` smoke test runs
+  after each one.** `verify` reads Cargo.toml's version and refuses a tag whose
+  release core (the tag without a `-rc.N` or other prerelease suffix) does not
+  match it, and refuses a changelog with no `## [<version>]` section: a
+  `v0.1.0-rc.1` rehearsal is checked against the same `0.1.0` a real tag would
+  need, so the rehearsal proves what a real release needs true, not a looser
+  version of it. Each build then runs the binary it just produced with
+  `--version` and checks it against that same version, catching a build that
+  silently picked up the wrong Cargo.toml (a stale checkout, a bad cache).
+- **The checksums file is verified against its own archives (`sha256sum -c`)
+  before anything is attested or released**, and `gh release create` is given
+  `--verify-tag`, so a checksum written wrong or a tag that only exists locally
+  fails the workflow instead of shipping.
+- **The draft release is made with `gh release create`, not a third-party release
+  action.** `gh` is already on every GitHub-hosted runner and authenticates with
+  the job's own token, so nothing more is added to the supply chain than what
+  `actions/attest-build-provenance` already requires for the attestation itself.
+- **The workflow triggers on any `v*` tag push, not only release tags**, so that
+  `v0.1.0-rc.1` exercises the exact same workflow a real release uses (see
+  `docs/RELEASING.md`, gate 4) without a separate path to keep in sync.
 
 ## Known limitations in 0.1.0
 

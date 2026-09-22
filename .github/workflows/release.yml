@@ -1,0 +1,221 @@
+name: Release
+
+# A push of a version tag (`v0.1.0`, or `v0.1.0-rc.1` to test this workflow
+# itself, see docs/RELEASING.md) checks the tag against the repository, builds
+# one archive per platform, smoke-tests each binary, checksums the archives
+# together, attests where each was built from, and opens a draft release with
+# all of it attached. Nothing here publishes anything by itself: a draft is
+# reviewed and published by hand.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# Nothing is granted by default: every job asks for what it needs.
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Catches a tag pushed against the wrong commit before anything is built:
+  # a version that was never released in the changelog, or a tag that does not
+  # match what Cargo.toml says this commit is. An rc tag (`v0.1.0-rc.1`) is
+  # checked against its release core (`0.1.0`), so the rehearsal in
+  # docs/RELEASING.md uses the exact same changelog section a real release
+  # would need to already have.
+  verify:
+    name: verify the tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 5
+    outputs:
+      tag_version: ${{ steps.tag_version.outputs.tag_version }}
+      core_version: ${{ steps.tag_version.outputs.core_version }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Read the crate version from Cargo.toml
+        id: cargo_version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
+          if [ -z "$version" ]; then
+            echo "Cargo.toml has no version" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Check the tag's release core matches Cargo.toml
+        id: tag_version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          core="${tag%%-*}"
+          cargo_version="${{ steps.cargo_version.outputs.version }}"
+          if [ "$core" != "$cargo_version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME (release core $core) does not match Cargo.toml's version $cargo_version" >&2
+            exit 1
+          fi
+          echo "tag_version=$tag" >> "$GITHUB_OUTPUT"
+          echo "core_version=$core" >> "$GITHUB_OUTPUT"
+
+      - name: Check the changelog has a section for this version
+        run: |
+          version="${{ steps.cargo_version.outputs.version }}"
+          if ! grep -qE "^## \[${version}\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## [${version}]' section" >&2
+            exit 1
+          fi
+
+  # One build per platform, native wherever GitHub still offers a matching
+  # runner. x86_64-apple-darwin no longer does (macos-13, Intel, was retired
+  # in December 2025): that leg is cross-built on the same arm64 runner as
+  # aarch64-apple-darwin. See docs/DECISIONS.md for what that means for its
+  # smoke test.
+  build:
+    name: build ${{ matrix.target }}
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            expect_runnable: true
+          - target: aarch64-apple-darwin
+            os: macos-14
+            expect_runnable: true
+          - target: x86_64-apple-darwin
+            os: macos-14
+            expect_runnable: false
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            expect_runnable: true
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Add the target
+        run: rustup target add ${{ matrix.target }}
+
+      # Release binaries are not stripped: see docs/DECISIONS.md. Nothing here
+      # sets `strip`, so cargo's own default (unstripped) applies.
+      - name: Build
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Smoke test
+        if: matrix.expect_runnable
+        shell: bash
+        run: |
+          bin="target/${{ matrix.target }}/release/bifrost"
+          [ "${{ runner.os }}" = "Windows" ] && bin="$bin.exe"
+          got=$("$bin" --version)
+          want="bifrost ${{ needs.verify.outputs.core_version }}"
+          if [ "$got" != "$want" ]; then
+            echo "::error::$bin --version printed '$got', expected '$want'" >&2
+            exit 1
+          fi
+          echo "$bin --version: $got"
+
+      # A cross-built x86_64 binary on an arm64 runner: it only runs here
+      # under Rosetta, which this image does not list as installed. Tried on
+      # a best-effort basis; a binary that cannot execute at all is not a
+      # workflow failure, but one that runs and prints the wrong thing is.
+      - name: Smoke test (best effort, needs Rosetta)
+        if: "!matrix.expect_runnable"
+        shell: bash
+        run: |
+          bin="target/${{ matrix.target }}/release/bifrost"
+          if ! got=$("$bin" --version 2>&1); then
+            echo "note: could not run $bin on this runner (no Rosetta here); not smoke-tested."
+            echo "note: $got"
+          else
+            want="bifrost ${{ needs.verify.outputs.core_version }}"
+            if [ "$got" != "$want" ]; then
+              echo "::error::$bin --version printed '$got', expected '$want'" >&2
+              exit 1
+            fi
+            echo "$bin --version under Rosetta: $got"
+          fi
+
+      - name: Package (Linux and macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          name="bifrost-${{ needs.verify.outputs.tag_version }}-${{ matrix.target }}"
+          mkdir "$name"
+          cp target/${{ matrix.target }}/release/bifrost "$name/"
+          cp README.md LICENSE-MIT LICENSE-APACHE "$name/"
+          tar -czf "$name.tar.gz" "$name"
+          echo "archive=$name.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "bifrost-${{ needs.verify.outputs.tag_version }}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path $name | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/bifrost.exe" $name/
+          Copy-Item README.md,LICENSE-MIT,LICENSE-APACHE $name/
+          Compress-Archive -Path $name -DestinationPath "$name.zip"
+          "archive=$name.zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.archive }}
+          path: ${{ env.archive }}
+          if-no-files-found: error
+
+  # Everything that needs to see every archive at once, and the only job with
+  # write access: checksums, provenance attestations and the draft release.
+  release:
+    name: draft release
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksum every archive together
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS
+
+      # The file we just wrote checked against the files that produced it: a
+      # cheap catch for a bad encoding or a name mismatch before either ships.
+      - name: Check the checksums file against the archives
+        working-directory: dist
+        run: sha256sum -c SHA256SUMS
+
+      - name: Attest where each archive was built from
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
+
+      - name: Open a draft release with every archive and the checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --draft \
+            --title "Bifrost $GITHUB_REF_NAME" \
+            --generate-notes \
+            dist/*

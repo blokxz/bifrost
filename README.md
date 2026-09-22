@@ -262,7 +262,7 @@ The complete list, with the reasons, is under "Known limitations in 0.1.0" in
 |---|---|
 | Linux | Tested: the automated tests run in CI and were run by hand against a real server. |
 | Windows | Builds and passes the automated tests in CI; manual testing pending. |
-| macOS | Covered by CI only: the test suite runs on macOS in CI, but nobody has used Bifrost by hand on a Mac yet. |
+| macOS | Covered by CI, including the terminal tests: the whole test suite, the pseudo-terminal suites included, runs on macOS in CI, but nobody has used Bifrost by hand on a Mac yet. |
 
 If something misbehaves on your system, please
 [open an issue](https://github.com/blokxz/bifrost/issues) and say which system and

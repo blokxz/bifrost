@@ -278,6 +278,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     every week. Only permissive licenses are allowed.
   - Every action is pinned to a full commit hash with its version in a comment, a
     script fails CI on any that is not, and Dependabot proposes updates weekly.
+  - `.github/workflows/release.yml`: pushing a version tag is checked against
+    Cargo.toml's version and the changelog before anything is built, then builds
+    a binary for each of the four released platforms (Linux musl, macOS on both
+    architectures, Windows msvc; `x86_64-apple-darwin` cross-built, since GitHub
+    retired its Intel macOS runners), smoke-tests each with `--version`, packages
+    it with the README and both licenses, checksums every archive together into
+    `SHA256SUMS` and verifies the file against them, attests where each archive
+    was built from, and opens a draft release with all of it attached. Nothing is
+    published automatically; the draft is reviewed and published by hand.
 
 ### Changed
 
