@@ -744,6 +744,21 @@ stays refused (see above).
   lines are joined, in a flattened screen, with what is drawn beside the popup. So
   waits name something only the finished screen has, and a phrase that wraps is
   checked in fragments that each sit on one line.
+- **A test never depends on how long a path is.** Screens show paths (the keys
+  folder, the ssh config, the store), and a path is one long word that a narrow screen
+  cuts wherever the line ends; the words after it wrap differently with every
+  length. A temporary directory is a few dozen characters on Linux and much longer on
+  macOS, and a real user's home is anywhere in between, so a test that looked for a
+  phrase next to a path passed on one machine and failed on another (a test in
+  `pty.rs` failed on macOS this way; the others were found by trying other lengths).
+  Text that contains a path, or follows one, is matched with `Screen::contains_wrapped`,
+  which ignores the borders and all spaces on both sides, so it does not matter
+  where the lines broke. It is only for pages that are text: something drawn beside
+  the text would be joined into it. `.github/scripts/pty-long-paths.sh` runs the
+  pseudo-terminal suites with the temporary directory at every fourth length from 24
+  to 108 characters, because the failures come in bands of a few lengths, and CI runs
+  it. Six tests in three suites had the problem: three lengths found three of them,
+  and walking every length from 20 to 109 found the other three.
 - **One hostile field at a time.** A test that puts hostile text in every field
   cannot say which one was cleaned; each source is tested alone, and every claim is
   checked by breaking the code it is about and seeing a test fail.
@@ -850,6 +865,13 @@ stays refused (see above).
   supported Rust version, the static musl target that the Linux release is built
   for, and the pseudo-terminal tests repeated twenty times. macOS is in the matrix
   but no one has used Bifrost on a Mac by hand: the README says "covered by CI only".
+- **Every `cargo test` in CI has `--no-fail-fast`.** Cargo stops at the first test
+  binary that fails and never runs the ones after it, so a run that showed one
+  failure could be hiding a suite that had never run at all (this happened on macOS:
+  three of the four pseudo-terminal suites had not run when the first one failed).
+- **The pseudo-terminal suites also run with long temporary paths**, in a job of their
+  own, because Linux CI's short paths cannot show the mistakes that macOS's long ones
+  do (see "A test never depends on how long a path is").
 - **The minimum supported Rust version is 1.88, and CI reads it from `Cargo.toml`.**
   A number that only lives in a document drifts; this job fails the day the code
   needs something newer than the manifest says.

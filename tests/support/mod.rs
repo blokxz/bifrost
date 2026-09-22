@@ -147,6 +147,30 @@ impl Screen {
         self.lines().iter().any(|line| line.contains(needle))
     }
 
+    /// Whether `needle` is on the screen as text, whatever lines it was wrapped over:
+    /// the borders and all spaces, in the screen and in `needle`, do not count.
+    ///
+    /// For text that contains, or comes after, a word whose length the test does
+    /// not control, such as the path of a temporary directory (a few dozen
+    /// characters on Linux and much longer on macOS). A word wider than the line is
+    /// cut between characters, and where the lines after it break depends on how
+    /// long it was, so a phrase that fits on one line with one path is split by
+    /// another. Only for a page that is text: something drawn beside the text
+    /// would be joined into it.
+    pub fn contains_wrapped(&self, needle: &str) -> bool {
+        let squeeze = |text: &str| -> String {
+            text.chars()
+                .filter(|c| !c.is_whitespace() && *c != '│')
+                .collect()
+        };
+        let screen: String = self
+            .rows
+            .iter()
+            .map(|row| squeeze(&row.iter().collect::<String>()))
+            .collect();
+        screen.contains(&squeeze(needle))
+    }
+
     /// Whether `needle` was written to the normal screen (not the alternate one).
     pub fn normal_contains(&self, needle: &str) -> bool {
         self.normal_text.contains(needle)

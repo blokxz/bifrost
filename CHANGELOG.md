@@ -269,8 +269,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The minimum supported Rust version is 1.88, checked by building and running the
     whole test suite with exactly that compiler.
   - CI: macOS joins Linux and Windows; the minimum Rust version, the static musl
-    target and the pseudo-terminal repeats have jobs of their own; and every
-    workflow starts with no permissions and gives each job only `contents: read`.
+    target, the pseudo-terminal repeats and the pseudo-terminal tests with long
+    temporary paths (as on macOS) have jobs of their own; every `cargo test` runs
+    with `--no-fail-fast`; and every workflow starts with no permissions and gives
+    each job only `contents: read`.
   - `cargo deny` (`deny.toml`, `.github/workflows/deny.yml`) checks advisories,
     yanked releases, licenses, bans and sources on every push and pull request, and
     every week. Only permissive licenses are allowed.

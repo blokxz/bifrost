@@ -301,8 +301,10 @@ fn no_keys_and_no_folder_are_said_plainly() {
 
     fs::remove_dir_all(home.file("")).unwrap();
     let (_dir, mut session) = start(&fake, &home);
+    // The sentence follows the folder's path, so where it wraps depends on the
+    // path's length.
     open_keys(&mut session, |s| {
-        s.contains("does not exist, so there are no keys yet")
+        s.contains_wrapped("does not exist, so there are no keys yet")
     });
     quit(session);
 }
@@ -1453,7 +1455,9 @@ fn with_no_keys_the_list_says_what_to_do_and_typing_still_works() {
         text.contains("(none)")
             && text.contains("Another file")
             && text.contains("There are no key pairs in")
-            && text.contains("then g)")
+            // After the folder's path, in a box: the path's length decides where
+            // the lines break, and the box's borders land between them.
+            && s.contains_wrapped("then g)")
     });
     session.send(b"\x1b");
     session.wait_until("the form again", |s| !s.contains("Key file"));

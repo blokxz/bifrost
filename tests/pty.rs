@@ -28,7 +28,8 @@ fn opens_explains_a_broken_store_navigates_and_restores_the_terminal() {
         s.alt_screen
             && s.contains("Saved hosts: unknown")
             && s.contains("Error: Bifrost could not read your saved hosts.")
-            && s.contains("hosts.toml.bak")
+            // The path of the backup is one long word, cut wherever the line ends.
+            && s.contains_wrapped("hosts.toml.bak")
     });
     assert!(
         !session.screen().cursor_visible,

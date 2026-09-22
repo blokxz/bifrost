@@ -164,7 +164,6 @@ fn i_shows_what_importing_would_do_and_saves_nothing_until_y() {
         "Warnings (2)",
         "Warning: Host 'jumpy': its ProxyCommand was dropped because Bifrost does not support",
         "Warning: Host 'app': the identity file",
-        "id_app' does not exist.",
     ] {
         assert!(
             text.contains(expected),
@@ -172,6 +171,13 @@ fn i_shows_what_importing_would_do_and_saves_nothing_until_y() {
             session.screen().text()
         );
     }
+    // The end of the identity file's path, which is one long word and is cut
+    // wherever the line ends.
+    assert!(
+        session.screen().contains_wrapped("id_app' does not exist."),
+        "{}",
+        session.screen().text()
+    );
     // Looking saved nothing, and ssh was asked about each new host and no other.
     assert_eq!(fs::read(config.join(HOSTS_FILE)).unwrap(), before);
     assert_eq!(saved_hosts(&config), ["db", "web"]);
@@ -259,7 +265,8 @@ fn a_missing_ssh_config_is_said_plainly_and_nothing_can_be_imported() {
     session.wait_until("the explanation", |s| {
         let text = said(s);
         text.contains("There is no ssh config at")
-            && text.contains(".ssh/config, so there is nothing to import.")
+            // Starts inside the path, which is cut wherever the line ends.
+            && s.contains_wrapped(".ssh/config, so there is nothing to import.")
     });
     assert!(!session.screen().contains("Press y"));
     session.send(b"y");
@@ -408,8 +415,9 @@ fn e_asks_first_and_then_writes_the_file_private_and_never_touches_the_ssh_confi
     session.send(b"e");
     session.wait_until("the plan", |s| {
         let text = said(s);
+        // The path is one long word, cut wherever the line ends.
         text.contains("Write 2 hosts to")
-            && text.contains(".ssh/bifrost_config.")
+            && s.contains_wrapped(".ssh/bifrost_config.")
             && text.contains("The file does not exist yet, so it will be created.")
             && text.contains("Press y to write it, or n to cancel.")
     });

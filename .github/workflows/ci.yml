@@ -36,8 +36,10 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
 
+      # `--no-fail-fast`: cargo stops at the first test binary that fails, and the
+      # ones after it never run, so one run would show only part of what is broken.
       - name: Test
-        run: cargo test --locked
+        run: cargo test --locked --no-fail-fast
 
   # The oldest Rust that Bifrost says it supports (`rust-version` in Cargo.toml),
   # built and tested with exactly that compiler. The number is read from the
@@ -73,7 +75,7 @@ jobs:
           MSRV: ${{ steps.msrv.outputs.version }}
         run: |
           cargo "+$MSRV" --version
-          cargo "+$MSRV" test --locked
+          cargo "+$MSRV" test --locked --no-fail-fast
 
   # The Linux release is a static musl binary, so that is what is tested here too:
   # a test suite that passes with glibc says nothing about a different libc.
@@ -92,7 +94,7 @@ jobs:
         run: rustup target add x86_64-unknown-linux-musl
 
       - name: Test
-        run: cargo test --locked --target x86_64-unknown-linux-musl
+        run: cargo test --locked --no-fail-fast --target x86_64-unknown-linux-musl
 
   # The pseudo-terminal tests race real processes and signals, so one green run
   # proves little. This repeats them to catch flakiness. A separate job, so the
@@ -115,9 +117,26 @@ jobs:
         run: |
           for run in $(seq 1 20); do
             echo "::group::run $run of 20"
-            cargo test --locked --test pty --test pty_connect --test pty_keys --test pty_sshconfig --test import_timeout --test connect --test cli_connect
+            cargo test --locked --no-fail-fast --test pty --test pty_connect --test pty_keys --test pty_sshconfig --test import_timeout --test connect --test cli_connect
             echo "::endgroup::"
           done
+
+  # The pseudo-terminal tests with the temporary directory at many path lengths.
+  # macOS temporary paths are much longer than Linux's, and a screen that shows a
+  # path wraps differently with each length; see the script for what that broke.
+  pty-paths:
+    name: pty tests with long paths
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Run the pty suites at lengths from 24 to 108
+        run: sh .github/scripts/pty-long-paths.sh
 
   # Every action is pinned to a full commit hash, with the version in a comment.
   # See the script for why.
