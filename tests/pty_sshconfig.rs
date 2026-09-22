@@ -437,22 +437,18 @@ fn e_asks_first_and_then_writes_the_file_private_and_never_touches_the_ssh_confi
     session.send(b"e");
     session.wait_until("the plan again", |s| s.contains("Press y to write it"));
     session.send(b"y");
-    session.wait_until("the include line", |s| {
+    // Everything asserted is waited for, the line on a line of its own
+    // included: the frame arrives in pieces, and until the last of it is here
+    // the tail of the previous page is still beside this one.
+    session.wait_until("the include line, alone on its line", |s| {
         let text = said(s);
         text.contains("Wrote 2 hosts to")
             && text.contains("add this line at the very top of")
-            && text.contains(INCLUDE_LINE)
+            && text.contains("named config, not in bifrost_config")
+            && s.lines().iter().any(|line| {
+                line.trim_matches(|c: char| c == '│' || c.is_whitespace()) == INCLUDE_LINE
+            })
     });
-    // The line is on a line of its own, exactly.
-    assert!(
-        session
-            .screen()
-            .lines()
-            .iter()
-            .any(|line| line.trim_matches(|c: char| c == '│' || c.is_whitespace()) == INCLUDE_LINE),
-        "{}",
-        session.screen().text()
-    );
 
     let exported = home.read("bifrost_config").unwrap();
     assert!(exported.starts_with(GENERATED_HEADER), "{exported}");
@@ -504,6 +500,32 @@ fn an_include_after_a_host_line_is_a_warning() {
     session.wait_until("the warning", |s| {
         said(s).contains("but after a Host or Match line")
             && said(s).contains("Move this line to the very top")
+    });
+    quit(session);
+}
+
+#[test]
+fn a_config_whose_includes_loop_is_a_warning_and_not_a_clean_bill_of_health() {
+    // A file of the user's own that includes itself: ssh refuses to start with
+    // "Too many recursive configuration includes", however right the rest of
+    // the config is. The include of bifrost_config is found, which on its own
+    // used to be reported as "nothing more to do".
+    //
+    // (The same line inside bifrost_config heals itself: the export rewrites
+    // that file before this check runs.)
+    let home = Home::new(Some(&format!(
+        "{INCLUDE_LINE}\nInclude extra.conf\nHost home\n  User me\n"
+    )));
+    fs::write(home.file("extra.conf"), "Include extra.conf\nHost extra\n").unwrap();
+    let fake = FakeSsh::new("exit 0");
+    let (_dir, _config, mut session) = start(&fake, &home);
+    open_ssh_config(&mut session);
+    session.send(b"e");
+    session.wait_until("the plan", |s| s.contains("Press y to write it"));
+    session.send(b"y");
+    session.wait_until("the loop warning", |s| {
+        said(s).contains("includes itself")
+            && said(s).contains("Too many recursive configuration includes")
     });
     quit(session);
 }

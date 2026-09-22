@@ -303,6 +303,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A connection that Windows' ssh drops during the handshake is explained as an
+  interrupted connection, not as an unknown failure.** Windows OpenSSH prints
+  "Unknown error" where Linux and macOS name the reset or the close, so three
+  real failures reached the generic screen. The stage ssh names
+  (`kex_exchange_identification`, `banner exchange`, `ssh_dispatch_run_fatal`)
+  now decides, never the words after it; the lines Windows really printed are
+  test fixtures.
+- **The exported file no longer invites the user to break their ssh setup.** Its
+  header showed the `Include` line commented out; uncommenting it there makes
+  `bifrost_config` include itself, and ssh then refuses to start with "Too many
+  recursive configuration includes". The comment now says plainly that the line
+  belongs in `~/.ssh/config` and must never be uncommented in that file.
+- **The export screen says which file the `Include` line goes in.** Both files
+  live in `~/.ssh` and are easy to mix up, so it now names `config` and says it
+  is not `bifrost_config`. On Windows it also offers a PowerShell command that
+  adds the line without replacing an existing config and writes ASCII, because
+  PowerShell's own `>` and `echo` write UTF-16, which ssh cannot read.
+- **A config whose `Include`s loop is reported instead of passing as healthy.**
+  Bifrost's scan survives a loop, so a config that ssh itself refuses could be
+  reported as "already includes it, nothing more to do". A file that includes
+  itself, directly or through other files, is now a warning on the export
+  screen whatever the include status is, and on the import preview too.
 - **Input typed during a handover (a connection, sending a key, generating a
   key, adding a key) that ssh or the tool never read is discarded reliably,
   including on macOS.** Taking the terminal back only drained whatever

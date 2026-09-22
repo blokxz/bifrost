@@ -363,58 +363,98 @@ fn export_done(
     header.push(Line::raw(""));
 
     // The one line to add, shown on a line of its own so that selecting it with
-    // the mouse copies it and nothing else.
+    // the mouse copies it and nothing else. On Windows a command that adds it
+    // follows, for the same reason: on its own line, ready to copy.
     let add = |lead: &str, width: usize, cleaner: &mut Cleaner| {
         let mut lines = text(lead, width, cleaner);
         lines.push(Line::raw(""));
         lines.push(Line::raw(INCLUDE_LINE));
+        if cfg!(windows) {
+            lines.push(Line::raw(""));
+            lines.extend(text(
+                "Or run this in PowerShell. It adds the line to the end of config, creating \
+                 the file if it is not there, and never replaces what is already in it. \
+                 -Encoding ascii matters: PowerShell's own > and echo write UTF-16, which \
+                 ssh cannot read.",
+                width,
+                cleaner,
+            ));
+            lines.push(Line::raw(""));
+            lines.push(Line::raw(format!(
+                "Add-Content -Path $HOME\\.ssh\\config -Value \"{INCLUDE_LINE}\" -Encoding ascii"
+            )));
+        }
         lines
     };
     let mut body = Vec::new();
     match &done.include {
-        Ok(IncludeStatus::Found) => body.extend(text(
-            &format!("{config} already includes it, so ssh uses these hosts. Nothing more to do."),
-            width,
-            cleaner,
-        )),
-        Ok(IncludeStatus::FoundInsideBlock) => {
-            body.extend(labeled_lines(
-                "Warning:",
-                theme.warning,
-                &format!(
-                    "{config} includes it, but after a Host or Match line, so ssh only uses it \
-                     for that block. Move this line to the very top of the file, before \
-                     anything else:"
-                ),
-                width,
-                cleaner,
-            ));
-            body.push(Line::raw(""));
-            body.push(Line::raw(INCLUDE_LINE));
+        Ok(check) => {
+            match check.status {
+                IncludeStatus::Found => body.extend(text(
+                    &format!(
+                        "{config} already includes it, so ssh uses these hosts. Nothing more \
+                         to do."
+                    ),
+                    width,
+                    cleaner,
+                )),
+                IncludeStatus::FoundInsideBlock => {
+                    body.extend(labeled_lines(
+                        "Warning:",
+                        theme.warning,
+                        &format!(
+                            "{config} includes it, but after a Host or Match line, so ssh only \
+                             uses it for that block. Move this line to the very top of the \
+                             file, before anything else:"
+                        ),
+                        width,
+                        cleaner,
+                    ));
+                    body.push(Line::raw(""));
+                    body.push(Line::raw(INCLUDE_LINE));
+                }
+                IncludeStatus::Missing => body.extend(add(
+                    &format!(
+                        "The line goes in the file named config, not in bifrost_config, which \
+                         is the one just written. To use these hosts with ssh, add this line \
+                         at the very top of {config}, before any Host or Match line. Bifrost \
+                         does not edit that file:"
+                    ),
+                    width,
+                    cleaner,
+                )),
+                IncludeStatus::NoConfigFile => body.extend(add(
+                    &format!(
+                        "You have no ssh config yet. The line goes in a file named config, not \
+                         in bifrost_config, which is the one just written. To use these hosts \
+                         with ssh, create {config} with this as its first line. Bifrost does \
+                         not create that file:"
+                    ),
+                    width,
+                    cleaner,
+                )),
+            }
+            // A config that ssh itself will refuse: said whatever the status is,
+            // because "it includes the file" is no comfort if ssh stops at it.
+            for warning in &check.warnings {
+                body.push(Line::raw(""));
+                body.extend(labeled_lines(
+                    "Warning:",
+                    theme.warning,
+                    warning.message(),
+                    width,
+                    cleaner,
+                ));
+            }
         }
-        Ok(IncludeStatus::Missing) => body.extend(add(
-            &format!(
-                "To use these hosts with ssh, add this line at the very top of {config}, \
-                 before any Host or Match line. Bifrost does not edit that file:"
-            ),
-            width,
-            cleaner,
-        )),
-        Ok(IncludeStatus::NoConfigFile) => body.extend(add(
-            &format!(
-                "You have no ssh config yet. To use these hosts with ssh, create {config} \
-                 with this as its first line. Bifrost does not create that file:"
-            ),
-            width,
-            cleaner,
-        )),
         Err(why) => {
             body.extend(labeled_lines(
                 "Warning:",
                 theme.warning,
                 &format!(
                     "Bifrost could not tell whether your ssh config includes the file: {why} \
-                     If it does not, add this line at the very top of {config}:"
+                     If it does not, add this line at the very top of {config}, the file named \
+                     config and not bifrost_config:"
                 ),
                 width,
                 cleaner,
@@ -436,6 +476,7 @@ mod tests {
     use super::*;
     use crate::domain::{Hosts, Warning};
     use crate::ssh::import::SkippedHost;
+    use crate::ssh::scan::IncludeCheck;
     use crate::tui::effects::{ExportDone, ExportPlan, ImportPreview, Request, Response};
     use crate::tui::wrap::display_width;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -737,6 +778,13 @@ mod tests {
     }
 
     fn with_done(include: Result<IncludeStatus, String>) -> App {
+        with_done_check(include.map(|status| IncludeCheck {
+            status,
+            warnings: Vec::new(),
+        }))
+    }
+
+    fn with_done_check(include: Result<IncludeCheck, String>) -> App {
         let mut app = with_plan(TargetState::Missing, 2);
         app.handle_key(key('y'));
         let request = app.take_request().unwrap();
@@ -748,6 +796,18 @@ mod tests {
             })),
         );
         app
+    }
+
+    /// An include check that found `status` and warns about a loop.
+    fn looping(status: IncludeStatus) -> Result<IncludeCheck, String> {
+        Ok(IncludeCheck {
+            status,
+            warnings: vec![Warning::new(
+                "/home/dev/.ssh/bifrost_config includes itself, directly or through other \
+                 included files. ssh will refuse to start with \"Too many recursive \
+                 configuration includes\" until the loop is broken.",
+            )],
+        })
     }
 
     /// How many screen lines are exactly the include line, and nothing else.
@@ -832,6 +892,95 @@ mod tests {
             "{text}"
         );
         assert_eq!(include_lines(&text), 1, "{text}");
+    }
+
+    #[test]
+    fn the_advice_names_the_file_the_line_goes_in_and_the_one_it_does_not() {
+        // Both files live in ~/.ssh and their names look alike. Saying only the
+        // path was not enough: a tester put the line in bifrost_config, which
+        // then included itself and stopped ssh from starting.
+        for include in [Ok(IncludeStatus::Missing), Ok(IncludeStatus::NoConfigFile)] {
+            let mut app = with_done(include.clone());
+            let words = flat(&text_of(&mut app, 100, 30));
+            assert!(
+                words.contains("named config, not in bifrost_config"),
+                "{include:?}: {words}"
+            );
+            assert!(
+                words.contains("which is the one just written"),
+                "{include:?}: {words}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn on_windows_a_powershell_command_that_adds_the_line_is_offered() {
+        // PowerShell's own `>` and `echo` write UTF-16, which ssh cannot read,
+        // and a tester has no way to know that from the line alone.
+        for include in [Ok(IncludeStatus::Missing), Ok(IncludeStatus::NoConfigFile)] {
+            let mut app = with_done(include.clone());
+            let text = text_of(&mut app, 120, 36);
+            let words = flat(&text);
+            assert!(
+                words.contains(
+                    "Add-Content -Path $HOME\\.ssh\\config -Value \
+                     \"Include ~/.ssh/bifrost_config\" -Encoding ascii"
+                ),
+                "{include:?}: {text}"
+            );
+            assert!(
+                words.contains("never replaces what is already in it"),
+                "{text}"
+            );
+            assert!(
+                words.contains("PowerShell's own > and echo write UTF-16"),
+                "{text}"
+            );
+        }
+        // Not where the line is already there, or has only to be moved: adding
+        // it again at the end would not fix either.
+        for include in [
+            Ok(IncludeStatus::Found),
+            Ok(IncludeStatus::FoundInsideBlock),
+        ] {
+            let mut app = with_done(include.clone());
+            assert!(
+                !text_of(&mut app, 120, 36).contains("Add-Content"),
+                "{include:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_config_that_includes_itself_is_a_warning_even_when_the_file_is_included() {
+        // ssh refuses to start on a loop, so "it is included, nothing to do"
+        // would be wrong however the status reads.
+        for status in [
+            IncludeStatus::Found,
+            IncludeStatus::FoundInsideBlock,
+            IncludeStatus::Missing,
+            IncludeStatus::NoConfigFile,
+        ] {
+            let mut app = with_done_check(looping(status));
+            let words = flat(&text_of(&mut app, 120, 36));
+            assert!(
+                words.contains("Warning:") && words.contains("includes itself"),
+                "{status:?}: {words}"
+            );
+            assert!(
+                words.contains("Too many recursive configuration includes"),
+                "{status:?}: {words}"
+            );
+        }
+    }
+
+    #[test]
+    fn without_a_loop_nothing_warns_about_one() {
+        let mut app = with_done(Ok(IncludeStatus::Found));
+        let words = flat(&text_of(&mut app, 120, 36));
+        assert!(!words.contains("includes itself"), "{words}");
+        assert!(!words.contains("Warning:"), "{words}");
     }
 
     #[test]

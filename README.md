@@ -261,7 +261,7 @@ The complete list, with the reasons, is under "Known limitations in 0.1.0" in
 | System | Status |
 |---|---|
 | Linux | Tested: the automated tests run in CI and were run by hand against a real server. |
-| Windows | Builds and passes the automated tests in CI; manual testing pending. |
+| Windows | Tested by hand on Windows, with the real OpenSSH client, as well as in CI. |
 | macOS | Covered by CI, including the terminal tests: the whole test suite, the pseudo-terminal suites included, runs on macOS in CI, but nobody has used Bifrost by hand on a Mac yet. |
 
 If something misbehaves on your system, please

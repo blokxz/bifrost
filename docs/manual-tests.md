@@ -272,3 +272,46 @@ a Windows machine, with the real `ssh.exe` (OpenSSH Client installed):
       host's identity file, save, and edit the host again. Look for: the list opens
       on that key's entry, and after sending that key to the host Bifrost does not
       ask whether to use it, because the host already does.
+
+### Results, 2026-09-22
+
+Run from the release archive of the `v0.1.0-rc.1` tag, with Windows OpenSSH
+9.5p2, against the Incus container.
+
+Everything in the steps above worked: the handover and the terminal restore,
+the changed-host-key screen with `r` and `known_hosts.old`, generating a key,
+sending a key with the server's password prompt, the export, and deleting a key
+with the "used by" warning.
+
+Answers to the steps that were open questions:
+
+- **Step 15, the Include line.** `Include ~/.ssh/bifrost_config` is read by
+  OpenSSH for Windows as it is written. Neither the relative form nor a quoted
+  absolute path is needed, so the decision to use `~` and `/` everywhere holds.
+
+Four things were found, and all four are fixed:
+
+1. **Windows says "Unknown error" where Linux names the reason.** Three of the
+   real-server failures came back as "the connection failed" (unrecognized)
+   instead of an interrupted connection, because `ssh.exe` prints
+   `kex_exchange_identification: read: Unknown error`,
+   `banner exchange: ... : Unknown error` and
+   `ssh_dispatch_run_fatal: ... : Unknown error` where other systems name the
+   reset or the close. The classifier now anchors on the stage ssh names, never
+   on "Unknown error" alone; the three captured lines are unit-test fixtures.
+2. **The commented Include line inside the exported file was a trap.** It was
+   uncommented there, which made `bifrost_config` include itself and `ssh`
+   refuse to start with "Too many recursive configuration includes". The
+   comment around it now says plainly that the line belongs in `~/.ssh/config`
+   and must never be uncommented in that file.
+3. **The export screen did not say which file the line goes in.** Both files
+   live in `~/.ssh` and their names look alike. It now names `config` and says
+   it is not `bifrost_config`, and on Windows it also offers an `Add-Content`
+   command that writes ASCII (PowerShell's `>` and `echo` write UTF-16, which
+   `ssh.exe` cannot read) and appends instead of replacing.
+4. **A config whose includes loop was reported as healthy.** The scan survives
+   a loop, so a config that `ssh` itself refuses could still be reported as
+   "already includes it, nothing more to do". A loop is now a warning on the
+   export screen, whatever the include status is. (The same line inside
+   `bifrost_config` heals itself: the export rewrites that file before the
+   check runs.)

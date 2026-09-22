@@ -280,6 +280,19 @@ fn classify_ssh_failure(stderr: &[u8]) -> Verdict {
     Verdict::Failed(kind_of(text))
 }
 
+/// ssh's own names for the stages before login where a dropped connection is
+/// reported. Windows OpenSSH has no better text for the errno than "Unknown
+/// error" here (its C library does not name the reason the way Linux's and
+/// macOS's do), so unlike them this cannot be told apart by the reason that
+/// follows; the stage name is what says this is a broken connection, not
+/// whatever comes after the colon. None of ssh's other failures at this point
+/// (a bad host name, a refused port, a timeout) use these names.
+const CONNECTION_DROPPED_STAGES: &[&str] = &[
+    "kex_exchange_identification:",
+    "banner exchange:",
+    "ssh_dispatch_run_fatal:",
+];
+
 /// Matches the message ssh ended with. Most specific first.
 fn kind_of(text: &str) -> FailureKind {
     let has = |needles: &[&str]| needles.iter().any(|needle| text.contains(needle));
@@ -305,7 +318,10 @@ fn kind_of(text: &str) -> FailureKind {
         "Connection reset by",
         "Connection closed by",
         "not responding",
-    ]) {
+    ]) || CONNECTION_DROPPED_STAGES
+        .iter()
+        .any(|stage| text.starts_with(stage))
+    {
         FailureKind::ConnectionLost
     } else {
         FailureKind::Unrecognized
@@ -514,6 +530,28 @@ mod tests {
             "Connection reset by 127.0.0.1 port 2299\r\n",
             "kex_exchange_identification: read: Connection reset by peer\r\n\
              Connection reset by 127.0.0.1 port 2299\r\n",
+        ] {
+            assert_eq!(
+                ssh_failure(stderr),
+                failed(FailureKind::ConnectionLost),
+                "{stderr:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_says_unknown_error_where_others_name_the_reason_but_the_stage_still_tells_it_apart()
+    {
+        // Captured from Windows OpenSSH 9.5p2 against a server that dropped the
+        // connection during the handshake: the reset or closed reason that Linux
+        // and macOS print becomes a bare "Unknown error" here. Only the stage
+        // name (before the colon) says this is a lost connection.
+        for stderr in [
+            "kex_exchange_identification: read: Unknown error\r\n\
+             banner exchange: Connection to 127.0.0.1 port 60022: Unknown error\r\n",
+            "kex_exchange_identification: read: Unknown error\r\n\
+             banner exchange: Connection to 127.0.0.1 port 60021: Unknown error\r\n",
+            "ssh_dispatch_run_fatal: Connection to 127.0.0.1 port 60023: Unknown error\r\n",
         ] {
             assert_eq!(
                 ssh_failure(stderr),

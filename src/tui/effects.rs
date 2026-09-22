@@ -30,7 +30,7 @@ use crate::ssh::keys::{
     Deleted, KeysSnapshot, SystemKeyTools, WithoutAgent, add_args, delete_key, ensure_name_is_free,
     fix_permissions, generate_args, load_keys,
 };
-use crate::ssh::scan::{IncludeStatus, find_include};
+use crate::ssh::scan::{IncludeCheck, find_include};
 use crate::store::fsutil::ensure_private_dir;
 
 const NO_HOME: &str = "Could not find your home directory, so the ssh folder cannot be located.";
@@ -110,7 +110,7 @@ pub struct ExportPlan {
 pub struct ExportDone {
     pub target: PathBuf,
     /// Whether `~/.ssh/config` includes the file, or why that could not be told.
-    pub include: Result<IncludeStatus, String>,
+    pub include: Result<IncludeCheck, String>,
 }
 
 impl Request {
@@ -399,6 +399,7 @@ mod tests {
     use super::*;
     use crate::domain::{Host, Hosts};
     use crate::ssh::command::build_args;
+    use crate::ssh::scan::IncludeStatus;
 
     fn connect_request() -> ConnectRequest {
         let host = Host::new("web", "web.example.com");
@@ -577,7 +578,10 @@ mod tests {
                     .unwrap()
                     .contains(INCLUDE_LINE)
             );
-            assert_eq!(done.include, Ok(IncludeStatus::Missing));
+            assert_eq!(
+                done.include.map(|check| check.status),
+                Ok(IncludeStatus::Missing)
+            );
         });
     }
 
@@ -599,7 +603,11 @@ mod tests {
             let files: Vec<(&str, &str)> = config.map(|c| ("config", c)).into_iter().collect();
             with_system(Err(SshNotFound), &files, |system, _| {
                 let done = system.export(&two_hosts()).unwrap();
-                assert_eq!(done.include, Ok(expected), "{config:?}");
+                assert_eq!(
+                    done.include.map(|check| check.status),
+                    Ok(expected),
+                    "{config:?}"
+                );
             });
         }
     }

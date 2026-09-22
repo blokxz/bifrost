@@ -82,7 +82,15 @@ fn scanner_follows_includes_and_survives_include_loops() {
             "last"
         ]
     );
-    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    // The fixture includes itself, which the scan survives and reports: ssh
+    // itself refuses such a file with "Too many recursive configuration
+    // includes", so it is not something to pass over in silence.
+    assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+    assert!(
+        report.warnings[0].message().contains("includes itself"),
+        "{:?}",
+        report.warnings
+    );
 }
 
 // ---- import ----------------------------------------------------------------

@@ -6509,7 +6509,11 @@ mod tests {
         assert!(stage_is(&app, "menu"));
     }
 
-    fn exported(app: &mut App, include: Result<IncludeStatus, String>) {
+    fn exported(app: &mut App, status: Result<IncludeStatus, String>) {
+        let include = status.map(|status| crate::ssh::scan::IncludeCheck {
+            status,
+            warnings: Vec::new(),
+        });
         app.handle_key(ch('y'));
         let request = app.take_request().unwrap();
         app.handle_response(

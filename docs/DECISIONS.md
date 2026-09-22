@@ -108,6 +108,29 @@ settled: reopen one only with a clear new reason.
   never edits `~/.ssh/config`, and refuses to replace a file without the
   header.** The user's own config is theirs; they add the `Include` line
   themselves. Notes, tags and favorites are never exported.
+- **The `Include` line shown in the exported file's header says, right where it
+  is shown, that it belongs in `~/.ssh/config` and must never be uncommented
+  where it stands.** A tester uncommented it in `bifrost_config`, which made
+  that file include itself; ssh then refuses to start at all with "Too many
+  recursive configuration includes". The line is still shown there, because it
+  is the thing to copy, but never without the warning beside it.
+- **The export screen names the file the line goes in, and says which file it is
+  not.** `config` and `bifrost_config` live in the same folder and read alike,
+  and the path alone was not enough to keep them apart.
+- **On Windows the export screen also offers a PowerShell command
+  (`Add-Content ... -Encoding ascii`).** `-Encoding ascii` is the point:
+  PowerShell's own `>` and `echo` write UTF-16, which ssh cannot read, so the
+  obvious way to add the line silently produces a config ssh ignores.
+  `Add-Content` appends and creates, so it can never replace a config that is
+  already there. It is offered only where the line is missing entirely: where it
+  merely sits in the wrong place, appending another one would not fix it.
+- **An `Include` loop is a warning, not something to pass over.** Bifrost's scan
+  survives a file that includes itself (it does not follow the loop again), but
+  ssh does not: it refuses the whole config. A scan that reports "the file is
+  included, nothing more to do" would then describe a setup that does not work,
+  so a loop is reported whatever the include status is. A file legitimately
+  reached from two branches is not a loop: what counts is a file that is still
+  being expanded when it is reached again.
 - **Exported values are quoted and escaped (`\`, `"`, `%`).** A value cannot
   inject a directive, even if validation were bypassed; the escaping keeps its
   own runtime check.
@@ -341,6 +364,16 @@ settled: reopen one only with a clear new reason.
 - **A line with a control or bidirectional character is never taken for ssh's
   own.** ssh's messages have none. Such a line is not matched, so the failure is
   "not recognized" and the raw output is there to read.
+- **A connection dropped during the handshake is recognized by the stage ssh
+  names, not by the reason it gives for it.** Windows OpenSSH prints "Unknown
+  error" where Linux and macOS name the reset or the close, so matching the
+  reason left three real failures unexplained there. `kex_exchange_identification:`,
+  `banner exchange:` and `ssh_dispatch_run_fatal:` at the start of the line are
+  matched instead: they are ssh's own stage names, they happen before login, and
+  none of ssh's other failures at that point (a bad name, a refused port, a
+  timeout) use them. "Unknown error" on its own is never matched; it says
+  nothing about what failed. The Windows lines are test fixtures, captured from
+  OpenSSH 9.5p2.
 - **A changed host key needs ssh's own last line and its warning.** The last line
   must be `Host key verification failed.` and the warning `REMOTE HOST
   IDENTIFICATION HAS CHANGED!` must be before it. Without the warning it is a
@@ -982,8 +1015,9 @@ stays refused (see above).
   `UserKnownHostsFile` in ssh's config) is shown, and the user removes it by
   hand. The file is compared by the rules of the system (on Windows: either slash,
   any case, a drive or a network path, the `\\?\` prefix ignored), and those rules
-  are tested on every system; what path ssh.exe really prints has not been verified
-  there. A printed path with `..` in it is never the default file.
+  are tested on every system, and the path ssh.exe really prints was matched by
+  hand on Windows (the removal was offered, ran, and left `known_hosts.old`).
+  A printed path with `..` in it is never the default file.
 - **`bifrost <host>` cannot tell its own status 2 from a remote status 2** by the
   status alone. The message on stderr can.
 - **The keys screen cannot check or fix permissions on Windows.** ssh.exe checks
@@ -995,38 +1029,25 @@ stays refused (see above).
 - **Sending a public key needs a POSIX `sh` on the server.** A server whose
   login shell is `cmd.exe` or PowerShell answers that the command failed, and the
   screen says so with what it said.
-- **Sending a public key has not been run on Windows, and the shells of other
-  servers have been tried only in part.** Not checked: that `ssh.exe` reads the
-  password from the console while its stdin is a pipe, and that the command's
-  double quotes survive how Windows passes an argument. The remote script was run
-  under `sh`, bash, zsh, dash, fish and busybox here; csh was not available, and
-  is judged from its quoting rules only. Against a real server it is checked by
-  the ignored test in `tests/copy_real.rs`, which has not been run yet.
+- **The shells of other servers have been tried only in part.** Sending a public
+  key was run on Windows against a real server: `ssh.exe` reads the password from
+  the console while its stdin is a pipe, and the command's double quotes survive
+  how Windows passes an argument. The remote script was run under `sh`, bash,
+  zsh, dash, fish and busybox here; csh was not available, and is judged from its
+  quoting rules only.
 - **An import can take up to 60 seconds with an undrawn screen** if commands in the
   ssh config hang: each `ssh -G` is killed after 5 seconds and the import as a whole
   is cut off at 60, and the hosts not read are listed as skipped, with the reason.
   The screen still cannot be interrupted meanwhile. On Windows only ssh itself is
   killed on a timeout: a hanging `Match exec` command it started is not, and remains
   until it ends. See the ssh config screen above.
-- **Choosing the identity file has not been run on Windows.** Not checked: that
-  `~/.ssh/<name>` is accepted by ssh.exe for `-i` and that the keys found in
-  `%USERPROFILE%\.ssh` are named as the list expects.
 - **Enter on the Identity file field opens the list** and no longer moves to the next
   field. Tab does.
-- **The ssh config screen has not been run on Windows.** Not checked: that
-  `Include ~/.ssh/bifrost_config` (with `~`) is what OpenSSH for Windows accepts in
-  `%USERPROFILE%\.ssh\config`, and how the import's `ssh -G` output paths look
-  there. The include check resolves each file through the disk and then compares it by
-  the rules of Windows (either slash, any case, the `\\?\` prefix ignored).
-- **Making a key and adding one to the agent have not been run on Windows.** They
-  use the same handover as a connection, so the limits above hold, and how
-  `ssh-keygen.exe` prompts on the legacy console host and in Windows Terminal, and
-  whether the ssh-agent service is running, have not been checked. See
-  `docs/manual-tests.md`.
-- **Deleting a key has not been run on Windows.** The same code removes files there,
-  not checked: whether a key file with the read-only attribute is removed, and
-  whether a link is removed as a link (links on Windows need privileges that were
-  not available to try). The whole flow is on the list in `docs/manual-tests.md`.
+- **`Include ~/.ssh/bifrost_config` (with `~` and `/`) is what OpenSSH for
+  Windows reads**, confirmed by hand with OpenSSH 9.5p2; neither a relative
+  form nor a quoted absolute path is needed. The include check resolves each
+  file through the disk and then compares it by the rules of Windows (either
+  slash, any case, the `\\?\` prefix ignored).
 - **Notes are edited on one line.** Line breaks and tabs are typed as `\n` and
   `\t`.
 

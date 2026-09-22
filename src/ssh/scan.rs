@@ -43,6 +43,7 @@ pub fn scan_host_names(
         names: Vec::new(),
         seen_names: HashSet::new(),
         visited: HashSet::new(),
+        stack: Vec::new(),
         warnings: Vec::new(),
         target: None,
         found: None,
@@ -70,21 +71,38 @@ pub enum IncludeStatus {
     FoundInsideBlock,
 }
 
+/// [`find_include`]'s result: whether the config includes the file, and any
+/// warning found while checking, such as an include loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncludeCheck {
+    pub status: IncludeStatus,
+    pub warnings: Vec<Warning>,
+}
+
 /// Looks for an `Include` of `target` in `config`, following `Include`s as the
 /// scan for host names does, and reads nothing else. Nothing is written.
 ///
 /// An include reaches `target` when it names it, as a path or with wildcards in
 /// the file name, or when a file it includes does. A `config` that does not
 /// exist is [`IncludeStatus::NoConfigFile`]; one that cannot be read is an error.
+///
+/// A file that includes itself, directly or through other files, is a warning:
+/// ssh has no such tolerance and refuses to start with "Too many recursive
+/// configuration includes", so a status that otherwise looks fine (the file is
+/// included, just as it should be) can still describe a config that does not
+/// work. See [`Scanner::scan_file`] for how the loop itself is not followed.
 pub fn find_include(
     config: &Path,
     ssh_dir: &Path,
     home: Option<&Path>,
     target: &Path,
-) -> io::Result<IncludeStatus> {
+) -> io::Result<IncludeCheck> {
     match fs::metadata(config) {
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            return Ok(IncludeStatus::NoConfigFile);
+            return Ok(IncludeCheck {
+                status: IncludeStatus::NoConfigFile,
+                warnings: Vec::new(),
+            });
         }
         _ => {}
     }
@@ -94,12 +112,16 @@ pub fn find_include(
         names: Vec::new(),
         seen_names: HashSet::new(),
         visited: HashSet::new(),
+        stack: Vec::new(),
         warnings: Vec::new(),
         target: Some(resolved(target)),
         found: None,
     };
     scanner.scan_file(config, 0, true)?;
-    Ok(scanner.found.unwrap_or(IncludeStatus::Missing))
+    Ok(IncludeCheck {
+        status: scanner.found.unwrap_or(IncludeStatus::Missing),
+        warnings: scanner.warnings,
+    })
 }
 
 /// `path` as the disk resolves it when the file exists (links followed, `.` and
@@ -124,7 +146,13 @@ struct Scanner<'a> {
     home: Option<&'a Path>,
     names: Vec<String>,
     seen_names: HashSet<String>,
+    /// Every file scanned so far, so a diamond (two branches that legitimately
+    /// include the same file) is only read once. Does not by itself say a file
+    /// includes itself: [`Self::stack`] is what tells the two apart.
     visited: HashSet<PathBuf>,
+    /// The files currently being expanded, outermost first: the chain of
+    /// `Include`s that led here. A file already on it is a loop, not a diamond.
+    stack: Vec<PathBuf>,
     warnings: Vec<Warning>,
     /// The file [`find_include`] looks for, as the disk resolves it ([`resolved`]).
     target: Option<PathBuf>,
@@ -133,9 +161,22 @@ struct Scanner<'a> {
 }
 
 impl Scanner<'_> {
+    /// Reads `path` for `Host`/`Match` names and `Include`s. Follows `Include`s
+    /// depth-first; a file already an ancestor of this call (on [`Self::stack`])
+    /// is a loop and is warned about, not followed again, so a config that
+    /// includes itself cannot hang this scan the way it hangs ssh's own.
     fn scan_file(&mut self, path: &Path, depth: usize, top_level: bool) -> io::Result<()> {
         let key = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        if !self.visited.insert(key) {
+        if self.stack.contains(&key) {
+            self.warnings.push(Warning::new(format!(
+                "{} includes itself, directly or through other included files. ssh will \
+                 refuse to start with \"Too many recursive configuration includes\" until \
+                 the loop is broken.",
+                path.display()
+            )));
+            return Ok(());
+        }
+        if !self.visited.insert(key.clone()) {
             return Ok(());
         }
         let bytes = match fs::read(path) {
@@ -151,6 +192,7 @@ impl Scanner<'_> {
             }
         };
         let text = String::from_utf8_lossy(&bytes);
+        self.stack.push(key);
 
         // Whether a `Host` or `Match` line came before, in this file.
         let mut in_block = false;
@@ -190,6 +232,7 @@ impl Scanner<'_> {
                 _ => {}
             }
         }
+        self.stack.pop();
         Ok(())
     }
 
@@ -521,6 +564,11 @@ mod tests {
         }
 
         fn check(&self) -> io::Result<IncludeStatus> {
+            self.check_full().map(|check| check.status)
+        }
+
+        /// [`Self::check`] with the warnings too.
+        fn check_full(&self) -> io::Result<IncludeCheck> {
             // The home is the parent of the ssh directory, so `~/x` is `<dir>/x`.
             find_include(
                 &self.dir.path().join("config"),
@@ -661,7 +709,67 @@ mod tests {
             ("a", "Include config\nInclude a\n"),
             ("bifrost_config", ""),
         ]);
-        assert_eq!(ssh.check().unwrap(), IncludeStatus::Missing);
+        let check = ssh.check_full().unwrap();
+        assert_eq!(check.status, IncludeStatus::Missing);
+        assert!(
+            !check.warnings.is_empty(),
+            "the loop itself is warned about"
+        );
+    }
+
+    #[test]
+    fn a_status_that_looks_fine_still_warns_when_the_file_that_reaches_it_loops() {
+        // config includes bifrost_config, which is exactly what should happen -
+        // except bifrost_config here also includes itself, which makes ssh
+        // refuse to start. `Found` alone would say everything is fine.
+        let ssh = Ssh::new(&[
+            ("config", "Include bifrost_config\n"),
+            (
+                "bifrost_config",
+                "Include bifrost_config\nHost web\n  HostName x\n",
+            ),
+        ]);
+        let check = ssh.check_full().unwrap();
+        assert_eq!(check.status, IncludeStatus::Found);
+        assert_eq!(check.warnings.len(), 1, "{:?}", check.warnings);
+        let message = check.warnings[0].message();
+        assert!(message.contains("includes itself"), "{message}");
+        assert!(
+            message.contains("Too many recursive configuration includes"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_loop_elsewhere_in_the_config_is_still_warned_about() {
+        // The cycle is between two files that are not the export target at all;
+        // ssh would still refuse the whole file for it.
+        let ssh = Ssh::new(&[
+            ("config", "Include a\nInclude bifrost_config\n"),
+            ("a", "Include b\n"),
+            ("b", "Include a\n"),
+            ("bifrost_config", ""),
+        ]);
+        let check = ssh.check_full().unwrap();
+        assert_eq!(check.status, IncludeStatus::Found);
+        assert_eq!(check.warnings.len(), 1, "{:?}", check.warnings);
+        assert!(check.warnings[0].message().contains("includes itself"));
+    }
+
+    #[test]
+    fn two_branches_that_legitimately_share_a_file_are_not_a_loop() {
+        // A diamond, not a cycle: `shared` is included from two places, but
+        // never while it is still being expanded. No warning is warranted.
+        let ssh = Ssh::new(&[
+            ("config", "Include a\nInclude b\nInclude bifrost_config\n"),
+            ("a", "Include shared\n"),
+            ("b", "Include shared\n"),
+            ("shared", "Host from-shared\n"),
+            ("bifrost_config", ""),
+        ]);
+        let check = ssh.check_full().unwrap();
+        assert_eq!(check.status, IncludeStatus::Found);
+        assert!(check.warnings.is_empty(), "{:?}", check.warnings);
     }
 
     #[test]
@@ -811,7 +919,7 @@ mod tests {
             &ssh.dir.path().join("real/bifrost_config"),
         )
         .unwrap();
-        assert_eq!(through_link, IncludeStatus::Found);
+        assert_eq!(through_link.status, IncludeStatus::Found);
     }
 
     #[cfg(unix)]
@@ -858,6 +966,6 @@ mod tests {
             &ssh.dir.path().join("link/bifrost_config"),
         )
         .unwrap();
-        assert_eq!(status, IncludeStatus::Found);
+        assert_eq!(status.status, IncludeStatus::Found);
     }
 }
