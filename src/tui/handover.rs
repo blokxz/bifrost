@@ -18,6 +18,18 @@
 //! A panic in step 3 unwinds with the terminal already in its normal state (the
 //! guard is suspended), and the child is killed by its own guard, so the shell
 //! gets a working terminal and no stray ssh.
+//!
+//! Step 5 asks the kernel to discard the input directly
+//! ([`tcflush`](rustix::termios::tcflush) on Unix), rather than only draining
+//! whatever crossterm's own `poll`/`read` finds readable. A key typed without a
+//! following newline while the terminal was in its suspended (cooked) mode sits
+//! in the driver's canonical-mode queue, not yet visible to `read`; switching
+//! back to raw mode in step 4 is what is supposed to expose it. POSIX leaves the
+//! fate of already-queued input across that switch undefined (see `tcsetattr`,
+//! IEEE Std 1003.1-2017), and it can be exposed later than the `poll(Duration::
+//! ZERO)` call right after the switch, so relying on that alone is a race.
+//! `tcflush` discards the queue itself, independent of canonical/raw state or of
+//! when the switch is observed to take effect.
 
 use std::io::{self, Write};
 use std::path::Path;
@@ -141,7 +153,16 @@ pub fn hand_over<O: TerminalOps>(
 }
 
 /// Drops events that are already waiting.
+///
+/// On Unix, the kernel's own input queue for the terminal is flushed first: see
+/// the module docs for why `poll`/`read` alone is not enough. Flushing a
+/// non-terminal stdin (as in a test without a real tty) simply fails and is
+/// ignored, the same as a terminal with nothing queued.
 fn discard_pending_input() {
+    #[cfg(unix)]
+    {
+        let _ = rustix::termios::tcflush(io::stdin(), rustix::termios::QueueSelector::IFlush);
+    }
     for _ in 0..MAX_DISCARDED_EVENTS {
         match event::poll(Duration::ZERO) {
             Ok(true) if event::read().is_ok() => {}

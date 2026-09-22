@@ -294,6 +294,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Input typed during a handover (a connection, sending a key, generating a
+  key, adding a key) that ssh or the tool never read is discarded reliably,
+  including on macOS.** Taking the terminal back only drained whatever
+  crossterm's own `poll`/`read` found ready; a key typed without a following
+  newline can sit in the terminal's canonical-mode queue in a way POSIX leaves
+  undefined across the switch back to raw mode, so it could still surface
+  afterwards and run as a Bifrost command (for example quitting). The terminal's
+  input queue is now flushed directly (`tcflush`) as part of taking it back.
 - **A host's key file is recognized on Windows.** The identity file list, the
   "use this key?" question after sending a key, and the list of hosts shown before
   a key is deleted compared paths as text, so `/` and `\` made one key look like

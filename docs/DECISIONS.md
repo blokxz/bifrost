@@ -290,7 +290,13 @@ settled: reopen one only with a clear new reason.
   Bifrost that took the terminal back from a killed ssh would restore raw mode
   when it quits. Unix only.
 - **Input typed during the connection that ssh did not read is discarded** when
-  the interface comes back. A `q` typed as ssh exits would otherwise quit.
+  the interface comes back. A `q` typed as ssh exits would otherwise quit. On
+  Unix this is a `tcflush` of the terminal's input queue, not only draining
+  whatever crossterm's `poll`/`read` finds ready: a key typed without a
+  following newline can sit in the canonical-mode queue in a way POSIX leaves
+  undefined across the switch back to raw mode, and relying on `poll`/`read`
+  alone left a window, seen on macOS, where such a key survived to be read as a
+  live command afterwards.
 - **Only exit status 255 is an ssh failure.** Any other status is what the remote
   session or command returned, and is reported neutrally.
 - **Repainting after a connection does not ask the terminal for the cursor
