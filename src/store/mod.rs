@@ -264,12 +264,24 @@ impl Store {
             });
         };
         let hosts = self.parse(&bytes)?;
+        let warnings = self.warnings(&hosts);
+        Ok(Loaded { hosts, warnings })
+    }
+
+    /// What is worth warning about right now: the permissions of the store's own
+    /// files, and identity files that are not there.
+    ///
+    /// Read from the disk each time, never cached: a key that is made, deleted or
+    /// pointed elsewhere during a session changes the answer, and a warning that
+    /// outlives its cause is worse than none. `hosts` is what is in memory, which
+    /// after a save is what is in the file.
+    pub fn warnings(&self, hosts: &Hosts) -> Vec<Warning> {
         let mut warnings = fsutil::permission_warnings(&[
             (self.dir.as_path(), fsutil::Kind::Dir),
-            (path.as_path(), fsutil::Kind::File),
+            (self.hosts_path().as_path(), fsutil::Kind::File),
         ]);
         warnings.extend(hosts.warnings(self.home.as_deref()));
-        Ok(Loaded { hosts, warnings })
+        warnings
     }
 
     /// Writes the store atomically, keeping the previous version as

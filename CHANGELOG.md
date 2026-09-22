@@ -303,6 +303,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An `ssh.exe` killed during a session no longer leaves a console Bifrost
+  cannot use.** Windows had no counterpart to the terminal-mode save and restore
+  that Unix has had since Block 5: `ssh.exe` changes the console's input and
+  output modes, a kill from the Task Manager restores neither, and crossterm
+  puts back only three input bits, so the list came back with some keys working,
+  others doing nothing, and no way to quit. Both console modes are now saved
+  before every handover (connecting, sending a key, `ssh-keygen`, `ssh-add`) and
+  put back after it.
+- **A warning on the host list goes away when its cause is fixed.** The warnings
+  were read once at startup and never again, so one that had been dealt with —
+  a key file made, a host deleted, a key path corrected — stayed until Bifrost
+  was restarted. They are now read again after every change that can affect
+  them: a host saved, edited, deleted or imported, and a key made or deleted.
 - **A connection that Windows' ssh drops during the handshake is explained as an
   interrupted connection, not as an unknown failure.** Windows OpenSSH prints
   "Unknown error" where Linux and macOS name the reset or the close, so three

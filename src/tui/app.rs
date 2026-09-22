@@ -557,6 +557,32 @@ impl App {
         &self.notices
     }
 
+    /// Asks the store what is worth warning about now and replaces the notices
+    /// with the answer.
+    ///
+    /// Called after everything that can make a warning appear or go away: a host
+    /// saved, edited, deleted or imported, and a key made or deleted. Without it
+    /// a warning outlives its cause and only a restart clears it.
+    ///
+    /// The warnings page cannot be open while this runs (it answers only `w`,
+    /// Esc and scrolling), and opening it resets the scroll, so there is no
+    /// stale position to correct here.
+    ///
+    /// Does nothing when the hosts could not be loaded: the notice then explains
+    /// that, there is no store to ask, and nothing the user does in this session
+    /// can change it.
+    fn refresh_notices(&mut self) {
+        let Some(library) = self.library.as_ref() else {
+            return;
+        };
+        self.notices = library
+            .store
+            .warnings(&library.hosts)
+            .iter()
+            .map(|warning| Notice::warning(warning.message()))
+            .collect();
+    }
+
     pub fn status(&self) -> Option<&Status> {
         self.status.as_ref()
     }
@@ -1917,6 +1943,8 @@ impl App {
                     ));
                     self.set_status(StatusKind::Warning, text);
                 }
+                // A key that is gone is a key some host may now be missing.
+                self.refresh_notices();
             }
             Err(why) => self.set_status(StatusKind::Error, why),
         }
@@ -2208,6 +2236,8 @@ impl App {
                 );
                 self.select_key = Some(file_name.to_string());
                 self.requests.push_back(Request::LoadKeys);
+                // A host that named this key was warned about; it is there now.
+                self.refresh_notices();
             }
             ToolEnd::Cancelled => {
                 self.set_status(StatusKind::Info, "Making the key was cancelled.");
@@ -2476,6 +2506,10 @@ impl App {
             .save(&candidate)
             .map_err(|err| format!("Could not save your changes: {err}"))?;
         library.hosts = candidate;
+        // The hosts that are saved are the ones the warnings are about: a key
+        // path that was fixed, a host that was deleted, or the file's own
+        // permissions, which the save has just set.
+        self.refresh_notices();
         Ok(())
     }
 
@@ -2515,12 +2549,13 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::Host;
+    use crate::domain::{Host, Warning};
     use crate::ssh::connect::Exit;
     use crate::tui::effects::testing::{
         take_connect_request, take_copy_request, take_removal_request,
     };
     use crate::tui::persist::testing::FakeStore;
+    use crate::tui::startup::Severity;
     use ratatui::crossterm::event::KeyEventKind;
 
     fn host(name: &str, favorite: bool) -> Host {
@@ -3017,6 +3052,84 @@ mod tests {
         app.handle_key(ch('?'));
         app.handle_key(ch('?'));
         assert_eq!(app.scroll(), 0);
+    }
+
+    #[test]
+    fn a_warning_goes_when_its_cause_is_fixed_without_restarting() {
+        // The bug this covers: the warnings were read once at startup, so one
+        // that had been dealt with stayed on the list until Bifrost was closed.
+        let (mut app, store) = app_with(sample(), vec![Notice::warning("key file is missing")]);
+        assert_eq!(app.notices().len(), 1);
+
+        // The cause is gone, as it would be after the key was made.
+        store.set_warnings(Vec::new());
+        app.handle_key(ch('f')); // any change that saves
+        assert!(app.notices().is_empty(), "{:?}", app.notices());
+        assert!(!labels(&app).contains(&"warnings"), "the footer too");
+    }
+
+    #[test]
+    fn a_new_warning_appears_without_restarting_too() {
+        let (mut app, store) = app_with(sample(), Vec::new());
+        assert!(app.notices().is_empty());
+        store.set_warnings(vec![Warning::new("key file is missing")]);
+        app.handle_key(ch('f'));
+        assert_eq!(app.notices().len(), 1);
+        assert_eq!(app.notices()[0].severity, Severity::Warning);
+        assert!(labels(&app).contains(&"warnings"));
+    }
+
+    #[test]
+    fn every_change_that_can_affect_a_warning_asks_the_store_again() {
+        let (mut app, store) = app_with(sample(), Vec::new());
+        let before = store.warnings_asked();
+
+        app.handle_key(ch('f')); // favorite
+        assert!(store.warnings_asked() > before, "saving a favorite");
+
+        // Deleting a host.
+        let after_favorite = store.warnings_asked();
+        app.handle_key(ch('/'));
+        type_text(&mut app, "web");
+        app.handle_key(press(KeyCode::Enter));
+        app.handle_key(ch('d'));
+        type_name_and_confirm(&mut app, "web");
+        assert!(app.hosts().unwrap().get("web").is_none(), "it was deleted");
+        assert!(
+            store.warnings_asked() > after_favorite,
+            "deleting a host: {:?}",
+            app.status()
+        );
+    }
+
+    #[test]
+    fn the_warnings_page_reads_the_new_list_next_time_it_is_opened() {
+        let (mut app, store) = app_with(sample(), vec![Notice::warning("key file is missing")]);
+        app.handle_key(ch('w'));
+        assert_eq!(app.screen(), Screen::Notices);
+        app.handle_key(press(KeyCode::Esc));
+
+        store.set_warnings(Vec::new());
+        app.handle_key(ch('f'));
+
+        // Nothing left to read, so `w` says so instead of opening a blank page.
+        app.handle_key(ch('w'));
+        assert_eq!(app.screen(), Screen::List);
+        assert!(
+            app.status().unwrap().text.contains("no warnings"),
+            "{:?}",
+            app.status()
+        );
+    }
+
+    #[test]
+    fn a_store_that_could_not_be_read_keeps_its_error_notice() {
+        // There is no store to ask, and nothing done here can change it.
+        let mut app = unavailable();
+        assert_eq!(app.notices().len(), 1);
+        app.handle_key(ch('f'));
+        assert_eq!(app.notices().len(), 1);
+        assert_eq!(app.notices()[0].severity, Severity::Error);
     }
 
     #[test]

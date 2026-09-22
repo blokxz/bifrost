@@ -226,6 +226,13 @@ settled: reopen one only with a clear new reason.
 - **Every change is applied to a copy, saved, and only then shown.** If saving
   fails, the screen still matches the file, and the error says why. A form that
   fails to save stays open with everything typed, so nothing is lost.
+- **The warnings are read again after every change that can affect them**, not
+  once at startup: a host saved, edited, deleted or imported, and a key made or
+  deleted. They are about the state of the disk (a key file that is not there,
+  permissions that are too broad), and that state changes while Bifrost runs. A
+  warning that outlives its cause is worse than none, because the user has no
+  way to tell which of the two it is. The store is asked, since it is what knows
+  the home directory and reads the files; nothing is cached.
 - **If the store cannot be loaded there is no host list, and adding, editing and
   deleting are switched off.** `Store::save` would refuse to overwrite the
   damaged file anyway; the screen explains the problem instead of pretending.
@@ -307,11 +314,22 @@ settled: reopen one only with a clear new reason.
   cannot be removed again (the signal library leaves the signal ignored), so it
   stays for the process's life, and a SIGINT outside a connection is turned into
   the Ctrl+C key, which quits, or asks first in a form with unsaved changes.
-- **Terminal modes are saved before ssh and restored after it.** ssh restores
-  its own changes when it exits normally, but not when it is killed. crossterm
-  records "the original modes" on every `enable_raw_mode`, so without this a
-  Bifrost that took the terminal back from a killed ssh would restore raw mode
-  when it quits. Unix only.
+- **Terminal modes are saved before ssh and restored after it, on both Unix and
+  Windows.** ssh restores its own changes when it exits normally, but not when
+  it is killed. On Unix crossterm records "the original modes" on every
+  `enable_raw_mode`, so without this a Bifrost that took the terminal back from
+  a killed ssh would restore raw mode when it quits. On Windows crossterm saves
+  no original mode at all: its `disable_raw_mode` only sets `ENABLE_LINE_INPUT`,
+  `ENABLE_ECHO_INPUT` and `ENABLE_PROCESSED_INPUT` back, and everything else
+  `ssh.exe` changed — virtual-terminal input, mouse and window input, and the
+  whole output mode — is left as it was. That is how killing `ssh.exe` left a
+  console where some keys worked, others did nothing, and Bifrost could not be
+  closed. Both the input (`CONIN$`) and output (`CONOUT$`) modes are saved and
+  put back whole, through `crossterm_winapi`'s safe wrappers around
+  `GetConsoleMode`/`SetConsoleMode`, so the crate keeps `#![forbid(unsafe_code)]`.
+  The console's own handles are used, not this process's stdin and stdout: a
+  redirected stdin is not the console whose modes ssh changed. It covers all
+  four handovers because they all run through `connect::run_inner`.
 - **Input typed during the connection that ssh did not read is discarded** when
   the interface comes back. A `q` typed as ssh exits would otherwise quit. On
   Unix this is a `tcflush` of the terminal's input queue, not only draining
@@ -1008,8 +1026,12 @@ stays refused (see above).
   code or another dependency. The terminal itself is not left broken, because it
   was already handed to ssh in its normal mode. Other platforms return to the
   list.
-- **Terminal modes are restored after ssh only on Unix.** The Windows console
-  has its own modes and restoring them needs `unsafe` code.
+- **The Windows console modes are saved and restored, but only the ones a mode
+  word carries.** Both the input and the output mode are put back after every
+  handover (see "Terminal interface"), which covers an `ssh.exe` that was
+  killed. What a mode word does not carry — the screen buffer's size, the
+  cursor's shape, a window that a program resized — is not saved, so a tool that
+  changes one of those still leaves it changed.
 - **The changed-key screen offers removal only for the default `known_hosts`.**
   A key kept in another file (a system-wide `ssh_known_hosts`, or a
   `UserKnownHostsFile` in ssh's config) is shown, and the user removes it by

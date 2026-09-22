@@ -195,9 +195,21 @@ a Windows machine, with the real `ssh.exe` (OpenSSH Client installed):
 4. **Ctrl-C at a password prompt.** Expected on Windows (a known limitation):
    Bifrost ends together with ssh. Check that the console is sane afterwards:
    typing echoes, line editing works, Enter works.
-5. **ssh killed.** End `ssh.exe` in Task Manager while connected. Look for:
-   what state the console is left in (echo, line editing). This is the case the
-   terminal-mode restore covers on Unix and cannot on Windows.
+5. **ssh killed.** End `ssh.exe` in Task Manager while connected. Bifrost now
+   saves the console's input and output modes before the handover and puts both
+   back afterwards, so this should behave like a clean logout. Look for, in
+   Windows Terminal and in the legacy console host:
+   - The list comes back drawn correctly and every key works: `j`/`k` move,
+     `?` opens the help, `/` searches, and `q` quits. The symptom this fixes is
+     a console where some keys work, others do nothing, and Bifrost cannot be
+     closed.
+   - After quitting, the shell is normal: typing echoes, line editing works,
+     Enter works, and Ctrl-C at the prompt does what it always does.
+   - The same after killing `ssh.exe` during each of the other handovers:
+     sending a key (`K`, `c`), `ssh-keygen` (`K`, `g`) and `ssh-add` (`K`, `a`).
+     All four go through the same save and restore, so one failing means the
+     save is not covering something the tool changed. Note the exact key that
+     stopped working.
 6. **Exit status.** `bifrost HOST`, then `exit 3` in the session: `echo %ERRORLEVEL%`
    (cmd) or `$LASTEXITCODE` (PowerShell) is 3. `bifrost nosuchhost` gives 2. A
    wrong port gives 255 and the explanation.
@@ -315,3 +327,16 @@ Four things were found, and all four are fixed:
    export screen, whatever the include status is. (The same line inside
    `bifrost_config` heals itself: the export rewrites that file before the
    check runs.)
+5. **Killing `ssh.exe` left a console Bifrost could not use** (step 5): some
+   keys worked, others did nothing, and Bifrost could not be closed. The
+   Windows half of the terminal-mode save and restore had never been written,
+   so `ssh.exe` changed the console's input and output modes, died without
+   putting them back, and Bifrost carried on over them. Both handles are now
+   saved before every handover and restored after it. **This one needs
+   checking again on Windows**: it cannot be reproduced or tested from Linux,
+   and step 5 above says what to look for.
+6. **A warning on the host list did not go away when its cause was fixed.** The
+   warnings were read once at startup and never again, so one that had been
+   dealt with stayed until Bifrost was restarted. They are now read again after
+   every change that can affect them: a host saved, edited, deleted or
+   imported, and a key made or deleted.

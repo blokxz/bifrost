@@ -76,6 +76,16 @@ signal-hook = { version = "0.3", default-features = false }
 # Already in the tree through crossterm, so it adds no crate.
 rustix = { version = "1", default-features = false, features = ["std", "termios", "process"] }
 
+[target.'cfg(windows)'.dependencies]
+# Saves the console's input and output modes before ssh runs and puts them back
+# afterwards, the Windows half of what `rustix::termios` does on Unix: an ssh.exe
+# killed from the Task Manager restores neither, and crossterm saves no original
+# mode on Windows at all (its disable_raw_mode only sets three input bits back),
+# so the console is otherwise left as ssh had it. Safe wrappers around
+# GetConsoleMode/SetConsoleMode, so the crate keeps `#![forbid(unsafe_code)]`.
+# Already in the tree through crossterm, so it adds no crate.
+crossterm_winapi = "0.9"
+
 [dev-dependencies]
 # Temporary directories (removed on drop) so tests never touch the real config dir.
 tempfile = "3"
