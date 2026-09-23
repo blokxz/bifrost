@@ -210,6 +210,18 @@ settled: reopen one only with a clear new reason.
 - **ratatui is used with default features off, and crossterm only through
   `ratatui::crossterm`.** There is exactly one crossterm in the dependency tree,
   and no proc-macro or calendar dependencies.
+- Two start views: full view (new) and host list (the list 0.1.0 already has, kept as it is).
+  Tab switches between them and keeps the selected host.
+- One-run override: bifrost --launcher / -l opens the host list. Not --list, because bifrost list 
+  is already a subcommand that prints host names.
+- UI settings live in a separate config.toml in the Bifrost config folder (same folder rules 
+  as hosts.toml, including BIFROST_CONFIG_DIR). hosts.toml holds data only.
+- Settings keys (table [ui]):
+  - start_view = "full" | "launcher", default "launcher"
+  - show_tips, default true
+  - show_command, default true
+  - confirm_connect, default false
+  - colors = "bifrost" | "terminal", default "bifrost"
 
 ## Host library
 
